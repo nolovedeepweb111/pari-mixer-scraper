@@ -427,8 +427,11 @@ def link_mixercup_data(
             if steam_team_id is None:
                 continue
             team_row = session.get(Team, steam_team_id)
-            if team_row is not None and mixer_team.get("name"):
-                team_row.name = mixer_team["name"]
+            if team_row is not None:
+                if mixer_team.get("name"):
+                    team_row.name = mixer_team["name"]
+                if mixer_team.get("id"):
+                    team_row.mixer_uuid = mixer_team["id"]
             _apply_confirmed_roster(session, steam_team_id, mixer_team)
         linked += 1
 

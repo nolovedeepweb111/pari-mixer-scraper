@@ -69,6 +69,20 @@ query Games($first: Int, $offset: Int, $filters: GameFilterInput) {
 }
 """
 
+_NEXT_GAME_QUERY = """
+query Games($first: Int, $filters: GameFilterInput) {
+    games(first: $first, filters: $filters) {
+        items {
+            id
+            status
+            plannedTime
+            team1 { id name }
+            team2 { id name }
+        }
+    }
+}
+"""
+
 
 class MixerCupClient:
     """Client for mixer-cup.gg's public GraphQL API - used to pull the
@@ -135,3 +149,30 @@ class MixerCupClient:
             offset += len(items)
             if not items or offset >= result["pageInfo"]["total"]:
                 return
+
+    def get_next_opponent(self, tournament_id: int, team_uuid: str) -> dict | None:
+        """Next not-yet-played game for this team, or None if there isn't
+        one (bracket finished, or team has none scheduled yet)."""
+        data = self._post(_NEXT_GAME_QUERY, {
+            "filters": {
+                "tournamentId": tournament_id,
+                "teamId": team_uuid,
+                "status": ["PENDING", "ACTIVE", "PAUSED", "ON_HOLD"],
+            },
+            "first": 50,
+        })
+        games = data["games"]["items"]
+        if not games:
+            return None
+
+        def sort_key(g):
+            return (g.get("plannedTime") is None, g.get("plannedTime") or "")
+
+        games.sort(key=sort_key)
+        game = games[0]
+        opponent = game["team2"] if game["team1"]["id"] == team_uuid else game["team1"]
+        return {
+            "opponent_name": opponent.get("name") or f"Team {opponent['id']}",
+            "planned_time": game.get("plannedTime"),
+            "status": game.get("status"),
+        }

@@ -1,11 +1,9 @@
 const teamsEl = document.getElementById("teams");
 const detailEl = document.getElementById("team-detail");
-const collectBtn = document.getElementById("collect-btn");
 const collectStatusEl = document.getElementById("collect-status");
 
 let activeTeamId = null;
 let activeTab = "composition";
-let pollTimer = null;
 
 function formatMmr(value) {
   return value == null ? "?" : Math.round(value).toLocaleString("ru-RU");
@@ -39,7 +37,7 @@ async function loadTeams() {
 
   teamsEl.innerHTML = "";
   if (teams.length === 0) {
-    teamsEl.innerHTML = '<p class="hint">Нет данных. Нажмите «Обновить матчи».</p>';
+    teamsEl.innerHTML = '<p class="hint">Нет данных. Обновляется автоматически, зайдите чуть позже.</p>';
     return;
   }
 
@@ -74,6 +72,18 @@ function renderComposition(team) {
   mmrLine.className = "total-mmr";
   mmrLine.textContent = `Суммарный MMR: ${formatMmr(team.total_mmr)}`;
   container.appendChild(mmrLine);
+
+  if (team.next_opponent) {
+    const opp = team.next_opponent;
+    const when = opp.planned_time
+      ? new Date(opp.planned_time).toLocaleString("ru-RU", { dateStyle: "medium", timeStyle: "short" })
+      : "время пока не назначено";
+    const nextLine = document.createElement("p");
+    nextLine.className = "next-opponent";
+    nextLine.innerHTML = `Следующий соперник: <strong>${opp.opponent_name}</strong> · ${when}`;
+    container.appendChild(nextLine);
+  }
+
   container.appendChild(grid);
 
   if (team.recent_drafts && team.recent_drafts.length > 0) {
@@ -83,7 +93,14 @@ function renderComposition(team) {
     for (const draft of team.recent_drafts) {
       const match = document.createElement("div");
       match.className = "draft-match";
+      let resultBadge = '<span class="match-result result-unknown">Результат неизвестен</span>';
+      if (draft.team_won === true) {
+        resultBadge = '<span class="match-result result-win">Победа</span>';
+      } else if (draft.team_won === false) {
+        resultBadge = '<span class="match-result result-loss">Поражение</span>';
+      }
       match.innerHTML =
+        resultBadge +
         renderDraftTeamRow(team.name, draft.team_entries) +
         renderDraftTeamRow(draft.opponent_name, draft.opponent_entries);
       draftsSection.appendChild(match);
@@ -188,41 +205,33 @@ async function loadTeamDetail(teamId, tab) {
   loadTeams();
 }
 
+// Матчи обновляются сами (внутренний таймер на сервере + внешний пинг раз
+// в 10 минут) - здесь просто пассивно отражаем текущий статус и
+// перезагружаем данные, когда фоновое обновление завершается.
+let wasRunning = false;
+
 async function pollCollectStatus() {
   const res = await fetch("/api/collect/status");
   const status = await res.json();
   const lastLine = status.log[status.log.length - 1] || "";
 
   if (status.running) {
-    collectStatusEl.textContent = `Сбор данных... ${lastLine}`;
+    collectStatusEl.textContent = `Обновление данных... ${lastLine}`;
   } else if (status.error) {
-    collectStatusEl.textContent = `Ошибка: ${status.error}`;
-  } else if (status.new_matches != null) {
-    collectStatusEl.textContent = `Готово. Новых матчей: ${status.new_matches}`;
+    collectStatusEl.textContent = `Ошибка обновления: ${status.error}`;
   } else {
     collectStatusEl.textContent = "";
   }
 
-  if (!status.running) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-    collectBtn.disabled = false;
+  if (wasRunning && !status.running) {
     loadTeams();
     if (activeTeamId != null) {
       loadTeamDetail(activeTeamId, activeTab);
     }
   }
+  wasRunning = status.running;
 }
 
-collectBtn.addEventListener("click", async () => {
-  collectBtn.disabled = true;
-  const res = await fetch("/api/collect", { method: "POST" });
-  if (res.status === 409) {
-    collectBtn.disabled = false;
-    return;
-  }
-  pollTimer = setInterval(pollCollectStatus, 1000);
-  pollCollectStatus();
-});
-
+setInterval(pollCollectStatus, 15000);
+pollCollectStatus();
 loadTeams();

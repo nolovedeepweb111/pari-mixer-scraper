@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from pari_mixer_scraper.analysis import compute_team_stats, generate_coach_text
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID, collect
+from pari_mixer_scraper.mixercup_client import MixerCupClient
 from pari_mixer_scraper.models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, Team,
     build_engine, configure_sqlite,
@@ -87,13 +88,13 @@ def _collect_scheduler_loop(interval_seconds: int) -> None:
 
 
 def _start_periodic_collect() -> None:
-    """Keeps match data fresh without anyone having to click "Обновить
-    матчи". Only useful while the process is actually running - on free
-    hosting tiers the service spins down after ~15 min idle, so this alone
-    won't refresh an asleep deploy. Pair with an external ping (e.g. the
-    GitHub Actions workflow in .github/workflows/) that hits /api/collect
-    on a schedule - that both wakes the service and triggers a collect."""
-    interval_seconds = int(os.environ.get("COLLECT_INTERVAL_SECONDS", 20 * 60))
+    """Keeps match data fresh with no manual trigger. Only useful while the
+    process is actually running - on free hosting tiers the service spins
+    down after ~15 min idle, so this alone won't refresh an asleep deploy.
+    Pair with an external ping (e.g. the GitHub Actions workflow in
+    .github/workflows/) that hits /api/collect on a schedule - that both
+    wakes the service and triggers a collect."""
+    interval_seconds = int(os.environ.get("COLLECT_INTERVAL_SECONDS", 10 * 60))
     if interval_seconds <= 0:
         return
     threading.Thread(target=_collect_scheduler_loop, args=(interval_seconds,), daemon=True).start()
@@ -106,6 +107,37 @@ _start_periodic_collect()
 @app.get("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
+
+
+_mixer_client = MixerCupClient()
+_mixer_tournament_id_cache: int | None = None
+
+
+def _resolve_mixer_tournament_id() -> int | None:
+    global _mixer_tournament_id_cache
+    if _mixer_tournament_id_cache is not None:
+        return _mixer_tournament_id_cache
+    env_id = os.environ.get("MIXER_TOURNAMENT_ID")
+    if env_id:
+        _mixer_tournament_id_cache = int(env_id)
+        return _mixer_tournament_id_cache
+    try:
+        active = _mixer_client.get_active_tournament()
+    except Exception:
+        return None
+    if active:
+        _mixer_tournament_id_cache = active["id"]
+    return _mixer_tournament_id_cache
+
+
+def _get_next_opponent(mixer_uuid: str) -> dict | None:
+    tournament_id = _resolve_mixer_tournament_id()
+    if tournament_id is None:
+        return None
+    try:
+        return _mixer_client.get_next_opponent(tournament_id, mixer_uuid)
+    except Exception:
+        return None
 
 
 def _roster_filter(session: Session, team_id: int):
@@ -165,16 +197,19 @@ def _recent_drafts(session: Session, team_id: int, limit: int = 5) -> list[dict]
     this team's last few matches - not just this team's own bans, since
     what the *opponent* banned against them is the more useful signal."""
     matches = session.execute(
-        select(Match.match_id, Match.radiant_team_id, Match.dire_team_id)
+        select(Match.match_id, Match.radiant_team_id, Match.dire_team_id, Match.radiant_win)
         .where((Match.radiant_team_id == team_id) | (Match.dire_team_id == team_id))
         .order_by(Match.start_time.desc())
     ).all()
 
     drafts = []
-    for match_id, radiant_team_id, dire_team_id in matches:
+    for match_id, radiant_team_id, dire_team_id, radiant_win in matches:
         if len(drafts) >= limit:
             break
         opponent_team_id = dire_team_id if radiant_team_id == team_id else radiant_team_id
+        team_won = None
+        if radiant_win is not None:
+            team_won = radiant_win if radiant_team_id == team_id else not radiant_win
 
         rows = session.execute(
             select(
@@ -204,6 +239,7 @@ def _recent_drafts(session: Session, team_id: int, limit: int = 5) -> list[dict]
 
         drafts.append({
             "match_id": match_id,
+            "team_won": team_won,
             "team_entries": side(rows, team_id),
             "opponent_name": opponent.name if opponent and opponent.name else f"Team {opponent_team_id}",
             "opponent_entries": side(rows, opponent_team_id),
@@ -238,6 +274,7 @@ def api_team_detail(team_id: int):
         ).all()
 
         recent_drafts = _recent_drafts(session, team_id)
+        mixer_uuid = team.mixer_uuid
 
     players: dict[int, dict] = {}
     for account_id, name, mmr, hero_id, hero_name, games, decided_games, wins in rows:
@@ -259,6 +296,7 @@ def api_team_detail(team_id: int):
         return jsonify({"error": "not found"}), 404
 
     total_mmr = sum(p["mmr"] for p in players.values() if p["mmr"] is not None) or None
+    next_opponent = _get_next_opponent(mixer_uuid) if mixer_uuid else None
 
     return jsonify({
         "team_id": team_id,
@@ -266,6 +304,7 @@ def api_team_detail(team_id: int):
         "total_mmr": total_mmr,
         "players": sorted(players.values(), key=lambda p: p["name"]),
         "recent_drafts": recent_drafts,
+        "next_opponent": next_opponent,
     })
 
 

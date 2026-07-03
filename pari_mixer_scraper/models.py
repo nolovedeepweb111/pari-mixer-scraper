@@ -50,6 +50,11 @@ class Team(Base):
 
     team_id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str | None]
+    # mixer-cup.gg's own UUID for this team, once linked (see
+    # collect.link_mixercup_data) - lets the site query mixer-cup.gg
+    # directly for things like the team's next scheduled opponent, without
+    # re-resolving Steam-team_id <-> MixerCup identity on every request.
+    mixer_uuid: Mapped[str | None] = mapped_column(nullable=True)
 
 
 class Player(Base):

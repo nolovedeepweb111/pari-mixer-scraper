@@ -1,0 +1,16 @@
+name: Keep-alive and refresh
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  trigger-collect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake service and trigger a match collection
+        run: |
+          curl -sf -X POST "${{ vars.APP_URL }}/api/collect" \
+            && echo "Triggered" \
+            || echo "Request failed (service may already be collecting, or still waking up) - not fatal"

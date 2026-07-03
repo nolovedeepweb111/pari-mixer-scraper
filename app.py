@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -65,7 +66,27 @@ def _auto_collect_if_empty() -> None:
         _start_collect_background()
 
 
+def _collect_scheduler_loop(interval_seconds: int) -> None:
+    while True:
+        time.sleep(interval_seconds)
+        _start_collect_background()
+
+
+def _start_periodic_collect() -> None:
+    """Keeps match data fresh without anyone having to click "Обновить
+    матчи". Only useful while the process is actually running - on free
+    hosting tiers the service spins down after ~15 min idle, so this alone
+    won't refresh an asleep deploy. Pair with an external ping (e.g. the
+    GitHub Actions workflow in .github/workflows/) that hits /api/collect
+    on a schedule - that both wakes the service and triggers a collect."""
+    interval_seconds = int(os.environ.get("COLLECT_INTERVAL_SECONDS", 20 * 60))
+    if interval_seconds <= 0:
+        return
+    threading.Thread(target=_collect_scheduler_loop, args=(interval_seconds,), daemon=True).start()
+
+
 _auto_collect_if_empty()
+_start_periodic_collect()
 
 
 @app.get("/")

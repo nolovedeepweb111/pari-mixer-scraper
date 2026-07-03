@@ -7,14 +7,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, send_from_directory
-from sqlalchemy import case, create_engine, func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from pari_mixer_scraper.analysis import compute_team_stats, generate_coach_text
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID, collect
 from pari_mixer_scraper.models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, Team,
-    build_database_url, configure_sqlite,
+    build_engine, configure_sqlite,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -24,7 +24,7 @@ DB_PATH = os.environ.get("TOURNAMENT_DB", str(BASE_DIR / "tournament.db"))
 LEAGUE_ID = int(os.environ.get("LEAGUE_ID", DEFAULT_LEAGUE_ID))
 
 app = Flask(__name__, static_folder="static", static_url_path="")
-engine = configure_sqlite(create_engine(build_database_url(DB_PATH)))
+engine = configure_sqlite(build_engine(DB_PATH))
 Base.metadata.create_all(engine)
 
 _collect_state = {"running": False, "log": [], "error": None, "new_matches": None, "started_at": None}

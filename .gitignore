@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+tournament.db
+cloudflared.exe
+cloudflared.log

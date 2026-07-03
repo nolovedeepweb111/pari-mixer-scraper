@@ -1,0 +1,111 @@
+# pari-mixer-scraper
+
+Веб-приложение, которое собирает данные по матчам турнира Dota 2 (по
+умолчанию — PARI Mixer Cup, league_id `19924`,
+https://www.dotabuff.com/esports/leagues/19924-pari-mixer-cup) в локальную
+базу SQLite и показывает их в браузере: выбираешь команду — видишь ники
+игроков и героев, на которых они играли.
+
+## Источники данных
+
+Прямой скрейпинг HTML dotabuff.com не используется — сайт закрыт Cloudflare
+(JS-челлендж "Just a moment...") для любых автоматических запросов. Вместо
+этого используются два источника:
+
+1. **Steam Web API** (`IDOTA2Match_570/GetMatchHistory`) — официальный API
+   Valve, тот же, что использует сама Dota 2 / Dota Plus. Это самый
+   надёжный и быстрый способ получить список матчей лиги: один запрос
+   отдаёт до 100 матчей сразу вместе с составами и героями. Требует
+   бесплатный ключ, см. ниже.
+2. **[OpenDota API](https://docs.opendota.com/)** — используется всегда, для
+   справочника героев, никнеймов про-игроков и как fallback/дозаполнение
+   матчей, которые Steam почему-то не отдал по `league_id`.
+
+Если ключ Steam API не задан, приложение продолжит работать только на
+OpenDota (как раньше) — но это медленнее (по одному запросу на матч) и
+может не находить матчи, которые OpenDota ещё не проиндексировал.
+
+### Как получить Steam Web API ключ
+
+1. Откройте https://steamcommunity.com/dev/apikey (нужен Steam-аккаунт).
+2. Зарегистрируйте ключ (domain можно указать `localhost`).
+3. Скопируйте `.env.example` в `.env` и впишите ключ туда — **не в чат и не
+   в код**:
+
+   ```
+   cp .env.example .env
+   # затем откройте .env и впишите STEAM_API_KEY=...
+   ```
+
+## Установка
+
+```bash
+cd pari-mixer-scraper
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+pip install -r requirements.txt
+```
+
+## Запуск веб-приложения
+
+**Windows, без терминала:** дважды кликните [`start.bat`](start.bat) в папке
+проекта — он запустит сервер и через пару секунд сам откроет
+http://127.0.0.1:5000 в браузере. Чтобы остановить — закройте открывшееся
+чёрное окно консоли или нажмите в нём Ctrl+C.
+
+**Через терминал** (PowerShell/cmd/bash — если нужно видеть логи или
+приложение уже не через `.venv\Scripts\activate`):
+
+```powershell
+cd pari-mixer-scraper
+.venv\Scripts\python.exe app.py
+```
+
+Откройте http://127.0.0.1:5000 в браузере. Кнопка «Обновить матчи» запускает
+сбор данных в фоне (прогресс виден в шапке страницы), после чего слева
+появляется список команд — по клику показываются игроки и герои.
+
+Сбор идемпотентен: повторные запуски докачивают только новые матчи, старые
+не перезапрашиваются. Останов сервера — Ctrl+C в терминале.
+
+## CLI (без браузера)
+
+Тот же сбор данных и текстовая сводка доступны без веб-интерфейса:
+
+```bash
+python -m pari_mixer_scraper.collect --league-id 19924 --db tournament.db
+python -m pari_mixer_scraper.report --db tournament.db
+```
+
+## Схема базы данных
+
+- `heroes(hero_id, name, localized_name)`
+- `teams(team_id, name)`
+- `players(account_id, name, team_id)`
+- `matches(match_id, league_id, start_time, duration, radiant_team_id, dire_team_id, radiant_win)`
+- `match_players(match_id, account_id, hero_id, team_id, is_radiant, kills, deaths, assists)`
+
+`match_players` — основная таблица для вопроса "какой игрок на каком герое
+играл"; на ней строятся и веб-эндпоинты, и `report.py`.
+
+## API веб-приложения
+
+- `GET /api/teams` — список команд с числом игроков.
+- `GET /api/teams/<team_id>` — игроки команды и герои, на которых каждый играл.
+- `POST /api/collect` — запускает сбор данных в фоновом потоке (409, если уже запущен).
+- `GET /api/collect/status` — статус текущего/последнего сбора и лог.
+
+## Если league_id не подходит
+
+- Проверить название лиги: `GET https://api.opendota.com/api/leagues/{league_id}`.
+- Список всех лиг для поиска по имени: `GET https://api.opendota.com/api/leagues`.
+- `leagueid` конкретного матча: `GET https://api.opendota.com/api/matches/{match_id}`.
+
+## Ограничения
+
+- Игроки, скрывшие профиль (анонимный `account_id`), не сопоставляются между
+  матчами — такие записи пропускаются с предупреждением в логе.
+- OpenDota, бесплатный тариф: 60 запросов/мин, 50k/месяц — клиент сам
+  выдерживает паузы и повторяет запрос при 429.
+- Steam Web API также ограничен по частоте запросов; клиент выдерживает
+  паузу между запросами и делает retry при 429.

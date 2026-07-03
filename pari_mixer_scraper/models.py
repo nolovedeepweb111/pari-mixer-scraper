@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 from sqlalchemy import Engine, ForeignKey, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -11,28 +9,13 @@ class Base(DeclarativeBase):
 
 
 def build_engine(db_path: str) -> Engine:
-    """Turso (libSQL) if TURSO_DATABASE_URL/TURSO_AUTH_TOKEN are set -
-    that's a real hosted database, so match data survives redeploys and
-    restarts instead of being wiped by free-tier ephemeral disks. Falls
-    back to a plain local SQLite file (unchanged local-dev behavior) when
-    they're not set.
-
-    The auth token has to go through connect_args (as auth_token, not a
-    URL query param) - the libsql dialect's create_connect_args() only
-    recognizes a fixed allowlist of sqlite3-style query params and passes
-    everything else straight to the server, so an authToken=... query
-    param silently never reaches the driver and the connection gets
-    rejected as unauthorized."""
+    """Local SQLite file. (Turso/libSQL was tried here as a persistent
+    backend, but its Rust driver appears to hold the GIL during network
+    I/O badly enough to make the whole app unresponsive mid-collection -
+    not worth it. Back to a plain local file; see git history if
+    revisiting this.)"""
     from sqlalchemy import create_engine
 
-    turso_url = os.environ.get("TURSO_DATABASE_URL")
-    turso_token = os.environ.get("TURSO_AUTH_TOKEN")
-    if turso_url and turso_token:
-        hostname = turso_url.removeprefix("libsql://")
-        return create_engine(
-            f"sqlite+libsql://{hostname}/?secure=true",
-            connect_args={"auth_token": turso_token},
-        )
     return create_engine(f"sqlite:///{db_path}")
 
 

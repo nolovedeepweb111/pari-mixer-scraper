@@ -195,11 +195,20 @@ def persist_match(
     pro_directory: dict[int, dict],
     team_names: dict[int, str | None],
 ) -> None:
+    # Explicit flush()es at each dependency boundary (teams -> match ->
+    # players -> match_players) instead of relying on SQLAlchemy's
+    # automatic flush-order dependency sort: that sort is reliable against
+    # local SQLite, but against Turso/libSQL (which - unlike local SQLite's
+    # default - actually enforces foreign keys) statements ended up sent in
+    # an order that tripped FOREIGN KEY constraint failures. Flushing at
+    # each stage guarantees the referenced rows exist first regardless of
+    # dialect-specific autoflush/ordering quirks.
     match_id = match["match_id"]
     radiant_team_id = match.get("radiant_team_id")
     dire_team_id = match.get("dire_team_id")
     upsert_team(session, radiant_team_id, team_names.get(radiant_team_id))
     upsert_team(session, dire_team_id, team_names.get(dire_team_id))
+    session.flush()
 
     session.add(Match(
         match_id=match_id,
@@ -210,17 +219,21 @@ def persist_match(
         dire_team_id=dire_team_id,
         radiant_win=match.get("radiant_win"),
     ))
+    session.flush()
 
+    player_rows = []
     for p in match["players"]:
         account_id = p["account_id"]
         is_radiant = bool(p["is_radiant"])
         team_id = radiant_team_id if is_radiant else dire_team_id
-
         upsert_player(session, account_id, None, team_id, pro_directory)
+        player_rows.append((p, is_radiant, team_id))
+    session.flush()
 
+    for p, is_radiant, team_id in player_rows:
         session.add(MatchPlayer(
             match_id=match_id,
-            account_id=account_id,
+            account_id=p["account_id"],
             hero_id=p["hero_id"],
             team_id=team_id,
             is_radiant=is_radiant,

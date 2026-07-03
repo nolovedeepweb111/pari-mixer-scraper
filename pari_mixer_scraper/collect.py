@@ -460,9 +460,6 @@ def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, en
         progress("Syncing hero list...")
         sync_heroes(session, od_client)
 
-        progress("Syncing pro player directory...")
-        pro_directory = fetch_pro_player_directory(od_client)
-
         progress(f"Fetching match list for league_id={league_id}...")
         matches = fetch_all_league_matches(league_id, od_client, steam_client, progress)
         if not matches:
@@ -476,18 +473,16 @@ def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, en
         new_matches = [m for m in matches if m["match_id"] not in existing_match_ids]
         progress(f"{len(matches)} matches total, {len(new_matches)} new")
 
+        # Saving matches with no team name yet (rather than looking them up
+        # here via Steam/OpenDota, which is almost always a dead-end 404 for
+        # these ad-hoc mixer teams) gets a usable site up fast: real names,
+        # rosters and MMR all come from the MixerCup link-up right below,
+        # which is one cheap GraphQL call - not a slow per-team lookup loop.
         if new_matches:
-            team_ids = {m.get("radiant_team_id") for m in new_matches} | {m.get("dire_team_id") for m in new_matches}
-            team_names = resolve_team_names(od_client, steam_client, {t for t in team_ids if t}, progress)
-
             for i, m in enumerate(new_matches, start=1):
                 progress(f"[{i}/{len(new_matches)}] Saving match {m['match_id']}")
-                persist_match(session, league_id, m, pro_directory, team_names)
+                persist_match(session, league_id, m, {}, {})
                 session.commit()
-
-        enrich_missing_player_names(session, od_client, progress)
-        enrich_missing_team_names(session, od_client, steam_client, progress)
-        sync_draft_data(session, od_client, progress)
 
         mixer_client = MixerCupClient()
         mixer_tournament_id = os.environ.get("MIXER_TOURNAMENT_ID")
@@ -507,6 +502,23 @@ def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, en
             link_mixercup_data(session, mixer_client, mixer_tournament_id, progress)
 
         apply_manual_roster_overrides(session, progress)
+        session.commit()
+        progress("Core team/roster data ready - filling in the slower supplementary details now.")
+
+        # Everything from here on is supplementary (nicknames for players
+        # MixerCup didn't cover, fallback team names, draft history for the
+        # "Последние драфты" tab) - the site already looks right without it.
+        progress("Syncing pro player directory...")
+        pro_directory = fetch_pro_player_directory(od_client)
+        for player in session.execute(select(Player).where(Player.name.is_(None))).scalars():
+            pro_info = pro_directory.get(player.account_id)
+            if pro_info and pro_info.get("name"):
+                player.name = pro_info["name"]
+        session.commit()
+
+        enrich_missing_player_names(session, od_client, progress)
+        enrich_missing_team_names(session, od_client, steam_client, progress)
+        sync_draft_data(session, od_client, progress)
 
     progress("Done.")
     return len(new_matches)

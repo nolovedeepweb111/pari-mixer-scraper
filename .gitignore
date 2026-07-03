@@ -5,3 +5,4 @@ __pycache__/
 tournament.db
 cloudflared.exe
 cloudflared.log
+gh_cli/

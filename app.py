@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from pari_mixer_scraper.analysis import compute_team_stats, generate_coach_text
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID, collect
-from pari_mixer_scraper.models import Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, Team
+from pari_mixer_scraper.models import Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, Team, configure_sqlite
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -21,11 +21,15 @@ DB_PATH = os.environ.get("TOURNAMENT_DB", str(BASE_DIR / "tournament.db"))
 LEAGUE_ID = int(os.environ.get("LEAGUE_ID", DEFAULT_LEAGUE_ID))
 
 app = Flask(__name__, static_folder="static", static_url_path="")
-engine = create_engine(f"sqlite:///{DB_PATH}")
+engine = configure_sqlite(create_engine(f"sqlite:///{DB_PATH}"))
 Base.metadata.create_all(engine)
 
-_collect_state = {"running": False, "log": [], "error": None, "new_matches": None}
+_collect_state = {"running": False, "log": [], "error": None, "new_matches": None, "started_at": None}
 _collect_lock = threading.Lock()
+# If a run has been "running" longer than this with no sign of life, treat
+# it as dead (stuck thread, killed worker that never reset the flag, etc.)
+# and allow a new attempt rather than blocking the site's data forever.
+_STALE_RUN_SECONDS = 15 * 60
 
 
 def _append_log(msg: str) -> None:
@@ -44,12 +48,19 @@ def _run_collect() -> None:
         _collect_state["running"] = False
 
 
-def _start_collect_background() -> bool:
-    """Returns False if a collection is already running."""
+def _start_collect_background(force: bool = False) -> bool:
+    """Returns False if a (non-stale) collection is already running."""
     with _collect_lock:
-        if _collect_state["running"]:
+        started_at = _collect_state.get("started_at")
+        is_stale = started_at is not None and (time.monotonic() - started_at) > _STALE_RUN_SECONDS
+        if _collect_state["running"] and not (force or is_stale):
             return False
-        _collect_state.update({"running": True, "log": [], "error": None, "new_matches": None})
+        if _collect_state["running"] and is_stale:
+            _append_log("Previous run looked stuck (no progress for 15+ min) - starting a new one.")
+        _collect_state.update({
+            "running": True, "log": list(_collect_state["log"]) if is_stale else [],
+            "error": None, "new_matches": None, "started_at": time.monotonic(),
+        })
         threading.Thread(target=_run_collect, daemon=True).start()
     return True
 

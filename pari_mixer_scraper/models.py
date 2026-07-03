@@ -1,11 +1,29 @@
 from __future__ import annotations
 
-from sqlalchemy import ForeignKey
+from sqlalchemy import Engine, ForeignKey, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
     pass
+
+
+def configure_sqlite(engine: Engine) -> Engine:
+    """Enables WAL mode so the web app's read queries and the background
+    collector's writes don't lock each other out - the default SQLite
+    rollback-journal mode serializes readers and writers, and with a
+    default-length lock-wait timeout a busy app can effectively starve a
+    background writer indefinitely under steady read traffic. Also raises
+    the busy timeout so any remaining contention waits and fails loudly
+    instead of hanging silently."""
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+
+    return engine
 
 
 class Hero(Base):

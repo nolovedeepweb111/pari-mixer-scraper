@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 .env
 tournament.db
+tournament.db-shm
+tournament.db-wal
 cloudflared.exe
 cloudflared.log
 gh_cli/

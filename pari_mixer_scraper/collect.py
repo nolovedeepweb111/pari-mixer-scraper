@@ -11,7 +11,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from .mixercup_client import MixerCupClient
-from .models import Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, Team
+from .models import Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, Team, configure_sqlite
 from .opendota_client import OpenDotaClient
 from .roster_overrides import MANUAL_ROSTER_OVERRIDES
 from .steam_client import SteamClient
@@ -439,8 +439,9 @@ def apply_manual_roster_overrides(session: Session, progress: ProgressFn) -> Non
 def collect(league_id: int, db_path: str, progress: ProgressFn | None = None) -> int:
     """Runs a full collection pass. Returns the number of newly stored matches."""
     progress = progress or log.info
+    progress("Starting collection...")
 
-    engine = create_engine(f"sqlite:///{db_path}")
+    engine = configure_sqlite(create_engine(f"sqlite:///{db_path}"))
     Base.metadata.create_all(engine)
 
     od_client = OpenDotaClient()

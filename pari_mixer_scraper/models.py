@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from sqlalchemy import Engine, ForeignKey, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -8,14 +10,29 @@ class Base(DeclarativeBase):
     pass
 
 
+def build_database_url(db_path: str) -> str:
+    """Turso (libSQL) if TURSO_DATABASE_URL/TURSO_AUTH_TOKEN are set -
+    that's a real hosted database, so match data survives redeploys and
+    restarts instead of being wiped by free-tier ephemeral disks. Falls
+    back to a plain local SQLite file (unchanged local-dev behavior) when
+    they're not set."""
+    turso_url = os.environ.get("TURSO_DATABASE_URL")
+    turso_token = os.environ.get("TURSO_AUTH_TOKEN")
+    if turso_url and turso_token:
+        hostname = turso_url.removeprefix("libsql://")
+        return f"sqlite+libsql://{hostname}/?authToken={turso_token}&secure=true"
+    return f"sqlite:///{db_path}"
+
+
 def configure_sqlite(engine: Engine) -> Engine:
     """Raises SQLite's lock-wait timeout so contention between the web
     app's reads and the background collector's writes waits and fails
-    loudly instead of the default short wait. (WAL mode was tried here
-    too, but its shared-memory (-shm) file relies on mmap semantics that
-    some container filesystems - Render's free-tier disk included - don't
-    support properly, which hung the app outright instead of helping.
-    Plain rollback-journal mode with a longer busy_timeout is safer.)"""
+    loudly instead of the default short wait. Local-file SQLite only -
+    Turso/libSQL handles its own concurrency and doesn't need this pragma
+    (and may not support it the same way over the wire)."""
+    if engine.url.get_backend_name() != "sqlite" or engine.url.get_driver_name() == "libsql":
+        return engine
+
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()

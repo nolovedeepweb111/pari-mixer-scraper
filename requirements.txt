@@ -3,3 +3,7 @@ SQLAlchemy>=2.0
 Flask>=3.0
 python-dotenv>=1.0
 gunicorn>=22.0; sys_platform != "win32"
+# No prebuilt Windows wheel for libsql-experimental (a dependency of this) -
+# needs a Rust toolchain to build from source there. Not needed for local
+# dev anyway (falls back to plain SQLite when TURSO_* env vars aren't set).
+sqlalchemy-libsql>=0.1; sys_platform != "win32"

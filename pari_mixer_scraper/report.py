@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from pathlib import Path
 
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from .models import Hero, MatchPlayer, Player, Team
+from .models import Hero, MatchPlayer, Player, Team, build_database_url
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 def report(db_path: str) -> None:
-    engine = create_engine(f"sqlite:///{db_path}")
+    engine = create_engine(build_database_url(db_path))
     with Session(engine) as session:
         rows = session.execute(
             select(Player.name, Player.account_id, Team.name, Hero.localized_name)

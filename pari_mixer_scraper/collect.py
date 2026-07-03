@@ -11,7 +11,10 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from .mixercup_client import MixerCupClient
-from .models import Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, Team, configure_sqlite
+from .models import (
+    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, Team,
+    build_database_url, configure_sqlite,
+)
 from .opendota_client import OpenDotaClient
 from .roster_overrides import MANUAL_ROSTER_OVERRIDES
 from .steam_client import SteamClient
@@ -447,7 +450,7 @@ def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, en
     progress("Starting collection...")
 
     if engine is None:
-        engine = configure_sqlite(create_engine(f"sqlite:///{db_path}"))
+        engine = configure_sqlite(create_engine(build_database_url(db_path)))
     Base.metadata.create_all(engine)
 
     od_client = OpenDotaClient()

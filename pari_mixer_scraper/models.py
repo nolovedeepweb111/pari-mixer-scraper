@@ -9,17 +9,16 @@ class Base(DeclarativeBase):
 
 
 def configure_sqlite(engine: Engine) -> Engine:
-    """Enables WAL mode so the web app's read queries and the background
-    collector's writes don't lock each other out - the default SQLite
-    rollback-journal mode serializes readers and writers, and with a
-    default-length lock-wait timeout a busy app can effectively starve a
-    background writer indefinitely under steady read traffic. Also raises
-    the busy timeout so any remaining contention waits and fails loudly
-    instead of hanging silently."""
+    """Raises SQLite's lock-wait timeout so contention between the web
+    app's reads and the background collector's writes waits and fails
+    loudly instead of the default short wait. (WAL mode was tried here
+    too, but its shared-memory (-shm) file relies on mmap semantics that
+    some container filesystems - Render's free-tier disk included - don't
+    support properly, which hung the app outright instead of helping.
+    Plain rollback-journal mode with a longer busy_timeout is safer.)"""
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA busy_timeout=30000")
         cursor.close()
 

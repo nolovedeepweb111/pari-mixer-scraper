@@ -436,12 +436,18 @@ def apply_manual_roster_overrides(session: Session, progress: ProgressFn) -> Non
         progress(f"Applied {applied} manual roster override(s)")
 
 
-def collect(league_id: int, db_path: str, progress: ProgressFn | None = None) -> int:
-    """Runs a full collection pass. Returns the number of newly stored matches."""
+def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, engine=None) -> int:
+    """Runs a full collection pass. Returns the number of newly stored matches.
+
+    Pass an existing `engine` when calling from a process that already has
+    one open on the same db_path (e.g. the Flask app) - two separate
+    SQLAlchemy Engines/pools pointed at the same SQLite file from the same
+    process is an easy way to end up with avoidable lock contention."""
     progress = progress or log.info
     progress("Starting collection...")
 
-    engine = configure_sqlite(create_engine(f"sqlite:///{db_path}"))
+    if engine is None:
+        engine = configure_sqlite(create_engine(f"sqlite:///{db_path}"))
     Base.metadata.create_all(engine)
 
     od_client = OpenDotaClient()

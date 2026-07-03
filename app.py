@@ -39,7 +39,7 @@ def _append_log(msg: str) -> None:
 
 def _run_collect() -> None:
     try:
-        new_count = collect(LEAGUE_ID, DB_PATH, progress=_append_log)
+        new_count = collect(LEAGUE_ID, DB_PATH, progress=_append_log, engine=engine)
         _collect_state["new_matches"] = new_count
     except Exception as e:
         _collect_state["error"] = str(e)

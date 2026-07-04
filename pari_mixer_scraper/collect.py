@@ -466,11 +466,17 @@ def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, en
     progress("Starting collection...")
 
     if engine is None:
+        # Only need to create tables here when we own the engine - when
+        # one is passed in (e.g. by the Flask app), the caller already
+        # did this once at startup. Re-running create_all() against an
+        # engine that's concurrently serving other requests is exactly
+        # what was deadlocking every collection on Render: it needs its
+        # own connection from the same pool other requests are using,
+        # and apparently never got one back.
         progress("Building a new database engine...")
         engine = configure_sqlite(build_engine(db_path))
-    progress("Engine ready, ensuring tables exist...")
-    Base.metadata.create_all(engine)
-    progress("Tables ready, building API clients...")
+        Base.metadata.create_all(engine)
+    progress("Engine ready, building API clients...")
 
     od_client = OpenDotaClient()
     steam_api_key = os.environ.get("STEAM_API_KEY")

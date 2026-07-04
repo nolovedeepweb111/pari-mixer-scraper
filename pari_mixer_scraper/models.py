@@ -20,17 +20,24 @@ def build_engine(db_path: str) -> Engine:
 
 
 def configure_sqlite(engine: Engine) -> Engine:
-    """Raises SQLite's lock-wait timeout so contention between the web
-    app's reads and the background collector's writes waits and fails
-    loudly instead of the default short wait. Local-file SQLite only -
-    Turso/libSQL handles its own concurrency and doesn't need this pragma
-    (and may not support it the same way over the wire)."""
-    if engine.url.get_backend_name() != "sqlite" or engine.url.get_driver_name() == "libsql":
+    """Enables WAL mode so the web app's reads (including external uptime
+    pings) and the background collector's writes don't lock each other out
+    - the default rollback-journal mode serializes readers and writers, and
+    under real traffic that surfaced as outright "database is locked"
+    errors that aborted a whole collection mid-run. (WAL was tried and
+    reverted once before, but that was against Turso/libSQL - a remote
+    database over HTTP, a completely different mechanism whose Rust driver
+    turned out to be the actual problem. Plain local-file SQLite WAL is
+    the standard, well-supported case and was verified under concurrent
+    load locally before shipping this.) Also raises the busy-wait timeout
+    as a second line of defense for whatever contention remains."""
+    if engine.url.get_backend_name() != "sqlite":
         return engine
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA busy_timeout=30000")
         cursor.close()
 

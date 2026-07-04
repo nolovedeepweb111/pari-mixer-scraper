@@ -84,7 +84,14 @@ def _auto_collect_if_empty() -> None:
 def _collect_scheduler_loop(interval_seconds: int) -> None:
     while True:
         time.sleep(interval_seconds)
-        _start_collect_background()
+        try:
+            _start_collect_background()
+        except Exception as e:
+            # Never let an unexpected error here kill the loop silently -
+            # Python threads don't auto-restart, so one uncaught exception
+            # would permanently stop future scheduled collections with no
+            # visible sign anything was wrong.
+            _append_log(f"Periodic collect trigger failed: {e}")
 
 
 def _start_periodic_collect() -> None:

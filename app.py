@@ -291,7 +291,7 @@ def _hero_icon_slug(internal_name: str) -> str:
     return internal_name[len(prefix):] if internal_name.startswith(prefix) else internal_name
 
 
-def _recent_drafts(session: Session, team_id: int, limit: int = 15) -> list[dict]:
+def _recent_drafts(session: Session, team_id: int, limit: int = 23) -> list[dict]:
     """Full draft (both teams' picks and bans, in actual draft order) for
     this team's last few matches - not just this team's own bans, since
     what the *opponent* banned against them is the more useful signal."""

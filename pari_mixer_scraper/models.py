@@ -20,25 +20,26 @@ def build_engine(db_path: str) -> Engine:
 
 
 def configure_sqlite(engine: Engine) -> Engine:
-    """Enables WAL mode so the web app's reads (including external uptime
-    pings) and the background collector's writes don't lock each other out
-    - the default rollback-journal mode serializes readers and writers, and
-    under real traffic that surfaced as outright "database is locked"
-    errors that aborted a whole collection mid-run. (WAL was tried and
-    reverted once before, but that was against Turso/libSQL - a remote
-    database over HTTP, a completely different mechanism whose Rust driver
-    turned out to be the actual problem. Plain local-file SQLite WAL is
-    the standard, well-supported case and was verified under concurrent
-    load locally before shipping this.) Also raises the busy-wait timeout
-    as a second line of defense for whatever contention remains."""
+    """Raises SQLite's lock-wait timeout so contention between the web
+    app's reads and the background collector's writes waits and fails
+    loudly instead of the default short wait.
+
+    WAL mode was tried here twice - once against Turso/libSQL, once
+    against a plain local file - and both times the app hung hard on
+    Render specifically (never reproduced locally under the same
+    concurrent load). Whatever the exact mechanism, WAL's reliance on a
+    shared-memory (-shm) file via mmap doesn't play well with Render's
+    disk. Rather than chase that further, this leans on a generous
+    busy_timeout plus the stale-run recovery in app.py: an occasional
+    "database is locked" failure is tolerated and self-heals within
+    minutes instead of being eliminated outright."""
     if engine.url.get_backend_name() != "sqlite":
         return engine
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA busy_timeout=60000")
         cursor.close()
 
     return engine

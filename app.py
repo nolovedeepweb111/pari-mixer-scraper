@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import multiprocessing
 import os
-import queue as queue_module
 import threading
 import time
 from pathlib import Path
@@ -13,7 +11,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from pari_mixer_scraper.analysis import compute_team_stats, generate_coach_text
-from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID, run_collect_process
+from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID, collect
 from pari_mixer_scraper.mixercup_client import MixerCupClient
 from pari_mixer_scraper.models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, Team,
@@ -43,96 +41,27 @@ def _append_log(msg: str) -> None:
     _collect_state["log"] = _collect_state["log"][-200:]
 
 
-# Even the slowest legitimate pass (first-ever backfill of drafts for every
-# past match, one OpenDota call each) shouldn't take anywhere near this;
-# anything longer gets killed outright rather than left to hang forever.
-_COLLECT_HARD_TIMEOUT_SECONDS = 10 * 60
-
-# The default start method on Linux is "fork", which is well-documented as
-# unsafe in a multi-threaded process (this app already runs a periodic
-# scheduler thread, plus this supervisor itself is a thread): the forked
-# child can inherit a lock held by some other thread at the instant of the
-# fork, and since that thread doesn't exist in the child to ever release
-# it, the child deadlocks before it can do anything - which is exactly what
-# was observed after switching to a subprocess: the child never even
-# emitted its first "Starting collection..." log line. "spawn" starts a
-# fresh interpreter instead of cloning this one, sidestepping that hazard
-# entirely.
-_mp_context = multiprocessing.get_context("spawn")
-
-
 def _run_collect() -> None:
-    """Runs collect() in a subprocess with a hard wall-clock deadline.
+    """Runs collect() directly on this background thread.
 
-    A previous version of this ran collect() directly on this thread and,
-    separately, tried bounding individual API calls with a
-    ThreadPoolExecutor-based timeout - and the exact same hang (stuck
-    indefinitely on an OpenDota request, reproducible only on Render, never
-    locally) came back through *that* too: the calling thread's own timed
-    wait never fired, which only makes sense if something wasn't releasing
-    the GIL the way it's supposed to. A Python-level timeout can't defend
-    against that since it still needs the GIL to wake up and raise. An OS
-    process doesn't have that problem - SIGTERM/SIGKILL from outside works
-    regardless of what its interpreter is doing internally.
-
-    Everything below is wrapped in try/finally: without it, a failure in
-    spawning the process itself (e.g. the platform restricting process
-    creation outright) would raise out of this function, silently kill this
-    thread (Python threads don't surface exceptions anywhere by default),
-    and leave _collect_state stuck at running=True forever with no error
-    ever recorded - indistinguishable from a genuine hang."""
-    process = None
+    A subprocess-based version of this was tried (to get a hard, OS-level
+    kill on a hung run instead of a cooperative Python-level timeout) but
+    made things worse: multiprocessing.Queue()'s first use unconditionally
+    forks a resource-tracker helper process internally, regardless of which
+    start method ("fork" or "spawn") you picked for your own Process - and
+    that appears to hang indefinitely in this environment, wedging the
+    supervisor before it even gets to start collect() at all (confirmed via
+    Render's logs: the run sat at running=true for over an hour, far past
+    even the 10-minute hard deadline that code tried to enforce). Reverted
+    to the simple direct-call version; the stale-run recovery in
+    _start_collect_background is what catches a hang here instead."""
     try:
-        result_queue = _mp_context.Queue()
-        process = _mp_context.Process(
-            target=run_collect_process, args=(LEAGUE_ID, DB_PATH, result_queue), daemon=True,
-        )
-        process.start()
-
-        deadline = time.monotonic() + _COLLECT_HARD_TIMEOUT_SECONDS
-        settled = False
-        while time.monotonic() < deadline:
-            try:
-                kind, payload = result_queue.get(timeout=1.0)
-            except queue_module.Empty:
-                if not process.is_alive():
-                    break
-                continue
-            if kind == "log":
-                _append_log(payload)
-                continue
-            if kind == "done":
-                _collect_state["new_matches"] = payload
-            else:
-                _collect_state["error"] = payload
-                _append_log(f"ERROR: {payload}")
-            settled = True
-            break
-
-        if not settled:
-            if process.is_alive():
-                _append_log(
-                    f"Collection exceeded the {_COLLECT_HARD_TIMEOUT_SECONDS}s hard limit - "
-                    "killing the stuck process."
-                )
-                process.terminate()
-                process.join(5)
-                if process.is_alive():
-                    process.kill()
-            _collect_state["error"] = (
-                _collect_state["error"] or f"Timed out after {_COLLECT_HARD_TIMEOUT_SECONDS}s"
-            )
+        new_count = collect(LEAGUE_ID, DB_PATH, progress=_append_log, engine=engine)
+        _collect_state["new_matches"] = new_count
     except Exception as e:
         _collect_state["error"] = str(e)
         _append_log(f"ERROR: {e}")
     finally:
-        if process is not None:
-            try:
-                if process.is_alive():
-                    process.kill()
-                process.join(timeout=5)
-            except Exception:
-                pass
         _collect_state["running"] = False
 
 

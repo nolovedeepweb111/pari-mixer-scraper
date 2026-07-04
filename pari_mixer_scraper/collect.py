@@ -559,26 +559,6 @@ def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, en
     return len(new_matches)
 
 
-def run_collect_process(league_id: int, db_path: str, result_queue) -> None:
-    """Entry point for running collect() in its own OS process (see
-    app.py's _run_collect for why: a hang here needs to be killable from
-    outside, regardless of what the child's interpreter/GIL is doing).
-
-    Deliberately lives in this module rather than app.py: multiprocessing's
-    "spawn" start method (required here - see app.py) re-imports whatever
-    module this function is defined in in the fresh child interpreter, and
-    this module has no Flask-app-creation side effects at import time,
-    unlike app.py."""
-    def progress(msg: str) -> None:
-        result_queue.put(("log", msg))
-
-    try:
-        new_count = collect(league_id, db_path, progress=progress, engine=None)
-        result_queue.put(("done", new_count))
-    except Exception as e:
-        result_queue.put(("error", str(e)))
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Collect player/hero data for a Dota 2 esports league into SQLite."

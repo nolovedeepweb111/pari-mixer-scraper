@@ -4,6 +4,8 @@ import time
 
 import requests
 
+from .http_utils import call_with_timeout
+
 BASE_URL = "https://api.steampowered.com/IDOTA2Match_570"
 
 # Sentinel Valve uses for a player who has hidden their match history.
@@ -31,7 +33,10 @@ class SteamClient:
             if elapsed < self.min_interval:
                 time.sleep(self.min_interval - elapsed)
 
-            resp = self.session.get(url, params=query, timeout=30)
+            resp = call_with_timeout(
+                lambda: self.session.get(url, params=query, timeout=30),
+                timeout=35,
+            )
             self._last_request = time.monotonic()
 
             if resp.status_code == 429:

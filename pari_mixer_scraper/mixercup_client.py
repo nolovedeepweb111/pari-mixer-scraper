@@ -5,6 +5,8 @@ import time
 
 import requests
 
+from .http_utils import call_with_timeout
+
 BASE_URL = "https://api.mixer-cup.gg"
 
 # SteamID64 -> SteamID32 (Dota account_id) offset.
@@ -100,11 +102,14 @@ class MixerCupClient:
         if elapsed < self.min_interval:
             time.sleep(self.min_interval - elapsed)
 
-        resp = self.session.post(
-            self.base_url,
-            json={"query": query, "variables": variables or {}},
-            headers={"Content-Type": "application/json"},
-            timeout=30,
+        resp = call_with_timeout(
+            lambda: self.session.post(
+                self.base_url,
+                json={"query": query, "variables": variables or {}},
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            ),
+            timeout=35,
         )
         self._last_request = time.monotonic()
         resp.raise_for_status()

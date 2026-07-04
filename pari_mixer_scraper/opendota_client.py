@@ -4,6 +4,8 @@ import time
 
 import requests
 
+from .http_utils import call_with_timeout
+
 BASE_URL = "https://api.opendota.com/api"
 
 
@@ -24,7 +26,10 @@ class OpenDotaClient:
             if elapsed < self.min_interval:
                 time.sleep(self.min_interval - elapsed)
 
-            resp = self.session.get(f"{self.base_url}{path}", params=params, timeout=30)
+            resp = call_with_timeout(
+                lambda: self.session.get(f"{self.base_url}{path}", params=params, timeout=30),
+                timeout=35,
+            )
             self._last_request = time.monotonic()
 
             if resp.status_code == 429:

@@ -13,7 +13,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from pari_mixer_scraper.analysis import compute_team_stats, generate_coach_text
-from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID, collect
+from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID, run_collect_process
 from pari_mixer_scraper.mixercup_client import MixerCupClient
 from pari_mixer_scraper.models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, Team,
@@ -48,23 +48,17 @@ def _append_log(msg: str) -> None:
 # anything longer gets killed outright rather than left to hang forever.
 _COLLECT_HARD_TIMEOUT_SECONDS = 10 * 60
 
-
-def _collect_worker(league_id: int, db_path: str, result_queue: "multiprocessing.Queue") -> None:
-    """Runs in its own OS process, not just a thread - see _run_collect for
-    why. Builds its own DB engine (engine=None) instead of sharing the
-    Flask app's, since an Engine/connection can't cross a process boundary
-    anyway; separate per-process connections against the same SQLite file
-    is the normal, well-supported way to use it (busy_timeout, set in
-    configure_sqlite, is exactly what handles that cross-process
-    contention)."""
-    def progress(msg: str) -> None:
-        result_queue.put(("log", msg))
-
-    try:
-        new_count = collect(league_id, db_path, progress=progress, engine=None)
-        result_queue.put(("done", new_count))
-    except Exception as e:
-        result_queue.put(("error", str(e)))
+# The default start method on Linux is "fork", which is well-documented as
+# unsafe in a multi-threaded process (this app already runs a periodic
+# scheduler thread, plus this supervisor itself is a thread): the forked
+# child can inherit a lock held by some other thread at the instant of the
+# fork, and since that thread doesn't exist in the child to ever release
+# it, the child deadlocks before it can do anything - which is exactly what
+# was observed after switching to a subprocess: the child never even
+# emitted its first "Starting collection..." log line. "spawn" starts a
+# fresh interpreter instead of cloning this one, sidestepping that hazard
+# entirely.
+_mp_context = multiprocessing.get_context("spawn")
 
 
 def _run_collect() -> None:
@@ -80,8 +74,10 @@ def _run_collect() -> None:
     against that since it still needs the GIL to wake up and raise. An OS
     process doesn't have that problem - SIGTERM/SIGKILL from outside works
     regardless of what its interpreter is doing internally."""
-    result_queue: multiprocessing.Queue = multiprocessing.Queue()
-    process = multiprocessing.Process(target=_collect_worker, args=(LEAGUE_ID, DB_PATH, result_queue), daemon=True)
+    result_queue = _mp_context.Queue()
+    process = _mp_context.Process(
+        target=run_collect_process, args=(LEAGUE_ID, DB_PATH, result_queue), daemon=True,
+    )
     process.start()
 
     deadline = time.monotonic() + _COLLECT_HARD_TIMEOUT_SECONDS

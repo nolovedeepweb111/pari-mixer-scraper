@@ -73,47 +73,67 @@ def _run_collect() -> None:
     the GIL the way it's supposed to. A Python-level timeout can't defend
     against that since it still needs the GIL to wake up and raise. An OS
     process doesn't have that problem - SIGTERM/SIGKILL from outside works
-    regardless of what its interpreter is doing internally."""
-    result_queue = _mp_context.Queue()
-    process = _mp_context.Process(
-        target=run_collect_process, args=(LEAGUE_ID, DB_PATH, result_queue), daemon=True,
-    )
-    process.start()
+    regardless of what its interpreter is doing internally.
 
-    deadline = time.monotonic() + _COLLECT_HARD_TIMEOUT_SECONDS
-    settled = False
-    while time.monotonic() < deadline:
-        try:
-            kind, payload = result_queue.get(timeout=1.0)
-        except queue_module.Empty:
-            if not process.is_alive():
-                break
-            continue
-        if kind == "log":
-            _append_log(payload)
-            continue
-        if kind == "done":
-            _collect_state["new_matches"] = payload
-        else:
-            _collect_state["error"] = payload
-            _append_log(f"ERROR: {payload}")
-        settled = True
-        break
+    Everything below is wrapped in try/finally: without it, a failure in
+    spawning the process itself (e.g. the platform restricting process
+    creation outright) would raise out of this function, silently kill this
+    thread (Python threads don't surface exceptions anywhere by default),
+    and leave _collect_state stuck at running=True forever with no error
+    ever recorded - indistinguishable from a genuine hang."""
+    process = None
+    try:
+        result_queue = _mp_context.Queue()
+        process = _mp_context.Process(
+            target=run_collect_process, args=(LEAGUE_ID, DB_PATH, result_queue), daemon=True,
+        )
+        process.start()
 
-    if not settled:
-        if process.is_alive():
-            _append_log(
-                f"Collection exceeded the {_COLLECT_HARD_TIMEOUT_SECONDS}s hard limit - "
-                "killing the stuck process."
-            )
-            process.terminate()
-            process.join(5)
+        deadline = time.monotonic() + _COLLECT_HARD_TIMEOUT_SECONDS
+        settled = False
+        while time.monotonic() < deadline:
+            try:
+                kind, payload = result_queue.get(timeout=1.0)
+            except queue_module.Empty:
+                if not process.is_alive():
+                    break
+                continue
+            if kind == "log":
+                _append_log(payload)
+                continue
+            if kind == "done":
+                _collect_state["new_matches"] = payload
+            else:
+                _collect_state["error"] = payload
+                _append_log(f"ERROR: {payload}")
+            settled = True
+            break
+
+        if not settled:
             if process.is_alive():
-                process.kill()
-        _collect_state["error"] = _collect_state["error"] or f"Timed out after {_COLLECT_HARD_TIMEOUT_SECONDS}s"
-
-    process.join(timeout=5)
-    _collect_state["running"] = False
+                _append_log(
+                    f"Collection exceeded the {_COLLECT_HARD_TIMEOUT_SECONDS}s hard limit - "
+                    "killing the stuck process."
+                )
+                process.terminate()
+                process.join(5)
+                if process.is_alive():
+                    process.kill()
+            _collect_state["error"] = (
+                _collect_state["error"] or f"Timed out after {_COLLECT_HARD_TIMEOUT_SECONDS}s"
+            )
+    except Exception as e:
+        _collect_state["error"] = str(e)
+        _append_log(f"ERROR: {e}")
+    finally:
+        if process is not None:
+            try:
+                if process.is_alive():
+                    process.kill()
+                process.join(timeout=5)
+            except Exception:
+                pass
+        _collect_state["running"] = False
 
 
 def _start_collect_background(force: bool = False) -> bool:

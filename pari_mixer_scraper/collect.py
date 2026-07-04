@@ -466,8 +466,11 @@ def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, en
     progress("Starting collection...")
 
     if engine is None:
+        progress("Building a new database engine...")
         engine = configure_sqlite(build_engine(db_path))
+    progress("Engine ready, ensuring tables exist...")
     Base.metadata.create_all(engine)
+    progress("Tables ready, building API clients...")
 
     od_client = OpenDotaClient()
     steam_api_key = os.environ.get("STEAM_API_KEY")
@@ -475,8 +478,9 @@ def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, en
     if steam_client is None:
         progress("STEAM_API_KEY not set - fetching via OpenDota only (see README for how to add a Steam Web API key).")
 
+    progress("Opening a session...")
     with Session(engine) as session:
-        progress("Syncing hero list...")
+        progress("Session open. Syncing hero list...")
         sync_heroes(session, od_client)
 
         progress(f"Fetching match list for league_id={league_id}...")

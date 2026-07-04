@@ -130,6 +130,23 @@ aside h2 {
 .player-card h3 {
   margin: 0 0 4px;
   font-size: 16px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.profile-links {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.profile-link {
+  color: var(--muted);
+  display: inline-flex;
+}
+
+.profile-link:hover {
+  color: var(--accent);
 }
 
 .player-card .mmr {
@@ -158,6 +175,21 @@ aside h2 {
 
 .next-opponent strong {
   color: var(--accent);
+}
+
+.opponent-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.opponent-link:hover {
+  color: var(--accent-hover);
 }
 
 .player-card ul {

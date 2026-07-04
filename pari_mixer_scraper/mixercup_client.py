@@ -172,6 +172,7 @@ class MixerCupClient:
         game = games[0]
         opponent = game["team2"] if game["team1"]["id"] == team_uuid else game["team1"]
         return {
+            "opponent_mixer_uuid": opponent["id"],
             "opponent_name": opponent.get("name") or f"Team {opponent['id']}",
             "planned_time": game.get("plannedTime"),
             "status": game.get("status"),

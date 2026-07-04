@@ -13,6 +13,26 @@ function heroIconUrl(slug) {
   return `https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes/icons/${slug}.png`;
 }
 
+const STEAM_ID64_BASE = 76561197960265728n;
+
+function steamProfileUrl(accountId) {
+  return `https://steamcommunity.com/profiles/${BigInt(accountId) + STEAM_ID64_BASE}`;
+}
+
+function dotabuffProfileUrl(accountId) {
+  return `https://www.dotabuff.com/players/${accountId}`;
+}
+
+const STEAM_ICON_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2C6.5 2 2 6.5 2 12c0 4.6 3.1 8.4 7.3 9.6l1.3-3.2c-.4-.5-.6-1.1-.6-1.8 0-1.7 1.3-3 3-3 .3 0 .6 0 .8.1l2.1-3c-.1-.3-.1-.6-.1-1 0-2.2 1.8-4 4-4s4 1.8 4 4-1.8 4-4 4c-.1 0-.2 0-.3 0l-2.9 2.1c0 .1 0 .3 0 .4 0 1.7-1.3 3-3 3-1.5 0-2.7-1-3-2.3l-3-1.2C8.6 20.9 10.2 22 12 22c5.5 0 10-4.5 10-10S17.5 2 12 2zm4.5 6.8a2 2 0 100 4 2 2 0 000-4z"/></svg>`;
+const DOTABUFF_ICON_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M4 20V10h4v10H4zm6 0V4h4v16h-4zm6 0v-7h4v7h-4z"/></svg>`;
+
+function profileLinks(accountId) {
+  return `
+    <a class="profile-link" href="${steamProfileUrl(accountId)}" target="_blank" rel="noopener noreferrer" title="Steam профиль">${STEAM_ICON_SVG}</a>
+    <a class="profile-link" href="${dotabuffProfileUrl(accountId)}" target="_blank" rel="noopener noreferrer" title="Dotabuff профиль">${DOTABUFF_ICON_SVG}</a>
+  `;
+}
+
 function renderDraftTeamRow(teamName, entries) {
   const cells = entries
     .map((e) => `
@@ -64,7 +84,11 @@ function renderComposition(team) {
         return `<li><span>${h.name}</span><span>${wr}<span class="count">×${h.games}</span></span></li>`;
       })
       .join("");
-    card.innerHTML = `<h3>${player.name}</h3><p class="mmr">${formatMmr(player.mmr)} MMR</p><ul>${heroItems}</ul>`;
+    card.innerHTML = `
+      <h3>${player.name}<span class="profile-links">${profileLinks(player.account_id)}</span></h3>
+      <p class="mmr">${formatMmr(player.mmr)} MMR</p>
+      <ul>${heroItems}</ul>
+    `;
     grid.appendChild(card);
   }
 
@@ -78,9 +102,16 @@ function renderComposition(team) {
     const when = opp.planned_time
       ? new Date(opp.planned_time).toLocaleString("ru-RU", { dateStyle: "medium", timeStyle: "short" })
       : "время пока не назначено";
+    const opponentLabel = opp.opponent_team_id != null
+      ? `<button class="opponent-link" data-team-id="${opp.opponent_team_id}">${opp.opponent_name}</button>`
+      : `<strong>${opp.opponent_name}</strong>`;
     const nextLine = document.createElement("p");
     nextLine.className = "next-opponent";
-    nextLine.innerHTML = `Следующий соперник: <strong>${opp.opponent_name}</strong> · ${when}`;
+    nextLine.innerHTML = `Следующий соперник: ${opponentLabel} · ${when}`;
+    const link = nextLine.querySelector(".opponent-link");
+    if (link) {
+      link.addEventListener("click", () => loadTeamDetail(opp.opponent_team_id));
+    }
     container.appendChild(nextLine);
   }
 

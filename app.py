@@ -135,9 +135,17 @@ def _get_next_opponent(mixer_uuid: str) -> dict | None:
     if tournament_id is None:
         return None
     try:
-        return _mixer_client.get_next_opponent(tournament_id, mixer_uuid)
+        opponent = _mixer_client.get_next_opponent(tournament_id, mixer_uuid)
     except Exception:
         return None
+    if opponent is None:
+        return None
+
+    with Session(engine) as session:
+        opponent["opponent_team_id"] = session.execute(
+            select(Team.team_id).where(Team.mixer_uuid == opponent["opponent_mixer_uuid"])
+        ).scalar_one_or_none()
+    return opponent
 
 
 def _roster_filter(session: Session, team_id: int):

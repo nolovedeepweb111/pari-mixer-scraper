@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing
 import os
+import queue as queue_module
 import threading
 import time
 from pathlib import Path
@@ -41,15 +43,81 @@ def _append_log(msg: str) -> None:
     _collect_state["log"] = _collect_state["log"][-200:]
 
 
-def _run_collect() -> None:
+# Even the slowest legitimate pass (first-ever backfill of drafts for every
+# past match, one OpenDota call each) shouldn't take anywhere near this;
+# anything longer gets killed outright rather than left to hang forever.
+_COLLECT_HARD_TIMEOUT_SECONDS = 10 * 60
+
+
+def _collect_worker(league_id: int, db_path: str, result_queue: "multiprocessing.Queue") -> None:
+    """Runs in its own OS process, not just a thread - see _run_collect for
+    why. Builds its own DB engine (engine=None) instead of sharing the
+    Flask app's, since an Engine/connection can't cross a process boundary
+    anyway; separate per-process connections against the same SQLite file
+    is the normal, well-supported way to use it (busy_timeout, set in
+    configure_sqlite, is exactly what handles that cross-process
+    contention)."""
+    def progress(msg: str) -> None:
+        result_queue.put(("log", msg))
+
     try:
-        new_count = collect(LEAGUE_ID, DB_PATH, progress=_append_log, engine=engine)
-        _collect_state["new_matches"] = new_count
+        new_count = collect(league_id, db_path, progress=progress, engine=None)
+        result_queue.put(("done", new_count))
     except Exception as e:
-        _collect_state["error"] = str(e)
-        _append_log(f"ERROR: {e}")
-    finally:
-        _collect_state["running"] = False
+        result_queue.put(("error", str(e)))
+
+
+def _run_collect() -> None:
+    """Runs collect() in a subprocess with a hard wall-clock deadline.
+
+    A previous version of this ran collect() directly on this thread and,
+    separately, tried bounding individual API calls with a
+    ThreadPoolExecutor-based timeout - and the exact same hang (stuck
+    indefinitely on an OpenDota request, reproducible only on Render, never
+    locally) came back through *that* too: the calling thread's own timed
+    wait never fired, which only makes sense if something wasn't releasing
+    the GIL the way it's supposed to. A Python-level timeout can't defend
+    against that since it still needs the GIL to wake up and raise. An OS
+    process doesn't have that problem - SIGTERM/SIGKILL from outside works
+    regardless of what its interpreter is doing internally."""
+    result_queue: multiprocessing.Queue = multiprocessing.Queue()
+    process = multiprocessing.Process(target=_collect_worker, args=(LEAGUE_ID, DB_PATH, result_queue), daemon=True)
+    process.start()
+
+    deadline = time.monotonic() + _COLLECT_HARD_TIMEOUT_SECONDS
+    settled = False
+    while time.monotonic() < deadline:
+        try:
+            kind, payload = result_queue.get(timeout=1.0)
+        except queue_module.Empty:
+            if not process.is_alive():
+                break
+            continue
+        if kind == "log":
+            _append_log(payload)
+            continue
+        if kind == "done":
+            _collect_state["new_matches"] = payload
+        else:
+            _collect_state["error"] = payload
+            _append_log(f"ERROR: {payload}")
+        settled = True
+        break
+
+    if not settled:
+        if process.is_alive():
+            _append_log(
+                f"Collection exceeded the {_COLLECT_HARD_TIMEOUT_SECONDS}s hard limit - "
+                "killing the stuck process."
+            )
+            process.terminate()
+            process.join(5)
+            if process.is_alive():
+                process.kill()
+        _collect_state["error"] = _collect_state["error"] or f"Timed out after {_COLLECT_HARD_TIMEOUT_SECONDS}s"
+
+    process.join(timeout=5)
+    _collect_state["running"] = False
 
 
 def _start_collect_background(force: bool = False) -> bool:

@@ -29,15 +29,21 @@ DEFAULT_LEAGUE_ID = 19924  # Pari Mixer Cup
 ProgressFn = Callable[[str], None]
 
 
-def sync_heroes(session: Session, client: OpenDotaClient) -> None:
-    for h in client.get_heroes():
+def sync_heroes(session: Session, client: OpenDotaClient, progress: ProgressFn | None = None) -> None:
+    progress = progress or (lambda msg: None)
+    progress("  Requesting hero list from OpenDota...")
+    heroes = client.get_heroes()
+    progress(f"  Got {len(heroes)} heroes from OpenDota, upserting into DB...")
+    for h in heroes:
         hero = session.get(Hero, h["id"])
         if hero is None:
             session.add(Hero(hero_id=h["id"], name=h["name"], localized_name=h["localized_name"]))
         else:
             hero.name = h["name"]
             hero.localized_name = h["localized_name"]
+    progress("  Hero upserts staged, committing...")
     session.commit()
+    progress("  Hero sync commit done.")
 
 
 def fetch_pro_player_directory(client: OpenDotaClient) -> dict[int, dict]:
@@ -487,7 +493,7 @@ def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, en
     progress("Opening a session...")
     with Session(engine) as session:
         progress("Session open. Syncing hero list...")
-        sync_heroes(session, od_client)
+        sync_heroes(session, od_client, progress)
 
         progress(f"Fetching match list for league_id={league_id}...")
         matches = fetch_all_league_matches(league_id, od_client, steam_client, progress)

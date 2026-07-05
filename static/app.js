@@ -236,6 +236,61 @@ async function loadTeamDetail(teamId, tab) {
   loadTeams();
 }
 
+const tournamentStatsBtn = document.getElementById("tournament-stats-btn");
+
+function renderTournamentHeroStats(data) {
+  const winRateHtml = data.top_win_rate.length
+    ? data.top_win_rate
+        .map((h) => `<span class="tag tag-pick">${h.hero} — ${h.win_rate}% (${h.wins}/${h.games})</span>`)
+        .join("")
+    : '<span class="hint">нет данных</span>';
+
+  const bannedHtml = data.most_banned.length
+    ? data.most_banned.map((h) => `<span class="tag tag-ban">${h.hero} ×${h.bans}</span>`).join("")
+    : '<span class="hint">нет данных</span>';
+
+  const monopolyHtml = data.signature_by_player.length
+    ? data.signature_by_player
+        .map((h) => {
+          const players = h.top_players.map((p) => `${p.name} (${p.games})`).join(", ");
+          return `<span class="tag tag-neutral">${h.hero} — ${h.concentration}%: ${players}</span>`;
+        })
+        .join("")
+    : '<span class="hint">нет данных</span>';
+
+  detailEl.innerHTML = `
+    <h2>Статистика по героям турнира</h2>
+    <p class="hint">Учитываются герои минимум с ${data.min_games} играми.</p>
+    <div class="analysis-grid">
+      <div class="analysis-block">
+        <h4>Самые успешные герои (win rate)</h4>
+        <div class="tag-list">${winRateHtml}</div>
+      </div>
+      <div class="analysis-block">
+        <h4>Чаще всего банят</h4>
+        <div class="tag-list">${bannedHtml}</div>
+      </div>
+      <div class="analysis-block">
+        <h4>Играют почти всегда одни и те же</h4>
+        <div class="tag-list">${monopolyHtml}</div>
+      </div>
+    </div>
+  `;
+}
+
+async function loadTournamentStats() {
+  activeTeamId = null;
+  for (const btn of teamsEl.querySelectorAll(".team-btn")) {
+    btn.classList.remove("active");
+  }
+  detailEl.innerHTML = '<p class="hint">Считаю статистику...</p>';
+  const res = await fetch("/api/tournament/heroes");
+  const data = await res.json();
+  renderTournamentHeroStats(data);
+}
+
+tournamentStatsBtn.addEventListener("click", loadTournamentStats);
+
 // Матчи обновляются сами (внутренний таймер на сервере + внешний пинг раз
 // в 10 минут) - здесь просто пассивно отражаем текущий статус и
 // перезагружаем данные, когда фоновое обновление завершается.

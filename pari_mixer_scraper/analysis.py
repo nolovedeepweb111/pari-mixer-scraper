@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import TypedDict
 
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
-from .models import Hero, Match, MatchDraftEntry, MatchPlayer
+from .models import Hero, Match, MatchDraftEntry, MatchPlayer, Player
 
 
 class TeamStats(TypedDict):
@@ -118,6 +118,70 @@ def compute_team_stats(session: Session, team_id: int) -> TeamStats:
         "drafts_available": len(first_pick_names),
         "enemy_bans": Counter(enemy_ban_names).most_common(5),
         "own_bans": Counter(own_ban_names).most_common(5),
+    }
+
+
+def compute_tournament_hero_stats(session: Session, min_games: int = 3) -> dict:
+    """Hero stats across the whole tournament (not per-team): win rate,
+    ban count, and how concentrated a hero's playtime is among just one or
+    two players (a real "signature" pick vs. one every team dips into).
+    min_games filters out heroes with too few appearances to say anything
+    meaningful about their win rate or player concentration."""
+    decided_case = case((Match.radiant_win.is_not(None), 1), else_=0)
+    won_case = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
+    hero_wl = session.execute(
+        select(Hero.localized_name, func.count(), func.sum(decided_case), func.sum(won_case))
+        .join(MatchPlayer, MatchPlayer.hero_id == Hero.hero_id)
+        .join(Match, Match.match_id == MatchPlayer.match_id)
+        .group_by(Hero.hero_id)
+    ).all()
+    win_rates = [
+        {"hero": hero, "games": games, "wins": wins, "win_rate": round(100 * wins / decided)}
+        for hero, games, decided, wins in hero_wl
+        if decided and decided >= min_games
+    ]
+    win_rates.sort(key=lambda h: (-h["win_rate"], -h["games"]))
+
+    ban_rows = session.execute(
+        select(Hero.localized_name, func.count())
+        .join(MatchDraftEntry, MatchDraftEntry.hero_id == Hero.hero_id)
+        .where(MatchDraftEntry.is_pick.is_(False))
+        .group_by(Hero.hero_id)
+        .order_by(func.count().desc())
+    ).all()
+    most_banned = [{"hero": hero, "bans": count} for hero, count in ban_rows]
+
+    player_rows = session.execute(
+        select(Hero.localized_name, Player.name, MatchPlayer.account_id, func.count())
+        .join(MatchPlayer, MatchPlayer.hero_id == Hero.hero_id)
+        .join(Player, Player.account_id == MatchPlayer.account_id)
+        .group_by(Hero.hero_id, MatchPlayer.account_id)
+    ).all()
+    hero_players: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for hero, player_name, account_id, count in player_rows:
+        hero_players[hero].append((player_name or f"account {account_id}", count))
+
+    monopolized = []
+    for hero, players in hero_players.items():
+        total_games = sum(c for _, c in players)
+        if total_games < min_games:
+            continue
+        players.sort(key=lambda p: -p[1])
+        top_players = players[:2]
+        concentration = round(100 * sum(c for _, c in top_players) / total_games)
+        monopolized.append({
+            "hero": hero,
+            "games": total_games,
+            "top_players": [{"name": name, "games": c} for name, c in top_players],
+            "concentration": concentration,
+        })
+    monopolized.sort(key=lambda h: (-h["concentration"], -h["games"]))
+
+    return {
+        "min_games": min_games,
+        "top_win_rate": win_rates[:10],
+        "most_banned": most_banned[:10],
+        "signature_by_player": monopolized[:10],
     }
 
 

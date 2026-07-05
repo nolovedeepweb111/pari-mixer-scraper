@@ -10,7 +10,7 @@ from flask import Flask, jsonify, send_from_directory
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
-from pari_mixer_scraper.analysis import compute_team_stats, generate_coach_text
+from pari_mixer_scraper.analysis import compute_team_stats, compute_tournament_hero_stats, generate_coach_text
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID, collect
 from pari_mixer_scraper.mixercup_client import MixerCupClient
 from pari_mixer_scraper.models import (
@@ -363,6 +363,13 @@ def api_team_analysis(team_id: int):
         "enemy_bans": [{"hero": h, "count": c} for h, c in stats["enemy_bans"]],
         "own_bans": [{"hero": h, "count": c} for h, c in stats["own_bans"]],
     })
+
+
+@app.get("/api/tournament/heroes")
+def api_tournament_heroes():
+    with Session(engine) as session:
+        stats = compute_tournament_hero_stats(session)
+    return jsonify(stats)
 
 
 @app.get("/api/collect/status")

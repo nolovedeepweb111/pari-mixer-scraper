@@ -189,6 +189,38 @@ async function renderAnalysisTab(teamId, container) {
   `;
 }
 
+async function renderSubstitutionsTab(teamId, container) {
+  container.innerHTML = '<p class="hint">Загружаю историю замен...</p>';
+  const res = await fetch(`/api/teams/${teamId}/substitutions`);
+  if (!res.ok) {
+    container.innerHTML = '<p class="hint">Не удалось получить историю замен.</p>';
+    return;
+  }
+  const data = await res.json();
+
+  if (!data.substitutions.length) {
+    container.innerHTML = '<p class="hint">Замен в составе не было.</p>';
+    return;
+  }
+
+  const rows = data.substitutions
+    .map((s) => {
+      const when = new Date(s.at).toLocaleString("ru-RU", { dateStyle: "medium", timeStyle: "short" });
+      let text;
+      if (s.out && s.in) {
+        text = `<strong>${s.out}</strong> → <strong>${s.in}</strong>`;
+      } else if (s.out) {
+        text = `<strong>${s.out}</strong> вышел из состава`;
+      } else {
+        text = `<strong>${s.in}</strong> добавлен в состав`;
+      }
+      return `<li class="sub-item"><span class="sub-date">${when}</span>${text}</li>`;
+    })
+    .join("");
+
+  container.innerHTML = `<ul class="sub-list">${rows}</ul>`;
+}
+
 async function loadTeamDetail(teamId, tab) {
   activeTeamId = teamId;
   activeTab = tab || "composition";
@@ -208,6 +240,7 @@ async function loadTeamDetail(teamId, tab) {
     <div class="tabs">
       <button class="tab-btn" data-tab="composition">Состав</button>
       <button class="tab-btn" data-tab="analysis">Аналитика</button>
+      <button class="tab-btn" data-tab="substitutions">Замены</button>
     </div>
     <div id="tab-content"></div>
   `;
@@ -223,8 +256,10 @@ async function loadTeamDetail(teamId, tab) {
     if (tab === "composition") {
       tabContent.innerHTML = "";
       tabContent.appendChild(renderComposition(team));
-    } else {
+    } else if (tab === "analysis") {
       renderAnalysisTab(teamId, tabContent);
+    } else {
+      renderSubstitutionsTab(teamId, tabContent);
     }
   }
 

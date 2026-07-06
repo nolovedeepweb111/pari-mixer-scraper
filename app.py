@@ -12,9 +12,9 @@ from sqlalchemy.orm import Session
 
 from pari_mixer_scraper.analysis import compute_team_stats, compute_tournament_hero_stats, generate_coach_text
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID, collect
-from pari_mixer_scraper.mixercup_client import MixerCupClient
+from pari_mixer_scraper.mixercup_client import MixerCupClient, pair_substitution_events
 from pari_mixer_scraper.models import (
-    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, Team,
+    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, SubstitutionEvent, Team,
     build_engine, configure_sqlite,
 )
 
@@ -166,6 +166,20 @@ def _get_next_opponent(mixer_uuid: str) -> dict | None:
             select(Team.team_id).where(Team.mixer_uuid == opponent["opponent_mixer_uuid"])
         ).scalar_one_or_none()
     return opponent
+
+
+def _get_substitution_history(session: Session, team_id: int) -> list[dict]:
+    """Reads from our own SubstitutionEvent table (synced during collect(),
+    see sync_substitution_history) rather than querying mixer-cup.gg live -
+    their own substitution history has been observed to disappear
+    periodically, so this is the durable copy."""
+    events = session.execute(
+        select(SubstitutionEvent)
+        .where(SubstitutionEvent.team_id == team_id)
+        .order_by(SubstitutionEvent.occurred_at)
+    ).scalars().all()
+    raw = [{"type": e.event_type, "nickname": e.nickname, "occurred_at": e.occurred_at} for e in events]
+    return pair_substitution_events(raw)
 
 
 def _roster_filter(session: Session, team_id: int):
@@ -363,6 +377,17 @@ def api_team_analysis(team_id: int):
         "enemy_bans": [{"hero": h, "count": c} for h, c in stats["enemy_bans"]],
         "own_bans": [{"hero": h, "count": c} for h, c in stats["own_bans"]],
     })
+
+
+@app.get("/api/teams/<int:team_id>/substitutions")
+def api_team_substitutions(team_id: int):
+    with Session(engine) as session:
+        team = session.get(Team, team_id)
+        if team is None:
+            return jsonify({"error": "not found"}), 404
+        swaps = _get_substitution_history(session, team_id)
+
+    return jsonify({"team_id": team_id, "substitutions": swaps})
 
 
 @app.get("/api/tournament/heroes")

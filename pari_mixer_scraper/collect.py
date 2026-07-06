@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from .mixercup_client import MixerCupClient
 from .models import (
-    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, Team,
+    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, SubstitutionEvent, Team,
     build_engine, configure_sqlite,
 )
 from .opendota_client import OpenDotaClient
@@ -445,6 +445,46 @@ def link_mixercup_data(
     progress(f"MixerCup linking: {linked} matches linked, {ambiguous} ambiguous, {skipped} skipped")
 
 
+def sync_substitution_history(
+    session: Session,
+    mixer_client: MixerCupClient,
+    tournament_id: int,
+    progress: ProgressFn,
+) -> None:
+    """Saves every PLAYER_IN/PLAYER_OFF event for each team we've linked to
+    mixer-cup.gg, permanently - their own substitution history has been
+    observed to disappear periodically, so this is the durable copy.
+    event_id dedupes cleanly against already-synced events, so this is
+    cheap to re-run every collection pass."""
+    known_event_ids = {row[0] for row in session.execute(select(SubstitutionEvent.event_id))}
+    teams = session.execute(select(Team).where(Team.mixer_uuid.is_not(None))).scalars().all()
+    if not teams:
+        return
+
+    new_count = 0
+    for team in teams:
+        try:
+            events = mixer_client.iter_substitution_events(tournament_id, team.mixer_uuid)
+            for e in events:
+                if e["event_id"] in known_event_ids:
+                    continue
+                session.add(SubstitutionEvent(
+                    event_id=e["event_id"],
+                    team_id=team.team_id,
+                    event_type=e["type"],
+                    nickname=e["nickname"],
+                    occurred_at=e["occurred_at"],
+                ))
+                known_event_ids.add(e["event_id"])
+                new_count += 1
+        except Exception as e:
+            progress(f"Substitution history fetch failed for team_id={team.team_id}: {e}")
+
+    if new_count:
+        session.commit()
+        progress(f"Substitution history: {new_count} new event(s) saved")
+
+
 def apply_manual_roster_overrides(session: Session, progress: ProgressFn) -> None:
     applied = 0
     for account_id, override in MANUAL_ROSTER_OVERRIDES.items():
@@ -535,6 +575,7 @@ def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, en
 
         if mixer_tournament_id is not None:
             link_mixercup_data(session, mixer_client, mixer_tournament_id, progress)
+            sync_substitution_history(session, mixer_client, mixer_tournament_id, progress)
 
         apply_manual_roster_overrides(session, progress)
         session.commit()

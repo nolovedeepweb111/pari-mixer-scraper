@@ -85,6 +85,19 @@ query Games($first: Int, $filters: GameFilterInput) {
 }
 """
 
+_TOURNAMENT_EVENTS_QUERY = """
+query TournamentEvents($filters: TournamentEventFilterInput, $first: Int, $offset: Int) {
+    tournamentEvents(filters: $filters, first: $first, offset: $offset, sort: [CREATED_AT]) {
+        items {
+            id
+            type
+            createdAt
+            user { nickname }
+        }
+    }
+}
+"""
+
 
 class MixerCupClient:
     """Client for mixer-cup.gg's public GraphQL API - used to pull the
@@ -182,3 +195,58 @@ class MixerCupClient:
             "planned_time": game.get("plannedTime"),
             "status": game.get("status"),
         }
+
+    def iter_substitution_events(self, tournament_id: int, team_uuid: str, page_size: int = 100):
+        """Raw PLAYER_IN/PLAYER_OFF events for this team, oldest first.
+        mixer-cup.gg's own substitution history has been observed to
+        disappear periodically, so the caller is expected to persist these
+        (see collect.sync_substitution_history) rather than display them
+        live - event id is mixer-cup.gg's own UUID, stable enough to
+        dedupe against on repeat syncs."""
+        offset = 0
+        while True:
+            data = self._post(_TOURNAMENT_EVENTS_QUERY, {
+                "filters": {
+                    "tournamentId": tournament_id,
+                    "teamId": team_uuid,
+                    "type": ["PLAYER_IN", "PLAYER_OFF"],
+                },
+                "first": page_size,
+                "offset": offset,
+            })
+            items = data["tournamentEvents"]["items"]
+            for e in items:
+                yield {
+                    "event_id": e["id"],
+                    "type": e["type"],
+                    "nickname": (e.get("user") or {}).get("nickname"),
+                    "occurred_at": e["createdAt"],
+                }
+            offset += len(items)
+            if not items:
+                return
+
+
+def pair_substitution_events(events: list[dict]) -> list[dict]:
+    """This tournament's format allows swapping a player mid-run; MixerCup
+    logs every swap as a PLAYER_OFF event immediately followed by a
+    PLAYER_IN event. Takes events sorted oldest-first (type/nickname/
+    occurred_at, as stored in SubstitutionEvent) and returns them paired up
+    as {out, in, at} - unpaired events (e.g. an OFF with no matching IN
+    yet) are returned with the other side set to None."""
+    swaps = []
+    pending_off = None
+    for e in events:
+        if e["type"] == "PLAYER_OFF":
+            if pending_off is not None:
+                swaps.append({"out": pending_off["nickname"], "in": None, "at": pending_off["occurred_at"]})
+            pending_off = e
+        else:  # PLAYER_IN
+            if pending_off is not None:
+                swaps.append({"out": pending_off["nickname"], "in": e["nickname"], "at": e["occurred_at"]})
+                pending_off = None
+            else:
+                swaps.append({"out": None, "in": e["nickname"], "at": e["occurred_at"]})
+    if pending_off is not None:
+        swaps.append({"out": pending_off["nickname"], "in": None, "at": pending_off["occurred_at"]})
+    return swaps

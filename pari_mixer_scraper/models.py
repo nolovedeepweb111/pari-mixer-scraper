@@ -118,3 +118,18 @@ class MatchDraftEntry(Base):
     hero_id: Mapped[int] = mapped_column(ForeignKey("heroes.hero_id"))
     team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.team_id"), nullable=True)
     is_pick: Mapped[bool]
+
+
+class SubstitutionEvent(Base):
+    """A single PLAYER_IN/PLAYER_OFF event from mixer-cup.gg's tournament
+    event log, saved permanently on our side - mixer-cup.gg's own history
+    for this has been observed to disappear periodically, so this is the
+    durable copy. event_id is mixer-cup.gg's own UUID for the event, used
+    as the primary key so re-syncing the same event twice is a no-op."""
+    __tablename__ = "substitution_events"
+
+    event_id: Mapped[str] = mapped_column(primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.team_id"))
+    event_type: Mapped[str]
+    nickname: Mapped[str | None]
+    occurred_at: Mapped[str]

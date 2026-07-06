@@ -178,7 +178,10 @@ def _get_substitution_history(session: Session, team_id: int) -> list[dict]:
         .where(SubstitutionEvent.team_id == team_id)
         .order_by(SubstitutionEvent.occurred_at)
     ).scalars().all()
-    raw = [{"type": e.event_type, "nickname": e.nickname, "occurred_at": e.occurred_at} for e in events]
+    raw = [
+        {"type": e.event_type, "nickname": e.nickname, "rating": e.rating, "occurred_at": e.occurred_at}
+        for e in events
+    ]
     return pair_substitution_events(raw)
 
 

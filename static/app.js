@@ -214,6 +214,11 @@ async function renderSubstitutionsTab(teamId, container) {
       } else {
         text = `<strong>${s.in}</strong> добавлен в состав`;
       }
+      if (s.rating_diff != null) {
+        const cls = s.rating_diff >= 0 ? "rating-diff-up" : "rating-diff-down";
+        const sign = s.rating_diff > 0 ? "+" : "";
+        text += ` <span class="rating-diff ${cls}">${sign}${s.rating_diff} pts</span>`;
+      }
       return `<li class="sub-item"><span class="sub-date">${when}</span>${text}</li>`;
     })
     .join("");

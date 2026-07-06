@@ -132,4 +132,9 @@ class SubstitutionEvent(Base):
     team_id: Mapped[int] = mapped_column(ForeignKey("teams.team_id"))
     event_type: Mapped[str]
     nickname: Mapped[str | None]
+    # MixerCup's rating for this player as of when we synced the event (not
+    # a true historical snapshot at swap time - their API only exposes the
+    # player's current rating - but it's captured once and never
+    # overwritten, so it stays close to the value at the time of the swap).
+    rating: Mapped[float | None]
     occurred_at: Mapped[str]

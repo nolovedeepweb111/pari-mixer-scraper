@@ -402,6 +402,19 @@ aside h2 {
   margin-bottom: 4px;
 }
 
+.rating-diff {
+  font-weight: 600;
+  margin-left: 6px;
+}
+
+.rating-diff-up {
+  color: #4ade80;
+}
+
+.rating-diff-down {
+  color: #f87171;
+}
+
 .analysis-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));

@@ -473,6 +473,7 @@ def sync_substitution_history(
                     team_id=team.team_id,
                     event_type=e["type"],
                     nickname=e["nickname"],
+                    rating=e["rating"],
                     occurred_at=e["occurred_at"],
                 ))
                 known_event_ids.add(e["event_id"])

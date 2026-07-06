@@ -92,7 +92,7 @@ query TournamentEvents($filters: TournamentEventFilterInput, $first: Int, $offse
             id
             type
             createdAt
-            user { nickname }
+            user { nickname rating }
         }
     }
 }
@@ -216,10 +216,12 @@ class MixerCupClient:
             })
             items = data["tournamentEvents"]["items"]
             for e in items:
+                user = e.get("user") or {}
                 yield {
                     "event_id": e["id"],
                     "type": e["type"],
-                    "nickname": (e.get("user") or {}).get("nickname"),
+                    "nickname": user.get("nickname"),
+                    "rating": user.get("rating"),
                     "occurred_at": e["createdAt"],
                 }
             offset += len(items)
@@ -231,22 +233,46 @@ def pair_substitution_events(events: list[dict]) -> list[dict]:
     """This tournament's format allows swapping a player mid-run; MixerCup
     logs every swap as a PLAYER_OFF event immediately followed by a
     PLAYER_IN event. Takes events sorted oldest-first (type/nickname/
-    occurred_at, as stored in SubstitutionEvent) and returns them paired up
-    as {out, in, at} - unpaired events (e.g. an OFF with no matching IN
-    yet) are returned with the other side set to None."""
+    rating/occurred_at, as stored in SubstitutionEvent) and returns them
+    paired up as {out, out_rating, in, in_rating, rating_diff, at} -
+    unpaired events (e.g. an OFF with no matching IN yet) are returned with
+    the other side set to None. rating_diff is in_rating - out_rating
+    (positive means the team traded up in rating) when both are known."""
+    def rating_diff(out_rating, in_rating):
+        if out_rating is None or in_rating is None:
+            return None
+        return round(in_rating - out_rating)
+
     swaps = []
     pending_off = None
     for e in events:
         if e["type"] == "PLAYER_OFF":
             if pending_off is not None:
-                swaps.append({"out": pending_off["nickname"], "in": None, "at": pending_off["occurred_at"]})
+                swaps.append({
+                    "out": pending_off["nickname"], "out_rating": pending_off["rating"],
+                    "in": None, "in_rating": None, "rating_diff": None,
+                    "at": pending_off["occurred_at"],
+                })
             pending_off = e
         else:  # PLAYER_IN
             if pending_off is not None:
-                swaps.append({"out": pending_off["nickname"], "in": e["nickname"], "at": e["occurred_at"]})
+                swaps.append({
+                    "out": pending_off["nickname"], "out_rating": pending_off["rating"],
+                    "in": e["nickname"], "in_rating": e["rating"],
+                    "rating_diff": rating_diff(pending_off["rating"], e["rating"]),
+                    "at": e["occurred_at"],
+                })
                 pending_off = None
             else:
-                swaps.append({"out": None, "in": e["nickname"], "at": e["occurred_at"]})
+                swaps.append({
+                    "out": None, "out_rating": None,
+                    "in": e["nickname"], "in_rating": e["rating"], "rating_diff": None,
+                    "at": e["occurred_at"],
+                })
     if pending_off is not None:
-        swaps.append({"out": pending_off["nickname"], "in": None, "at": pending_off["occurred_at"]})
+        swaps.append({
+            "out": pending_off["nickname"], "out_rating": pending_off["rating"],
+            "in": None, "in_rating": None, "rating_diff": None,
+            "at": pending_off["occurred_at"],
+        })
     return swaps

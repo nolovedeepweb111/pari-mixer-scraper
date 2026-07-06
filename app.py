@@ -168,6 +168,14 @@ def _get_next_opponent(mixer_uuid: str) -> dict | None:
     return opponent
 
 
+def _team_total_mmr(session: Session, team_id: int) -> float | None:
+    rows = session.execute(
+        select(Player.mmr).where(Player.team_id == team_id, Player.roster_confirmed.is_(True))
+    ).scalars().all()
+    total = sum(m for m in rows if m is not None)
+    return total or None
+
+
 def _get_substitution_history(session: Session, team_id: int) -> list[dict]:
     """Reads from our own SubstitutionEvent table (synced during collect(),
     see sync_substitution_history) rather than querying mixer-cup.gg live -
@@ -182,7 +190,25 @@ def _get_substitution_history(session: Session, team_id: int) -> list[dict]:
         {"type": e.event_type, "nickname": e.nickname, "rating": e.rating, "occurred_at": e.occurred_at}
         for e in events
     ]
-    return pair_substitution_events(raw)
+    swaps = pair_substitution_events(raw)
+
+    # MixerCup doesn't expose the team's historical total rating, only its
+    # current one - so reconstruct it by walking the swaps backward from
+    # today's total, undoing each swap's rating_diff in turn. This assumes
+    # the other roster slots' ratings stayed constant between swaps, which
+    # isn't strictly true (players' ratings drift with every game) but is
+    # the best available approximation without historical snapshots.
+    running_total = _team_total_mmr(session, team_id)
+    for swap in reversed(swaps):
+        swap["team_rating_after"] = running_total
+        if running_total is None:
+            swap["team_rating_before"] = None
+            continue
+        delta = swap["rating_diff"] or 0
+        running_total = running_total - delta
+        swap["team_rating_before"] = running_total
+
+    return swaps
 
 
 def _roster_filter(session: Session, team_id: int):

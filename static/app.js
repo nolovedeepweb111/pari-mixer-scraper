@@ -219,7 +219,18 @@ async function renderSubstitutionsTab(teamId, container) {
         const sign = s.rating_diff > 0 ? "+" : "";
         text += ` <span class="rating-diff ${cls}">${sign}${s.rating_diff} pts</span>`;
       }
-      return `<li class="sub-item"><span class="sub-date">${when}</span>${text}</li>`;
+      let teamLine = "";
+      if (s.team_rating_before != null && s.team_rating_after != null) {
+        const teamDiff = s.team_rating_after - s.team_rating_before;
+        const cls = teamDiff >= 0 ? "rating-diff-up" : "rating-diff-down";
+        teamLine = `
+          <div class="sub-team-rating">
+            Командный рейтинг: ${formatMmr(s.team_rating_before)} → ${formatMmr(s.team_rating_after)}
+            <span class="rating-diff ${cls}">${teamDiff >= 0 ? "+" : ""}${Math.round(teamDiff)}</span>
+          </div>
+        `;
+      }
+      return `<li class="sub-item"><span class="sub-date">${when}</span>${text}${teamLine}</li>`;
     })
     .join("");
 

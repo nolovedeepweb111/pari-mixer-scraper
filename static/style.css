@@ -415,6 +415,12 @@ aside h2 {
   color: #f87171;
 }
 
+.sub-team-rating {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .analysis-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));

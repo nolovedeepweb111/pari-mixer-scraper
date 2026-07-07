@@ -20,19 +20,23 @@ def build_engine(db_path: str) -> Engine:
 
 
 def configure_sqlite(engine: Engine) -> Engine:
-    """Raises SQLite's lock-wait timeout so contention between the web
-    app's reads and the background collector's writes waits and fails
-    loudly instead of the default short wait.
+    """Tunes SQLite for this app's usage on Render's free tier.
 
-    WAL mode was tried here twice - once against Turso/libSQL, once
-    against a plain local file - and both times the app hung hard on
-    Render specifically (never reproduced locally under the same
-    concurrent load). Whatever the exact mechanism, WAL's reliance on a
-    shared-memory (-shm) file via mmap doesn't play well with Render's
-    disk. Rather than chase that further, this leans on a generous
-    busy_timeout plus the stale-run recovery in app.py: an occasional
-    "database is locked" failure is tolerated and self-heals within
-    minutes instead of being eliminated outright."""
+    synchronous=OFF + journal_mode=MEMORY: the collector's commits were
+    hanging indefinitely on Render even when writing to a file nothing
+    else had open - not lock contention, but the fsync at each commit
+    stalling on the free tier's throttled disk (0.1 CPU). This database is
+    a disposable cache: it's rebuilt from external APIs on every collection
+    pass and wiped on every redeploy anyway, and the collector builds into
+    a side file that's only swapped in on success - so durability across a
+    crash buys us nothing. Dropping the per-commit fsync (synchronous=OFF)
+    and keeping the rollback journal in RAM (journal_mode=MEMORY) makes
+    writes memory-speed and removes the stall.
+
+    WAL mode was tried here twice and hung hard on Render both times (its
+    -shm mmap doesn't agree with Render's disk), so it's deliberately not
+    used. A generous busy_timeout plus the stale-run recovery in app.py
+    covers the occasional lock wait."""
     if engine.url.get_backend_name() != "sqlite":
         return engine
 
@@ -40,6 +44,8 @@ def configure_sqlite(engine: Engine) -> Engine:
     def _set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA busy_timeout=60000")
+        cursor.execute("PRAGMA synchronous=OFF")
+        cursor.execute("PRAGMA journal_mode=MEMORY")
         cursor.close()
 
     return engine

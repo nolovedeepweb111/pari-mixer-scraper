@@ -85,6 +85,18 @@ query Games($first: Int, $filters: GameFilterInput) {
 }
 """
 
+_PARTICIPANT_QUEUE_QUERY = """
+query ParticipantList($tournamentId: Int!, $first: Int, $offset: Int, $filters: ParticipantFilterInput) {
+    participantList(tournamentId: $tournamentId, first: $first, offset: $offset, filters: $filters) {
+        pageInfo { total }
+        items {
+            queuePosition
+            player { id nickname rating }
+        }
+    }
+}
+"""
+
 _TOURNAMENT_EVENTS_QUERY = """
 query TournamentEvents($filters: TournamentEventFilterInput, $first: Int, $offset: Int) {
     tournamentEvents(filters: $filters, first: $first, offset: $offset, sort: [CREATED_AT]) {
@@ -92,7 +104,7 @@ query TournamentEvents($filters: TournamentEventFilterInput, $first: Int, $offse
             id
             type
             createdAt
-            user { nickname rating }
+            user { id nickname rating }
         }
     }
 }
@@ -220,12 +232,45 @@ class MixerCupClient:
                 yield {
                     "event_id": e["id"],
                     "type": e["type"],
+                    "player_uuid": user.get("id"),
                     "nickname": user.get("nickname"),
                     "rating": user.get("rating"),
                     "occurred_at": e["createdAt"],
                 }
             offset += len(items)
             if not items:
+                return
+
+    def iter_queue_participants(self, tournament_id: int, page_size: int = 100):
+        """Current substitute queue (participants with status BID), in queue
+        order. A player disappears from here the moment they're picked into
+        a team, so the caller snapshots this regularly (see
+        collect.sync_queue_snapshot) to know later what position a player
+        held right before being substituted in."""
+        offset = 0
+        while True:
+            data = self._post(_PARTICIPANT_QUEUE_QUERY, {
+                "tournamentId": tournament_id,
+                "filters": {"status": ["BID"]},
+                "first": page_size,
+                "offset": offset,
+            })
+            result = data["participantList"]
+            items = result["items"]
+            for p in items:
+                player = p.get("player") or {}
+                yield {
+                    "player_uuid": player.get("id"),
+                    "nickname": player.get("nickname"),
+                    "rating": player.get("rating"),
+                    "queue_position": p.get("queuePosition"),
+                }
+            offset += len(items)
+            # participantList's pageInfo.total is the size of the *current
+            # page* (min(first, remaining)), unlike games/teams where it's
+            # the overall filtered count - so a short page is the only
+            # reliable end-of-list signal here.
+            if len(items) < page_size:
                 return
 
 
@@ -251,6 +296,7 @@ def pair_substitution_events(events: list[dict]) -> list[dict]:
                 swaps.append({
                     "out": pending_off["nickname"], "out_rating": pending_off["rating"],
                     "in": None, "in_rating": None, "rating_diff": None,
+                    "queue_position": None,
                     "at": pending_off["occurred_at"],
                 })
             pending_off = e
@@ -260,6 +306,7 @@ def pair_substitution_events(events: list[dict]) -> list[dict]:
                     "out": pending_off["nickname"], "out_rating": pending_off["rating"],
                     "in": e["nickname"], "in_rating": e["rating"],
                     "rating_diff": rating_diff(pending_off["rating"], e["rating"]),
+                    "queue_position": e.get("queue_position"),
                     "at": e["occurred_at"],
                 })
                 pending_off = None
@@ -267,12 +314,14 @@ def pair_substitution_events(events: list[dict]) -> list[dict]:
                 swaps.append({
                     "out": None, "out_rating": None,
                     "in": e["nickname"], "in_rating": e["rating"], "rating_diff": None,
+                    "queue_position": e.get("queue_position"),
                     "at": e["occurred_at"],
                 })
     if pending_off is not None:
         swaps.append({
             "out": pending_off["nickname"], "out_rating": pending_off["rating"],
             "in": None, "in_rating": None, "rating_diff": None,
+            "queue_position": None,
             "at": pending_off["occurred_at"],
         })
     return swaps

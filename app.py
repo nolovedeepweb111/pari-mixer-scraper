@@ -187,7 +187,10 @@ def _get_substitution_history(session: Session, team_id: int) -> list[dict]:
         .order_by(SubstitutionEvent.occurred_at)
     ).scalars().all()
     raw = [
-        {"type": e.event_type, "nickname": e.nickname, "rating": e.rating, "occurred_at": e.occurred_at}
+        {
+            "type": e.event_type, "nickname": e.nickname, "rating": e.rating,
+            "queue_position": e.queue_position, "occurred_at": e.occurred_at,
+        }
         for e in events
     ]
     swaps = pair_substitution_events(raw)
@@ -417,6 +420,28 @@ def api_team_substitutions(team_id: int):
         swaps = _get_substitution_history(session, team_id)
 
     return jsonify({"team_id": team_id, "substitutions": swaps})
+
+
+@app.get("/api/substitutions")
+def api_all_substitutions():
+    """Every substitution across the tournament, newest first, with the
+    team it happened in - the per-team tab shows the same data scoped to
+    one team; this powers the tournament-wide substitutions page."""
+    with Session(engine) as session:
+        teams = session.execute(
+            select(Team.team_id, Team.name)
+            .where(Team.team_id.in_(select(SubstitutionEvent.team_id).distinct()))
+        ).all()
+
+        all_swaps = []
+        for team_id, team_name in teams:
+            for swap in _get_substitution_history(session, team_id):
+                swap["team_id"] = team_id
+                swap["team_name"] = team_name or f"Team {team_id}"
+                all_swaps.append(swap)
+
+    all_swaps.sort(key=lambda s: s["at"], reverse=True)
+    return jsonify({"substitutions": all_swaps})
 
 
 @app.get("/api/tournament/heroes")

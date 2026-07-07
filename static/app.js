@@ -342,6 +342,70 @@ async function loadTournamentStats() {
 
 tournamentStatsBtn.addEventListener("click", loadTournamentStats);
 
+const allSubsBtn = document.getElementById("all-subs-btn");
+
+async function loadAllSubstitutions() {
+  activeTeamId = null;
+  for (const btn of teamsEl.querySelectorAll(".team-btn")) {
+    btn.classList.remove("active");
+  }
+  detailEl.innerHTML = '<p class="hint">Загружаю замены...</p>';
+  const res = await fetch("/api/substitutions");
+  const data = await res.json();
+
+  if (!data.substitutions.length) {
+    detailEl.innerHTML = "<h2>Замены турнира</h2><p class=\"hint\">Замен пока не было.</p>";
+    return;
+  }
+
+  const rows = data.substitutions
+    .map((s) => {
+      const when = new Date(s.at).toLocaleString("ru-RU", { dateStyle: "medium", timeStyle: "short" });
+      const outCell = s.out
+        ? `${s.out}${s.out_rating != null ? ` <span class="sub-mmr">${formatMmr(s.out_rating)}</span>` : ""}`
+        : "—";
+      const inCell = s.in
+        ? `${s.in}${s.in_rating != null ? ` <span class="sub-mmr">${formatMmr(s.in_rating)}</span>` : ""}`
+        : "—";
+      let diffCell = "—";
+      if (s.rating_diff != null) {
+        const cls = s.rating_diff >= 0 ? "rating-diff-up" : "rating-diff-down";
+        diffCell = `<span class="rating-diff ${cls}">${s.rating_diff > 0 ? "+" : ""}${s.rating_diff}</span>`;
+      }
+      const queueCell = s.queue_position != null ? `#${s.queue_position}` : "—";
+      return `
+        <tr>
+          <td class="subs-date">${when}</td>
+          <td><button class="opponent-link" data-team-id="${s.team_id}">${s.team_name}</button></td>
+          <td>${outCell}</td>
+          <td>${inCell}</td>
+          <td>${diffCell}</td>
+          <td>${queueCell}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  detailEl.innerHTML = `
+    <h2>Замены турнира</h2>
+    <table class="subs-table">
+      <thead>
+        <tr>
+          <th>Дата</th><th>Команда</th><th>Кто вышел (MMR)</th><th>Кто зашёл (MMR)</th><th>Разница</th><th>Место в очереди</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p class="hint">Место в очереди известно только для замен после того, как мы начали сохранять снимки очереди.</p>
+  `;
+
+  for (const link of detailEl.querySelectorAll(".opponent-link")) {
+    link.addEventListener("click", () => loadTeamDetail(Number(link.dataset.teamId)));
+  }
+}
+
+allSubsBtn.addEventListener("click", loadAllSubstitutions);
+
 // Матчи обновляются сами (внутренний таймер на сервере + внешний пинг раз
 // в 10 минут) - здесь просто пассивно отражаем текущий статус и
 // перезагружаем данные, когда фоновое обновление завершается.

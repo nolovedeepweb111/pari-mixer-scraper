@@ -137,4 +137,26 @@ class SubstitutionEvent(Base):
     # player's current rating - but it's captured once and never
     # overwritten, so it stays close to the value at the time of the swap).
     rating: Mapped[float | None]
+    # For PLAYER_IN events: the queue position this player held before being
+    # picked, from our own QueuedPlayer snapshot (see collect - MixerCup
+    # drops a player from the queue the moment they're picked, so this can
+    # only come from a snapshot taken beforehand; None for events synced
+    # before snapshotting existed or when no snapshot covered the player).
+    queue_position: Mapped[int | None]
     occurred_at: Mapped[str]
+
+
+class QueuedPlayer(Base):
+    """Last known state of a player in the tournament's substitute queue
+    (mixer-cup.gg participantList, status BID), refreshed on every collect
+    pass. Rows are never deleted when a player leaves the queue - keeping
+    the last known position is the whole point, since MixerCup removes a
+    player from the queue the instant they're substituted into a team,
+    which is exactly when we need to know where they were standing."""
+    __tablename__ = "queued_players"
+
+    player_uuid: Mapped[str] = mapped_column(primary_key=True)
+    nickname: Mapped[str | None]
+    rating: Mapped[float | None]
+    queue_position: Mapped[int | None]
+    updated_at: Mapped[str]

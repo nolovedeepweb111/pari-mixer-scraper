@@ -12,7 +12,8 @@ from sqlalchemy.orm import Session
 
 from .mixercup_client import MixerCupClient
 from .models import (
-    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, SubstitutionEvent, Team,
+    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, QueuedPlayer,
+    SubstitutionEvent, Team,
     build_engine, configure_sqlite,
 )
 from .opendota_client import OpenDotaClient
@@ -445,6 +446,48 @@ def link_mixercup_data(
     progress(f"MixerCup linking: {linked} matches linked, {ambiguous} ambiguous, {skipped} skipped")
 
 
+def sync_queue_snapshot(
+    session: Session,
+    mixer_client: MixerCupClient,
+    tournament_id: int,
+    progress: ProgressFn,
+) -> None:
+    """Refreshes our copy of the substitute queue (who's waiting, at what
+    position). Rows are upserted, never deleted: a player vanishes from
+    MixerCup's queue the instant they're picked into a team, so the last
+    known position we recorded is precisely what sync_substitution_history
+    needs to say where the incoming player stood in line."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    seen = 0
+    try:
+        for p in mixer_client.iter_queue_participants(tournament_id):
+            if not p["player_uuid"]:
+                continue
+            row = session.get(QueuedPlayer, p["player_uuid"])
+            if row is None:
+                session.add(QueuedPlayer(
+                    player_uuid=p["player_uuid"],
+                    nickname=p["nickname"],
+                    rating=p["rating"],
+                    queue_position=p["queue_position"],
+                    updated_at=now,
+                ))
+            else:
+                row.nickname = p["nickname"] or row.nickname
+                row.rating = p["rating"] if p["rating"] is not None else row.rating
+                row.queue_position = p["queue_position"]
+                row.updated_at = now
+            seen += 1
+    except Exception as e:
+        progress(f"Queue snapshot fetch failed: {e}")
+        return
+
+    session.commit()
+    progress(f"Queue snapshot: {seen} player(s) currently in line")
+
+
 def sync_substitution_history(
     session: Session,
     mixer_client: MixerCupClient,
@@ -468,12 +511,21 @@ def sync_substitution_history(
             for e in events:
                 if e["event_id"] in known_event_ids:
                     continue
+                # Where was the incoming player standing in the queue? Only
+                # our own snapshot knows - MixerCup already dropped them
+                # from the live queue the moment they were picked.
+                queue_position = None
+                if e["type"] == "PLAYER_IN" and e["player_uuid"]:
+                    queued = session.get(QueuedPlayer, e["player_uuid"])
+                    if queued is not None:
+                        queue_position = queued.queue_position
                 session.add(SubstitutionEvent(
                     event_id=e["event_id"],
                     team_id=team.team_id,
                     event_type=e["type"],
                     nickname=e["nickname"],
                     rating=e["rating"],
+                    queue_position=queue_position,
                     occurred_at=e["occurred_at"],
                 ))
                 known_event_ids.add(e["event_id"])
@@ -577,6 +629,7 @@ def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, en
         if mixer_tournament_id is not None:
             link_mixercup_data(session, mixer_client, mixer_tournament_id, progress)
             sync_substitution_history(session, mixer_client, mixer_tournament_id, progress)
+            sync_queue_snapshot(session, mixer_client, mixer_tournament_id, progress)
 
         apply_manual_roster_overrides(session, progress)
         session.commit()

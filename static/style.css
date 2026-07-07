@@ -421,6 +421,37 @@ aside h2 {
   font-size: 13px;
 }
 
+.subs-table {
+  border-collapse: collapse;
+  margin-top: 16px;
+  font-size: 14px;
+}
+
+.subs-table th,
+.subs-table td {
+  text-align: left;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.subs-table th {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.subs-table .subs-date {
+  color: var(--muted);
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.sub-mmr {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .analysis-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));

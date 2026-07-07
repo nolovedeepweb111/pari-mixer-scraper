@@ -58,6 +58,20 @@ button:hover:not(:disabled) {
   background: var(--accent-hover);
 }
 
+.header-link-btn {
+  background: var(--accent);
+  color: white;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-size: 14px;
+  text-decoration: none;
+  display: inline-block;
+}
+
+.header-link-btn:hover {
+  background: var(--accent-hover);
+}
+
 button:disabled {
   opacity: 0.5;
   cursor: default;

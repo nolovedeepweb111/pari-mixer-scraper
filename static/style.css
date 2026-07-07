@@ -1,11 +1,17 @@
+/* Palette and typography follow battlepass.ru: dark blue-gray surfaces
+   (#23282e / #2b323c / #334056), bright blue accent (#0396ff), green/red
+   status colors (#48c432 / #eb4242) and the Jost typeface. */
 :root {
-  --bg: #14161c;
-  --panel: #1c1f28;
-  --border: #2a2e3a;
-  --text: #e7e9ee;
-  --muted: #8b90a0;
-  --accent: #7c5cff;
-  --accent-hover: #6a4be0;
+  --bg: #23282e;
+  --panel: #2b323c;
+  --panel-deep: #1d2630;
+  --border: #334056;
+  --text: #ffffff;
+  --muted: #cfd4da;
+  --accent: #0396ff;
+  --accent-hover: #0078d6;
+  --good: #48c432;
+  --bad: #eb4242;
 }
 
 * {
@@ -14,7 +20,7 @@
 
 body {
   margin: 0;
-  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-family: "Jost", "Segoe UI", Roboto, sans-serif;
   background: var(--bg);
   color: var(--text);
 }
@@ -24,11 +30,13 @@ header {
   align-items: center;
   justify-content: space-between;
   padding: 16px 24px;
+  background: var(--panel-deep);
   border-bottom: 1px solid var(--border);
 }
 
 header h1 {
-  font-size: 20px;
+  font-size: 22px;
+  font-weight: 600;
   margin: 0;
 }
 
@@ -48,10 +56,13 @@ button {
   background: var(--accent);
   color: white;
   border: none;
-  border-radius: 6px;
-  padding: 8px 16px;
+  border-radius: 8px;
+  padding: 9px 18px;
   font-size: 14px;
+  font-family: inherit;
+  font-weight: 500;
   cursor: pointer;
+  transition: background 0.15s;
 }
 
 button:hover:not(:disabled) {
@@ -61,11 +72,13 @@ button:hover:not(:disabled) {
 .header-link-btn {
   background: var(--accent);
   color: white;
-  border-radius: 6px;
-  padding: 8px 16px;
+  border-radius: 8px;
+  padding: 9px 18px;
   font-size: 14px;
+  font-weight: 500;
   text-decoration: none;
   display: inline-block;
+  transition: background 0.15s;
 }
 
 .header-link-btn:hover {
@@ -94,6 +107,7 @@ aside h2 {
   letter-spacing: 0.05em;
   color: var(--muted);
   margin: 0 0 12px;
+  font-weight: 600;
 }
 
 .team-btn {
@@ -102,10 +116,11 @@ aside h2 {
   text-align: left;
   background: var(--panel);
   color: var(--text);
-  border: 1px solid var(--border);
+  border: 1px solid transparent;
   margin-bottom: 8px;
-  padding: 10px 12px;
+  padding: 10px 14px;
   border-radius: 8px;
+  font-weight: 400;
 }
 
 .team-btn:hover {
@@ -115,7 +130,7 @@ aside h2 {
 
 .team-btn.active {
   border-color: var(--accent);
-  background: #23263a;
+  background: #334056;
 }
 
 #team-detail {
@@ -137,13 +152,14 @@ aside h2 {
 .player-card {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 16px;
   padding: 16px;
 }
 
 .player-card h3 {
   margin: 0 0 4px;
   font-size: 16px;
+  font-weight: 600;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -203,6 +219,7 @@ aside h2 {
 }
 
 .opponent-link:hover {
+  background: none;
   color: var(--accent-hover);
 }
 
@@ -231,11 +248,11 @@ aside h2 {
 }
 
 .player-card li .wr-good {
-  color: #4ade80;
+  color: var(--good);
 }
 
 .player-card li .wr-bad {
-  color: #f87171;
+  color: var(--bad);
 }
 
 .drafts-section {
@@ -248,12 +265,13 @@ aside h2 {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   margin: 0 0 12px;
+  font-weight: 600;
 }
 
 .draft-match {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 16px;
   padding: 12px 16px;
   margin-bottom: 14px;
 }
@@ -270,17 +288,17 @@ aside h2 {
 }
 
 .match-result.result-win {
-  background: rgba(74, 222, 128, 0.15);
-  color: #4ade80;
+  background: rgba(72, 196, 50, 0.15);
+  color: var(--good);
 }
 
 .match-result.result-loss {
-  background: rgba(248, 113, 113, 0.15);
-  color: #f87171;
+  background: rgba(235, 66, 66, 0.15);
+  color: var(--bad);
 }
 
 .match-result.result-unknown {
-  background: rgba(139, 144, 160, 0.15);
+  background: rgba(207, 212, 218, 0.12);
   color: var(--muted);
 }
 
@@ -315,7 +333,7 @@ aside h2 {
   width: 44px;
   border-radius: 6px;
   overflow: hidden;
-  background: #14161c;
+  background: var(--panel-deep);
   border: 1px solid var(--border);
 }
 
@@ -341,13 +359,13 @@ aside h2 {
 }
 
 .draft-cell.cell-pick .cell-label {
-  background: rgba(74, 222, 128, 0.15);
-  color: #4ade80;
+  background: rgba(72, 196, 50, 0.15);
+  color: var(--good);
 }
 
 .draft-cell.cell-ban .cell-label {
-  background: rgba(248, 113, 113, 0.15);
-  color: #f87171;
+  background: rgba(235, 66, 66, 0.15);
+  color: var(--bad);
 }
 
 .draft-cell.cell-ban img {
@@ -386,7 +404,7 @@ aside h2 {
 .coach-text {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 16px;
   padding: 16px;
   line-height: 1.6;
   font-size: 15px;
@@ -422,11 +440,11 @@ aside h2 {
 }
 
 .rating-diff-up {
-  color: #4ade80;
+  color: var(--good);
 }
 
 .rating-diff-down {
-  color: #f87171;
+  color: var(--bad);
 }
 
 .sub-team-rating {
@@ -476,7 +494,7 @@ aside h2 {
 .analysis-block {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 16px;
   padding: 14px 16px;
 }
 
@@ -486,6 +504,7 @@ aside h2 {
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.05em;
+  font-weight: 600;
 }
 
 .tag-list {
@@ -502,16 +521,16 @@ aside h2 {
 }
 
 .tag-neutral {
-  background: rgba(139, 144, 160, 0.15);
+  background: rgba(207, 212, 218, 0.12);
   color: var(--text);
 }
 
 .tag-pick {
-  background: rgba(74, 222, 128, 0.15);
-  color: #4ade80;
+  background: rgba(72, 196, 50, 0.15);
+  color: var(--good);
 }
 
 .tag-ban {
-  background: rgba(248, 113, 113, 0.15);
-  color: #f87171;
+  background: rgba(235, 66, 66, 0.15);
+  color: var(--bad);
 }

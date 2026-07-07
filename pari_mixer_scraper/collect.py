@@ -4,7 +4,6 @@ import argparse
 import json
 import logging
 import os
-import shutil
 from collections.abc import Callable
 from pathlib import Path
 
@@ -658,68 +657,26 @@ def _run_collection_pass(engine, league_id: int, progress: ProgressFn) -> int:
 
 
 def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, engine=None) -> int:
-    """Runs a full collection pass. Returns the number of newly stored matches.
+    """Runs a full collection pass against db_path, building in place, and
+    returns the number of newly stored matches.
 
-    When called from the Flask app (with its live `engine` passed in), the
-    work is done against a *separate* build database that nothing else has
-    open, which is then atomically swapped in at the end. SQLite serialises
-    writers against concurrent readers on the same file, and on Render that
-    contention was hanging the collector indefinitely - even a single
-    batched write never completed while the web server was serving reads on
-    the same file. Building off to the side removes the contention entirely;
-    the site keeps serving the old data (slightly stale) until the new
-    database is ready, then sees all of it at once."""
+    This always writes directly to db_path with its own engine. The Flask
+    app does NOT call this in a background thread - writing SQLite from a
+    background thread of the gunicorn worker hung indefinitely on Render no
+    matter what (isolated file, no fsync, batched writes - all still hung),
+    while this exact code run as a standalone process works fine. So the app
+    spawns it as a separate process pointed at a build file and swaps that
+    in itself (see app._run_collect). `engine` is accepted for backward
+    compatibility and ignored."""
     progress = progress or log.info
     progress("Starting collection...")
-
-    if engine is None:
-        # CLI / standalone: no concurrent readers, so just build in place.
-        progress("Building a new database engine...")
-        own_engine = configure_sqlite(build_engine(db_path))
-        Base.metadata.create_all(own_engine)
-        try:
-            return _run_collection_pass(own_engine, league_id, progress)
-        finally:
-            own_engine.dispose()
-
-    # Flask app path: build into an isolated side file, seeded from the
-    # current live DB so already-collected data (substitution history,
-    # drafts) is preserved rather than re-fetched from scratch.
-    build_path = f"{db_path}.build"
-    progress("Preparing an isolated build database...")
-    if os.path.exists(build_path):
-        progress("  Removing stale build file...")
-        os.remove(build_path)
-    if os.path.exists(db_path):
-        # db_path is only ever read by the web app (the collector never
-        # writes to it directly), so with no active writer this is a
-        # consistent snapshot.
-        progress("  Copying live DB into build file...")
-        shutil.copyfile(db_path, build_path)
-
-    progress("  Opening build engine...")
-    build_engine_obj = configure_sqlite(build_engine(build_path))
-    progress("  Ensuring build schema...")
-    Base.metadata.create_all(build_engine_obj)
-    progress("  Build database ready.")
+    progress("Building a new database engine...")
+    own_engine = configure_sqlite(build_engine(db_path))
+    Base.metadata.create_all(own_engine)
     try:
-        count = _run_collection_pass(build_engine_obj, league_id, progress)
+        return _run_collection_pass(own_engine, league_id, progress)
     finally:
-        # Release our file handle before swapping so the replaced inode
-        # isn't held open by us.
-        build_engine_obj.dispose()
-
-    progress("Swapping the freshly built database in...")
-    # Drop the app's pooled connections to db_path first, then swap. Doing
-    # it in this order means os.replace runs with no open handle on the
-    # target (required on Windows; harmless on Linux), and disposing again
-    # afterwards clears any connection a request opened in the brief window
-    # so nothing keeps serving from the old, now-replaced inode.
-    engine.dispose()
-    os.replace(build_path, db_path)   # atomic on the same filesystem
-    engine.dispose()
-    progress("Database swap complete.")
-    return count
+        own_engine.dispose()
 
 
 def main() -> None:

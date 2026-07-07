@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -11,7 +14,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from pari_mixer_scraper.analysis import compute_team_stats, compute_tournament_hero_stats, generate_coach_text
-from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID, collect
+from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID
 from pari_mixer_scraper.mixercup_client import MixerCupClient, pair_substitution_events
 from pari_mixer_scraper.models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, SubstitutionEvent, Team,
@@ -42,22 +45,54 @@ def _append_log(msg: str) -> None:
 
 
 def _run_collect() -> None:
-    """Runs collect() directly on this background thread.
+    """Collects into a side file via a *separate process*, then atomically
+    swaps it in.
 
-    A subprocess-based version of this was tried (to get a hard, OS-level
-    kill on a hung run instead of a cooperative Python-level timeout) but
-    made things worse: multiprocessing.Queue()'s first use unconditionally
-    forks a resource-tracker helper process internally, regardless of which
-    start method ("fork" or "spawn") you picked for your own Process - and
-    that appears to hang indefinitely in this environment, wedging the
-    supervisor before it even gets to start collect() at all (confirmed via
-    Render's logs: the run sat at running=true for over an hour, far past
-    even the 10-minute hard deadline that code tried to enforce). Reverted
-    to the simple direct-call version; the stale-run recovery in
-    _start_collect_background is what catches a hang here instead."""
+    Writing SQLite from a background thread of this gunicorn worker hung
+    indefinitely on Render no matter what we tried (isolated build file, no
+    fsync, batched writes - every variant still wedged mid-write), while the
+    identical collection code run as a standalone OS process works reliably.
+    So instead of calling collect() in-thread, we spawn it as its own
+    process (plain subprocess, not multiprocessing - the latter's
+    resource-tracker fork hung here) pointed at <db>.build, seeded from the
+    current live DB so already-collected data is preserved. When it exits
+    cleanly we os.replace() the build file over the live one and dispose the
+    app's pool so requests reopen the fresh data. The site keeps serving the
+    previous data throughout."""
+    build_path = f"{DB_PATH}.build"
     try:
-        new_count = collect(LEAGUE_ID, DB_PATH, progress=_append_log, engine=engine)
-        _collect_state["new_matches"] = new_count
+        if os.path.exists(build_path):
+            os.remove(build_path)
+        if os.path.exists(DB_PATH):
+            # db_path is only read by the app (never written directly), so
+            # with no active writer this is a consistent snapshot to seed
+            # the build from.
+            shutil.copyfile(DB_PATH, build_path)
+
+        _append_log("Spawning collector process...")
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-m", "pari_mixer_scraper.collect",
+             "--db", build_path, "--league-id", str(LEAGUE_ID)],
+            cwd=str(BASE_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                _append_log(line)
+        proc.wait()
+        if proc.returncode != 0:
+            _collect_state["error"] = f"collector process exited with code {proc.returncode}"
+            _append_log(_collect_state["error"])
+            return
+
+        _append_log("Swapping the freshly built database in...")
+        engine.dispose()
+        os.replace(build_path, DB_PATH)
+        engine.dispose()
+        _append_log("Database swap complete.")
     except Exception as e:
         _collect_state["error"] = str(e)
         _append_log(f"ERROR: {e}")

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -54,22 +53,18 @@ def _run_collect() -> None:
     identical collection code run as a standalone OS process works reliably.
     So instead of calling collect() in-thread, we spawn it as its own
     process (plain subprocess, not multiprocessing - the latter's
-    resource-tracker fork hung here) pointed at <db>.build, seeded from the
-    current live DB so already-collected data is preserved. When it exits
-    cleanly we os.replace() the build file over the live one and dispose the
-    app's pool so requests reopen the fresh data. The site keeps serving the
-    previous data throughout."""
-    build_path = f"{DB_PATH}.build"
+    resource-tracker fork hung here) pointed at a fresh <db>.build. When it
+    exits cleanly we os.replace() the build file over the live one and
+    dispose the app's pool so requests reopen the fresh data. The site keeps
+    serving the previous data throughout. We deliberately do NO file I/O in
+    this thread beyond spawning the child - even that was suspect on Render -
+    and rebuild from scratch rather than seeding a copy (drafts/subs are all
+    re-fetched, so nothing is lost)."""
+    # Unique per run so we never touch a stale/half-written build file from
+    # a prior run (and so this thread needs no os.remove before spawning).
+    build_path = f"{DB_PATH}.build.{os.getpid()}.{int(time.monotonic() * 1000)}"
     try:
-        if os.path.exists(build_path):
-            os.remove(build_path)
-        if os.path.exists(DB_PATH):
-            # db_path is only read by the app (never written directly), so
-            # with no active writer this is a consistent snapshot to seed
-            # the build from.
-            shutil.copyfile(DB_PATH, build_path)
-
-        _append_log("Spawning collector process...")
+        _append_log("Collector thread started; spawning process...")
         proc = subprocess.Popen(
             [sys.executable, "-u", "-m", "pari_mixer_scraper.collect",
              "--db", build_path, "--league-id", str(LEAGUE_ID)],

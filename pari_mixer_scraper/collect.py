@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 from collections.abc import Callable
@@ -29,12 +30,24 @@ DEFAULT_LEAGUE_ID = 19924  # Pari Mixer Cup
 
 ProgressFn = Callable[[str], None]
 
+_HEROES_BUNDLE = Path(__file__).resolve().parent / "data" / "heroes.json"
 
-def sync_heroes(session: Session, client: OpenDotaClient, progress: ProgressFn | None = None) -> None:
+
+def sync_heroes(session: Session, client: OpenDotaClient | None = None, progress: ProgressFn | None = None) -> None:
+    """Populates the hero list from a bundled snapshot shipped in the repo,
+    not from OpenDota. The hero roster changes only a handful of times a
+    year (a new hero release), but OpenDota's /heroes call was the single
+    most frequent hang point for the collector on Render - and since it's
+    the very first step, a hang there left a freshly redeployed (empty)
+    database with no data at all until it cleared. Reading a static file
+    is instant and can't hang. `client` is accepted for backward
+    compatibility but no longer used; refresh the bundle by hand when a
+    new hero ships."""
     progress = progress or (lambda msg: None)
-    progress("  Requesting hero list from OpenDota...")
-    heroes = client.get_heroes()
-    progress(f"  Got {len(heroes)} heroes from OpenDota, upserting into DB...")
+    progress("  Loading hero list from bundled snapshot...")
+    with open(_HEROES_BUNDLE, encoding="utf-8") as f:
+        heroes = json.load(f)
+    progress(f"  {len(heroes)} heroes loaded, upserting into DB...")
     for h in heroes:
         hero = session.get(Hero, h["id"])
         if hero is None:

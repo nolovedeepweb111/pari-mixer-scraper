@@ -47,17 +47,23 @@ def sync_heroes(session: Session, client: OpenDotaClient | None = None, progress
     progress("  Loading hero list from bundled snapshot...")
     with open(_HEROES_BUNDLE, encoding="utf-8") as f:
         heroes = json.load(f)
-    progress(f"  {len(heroes)} heroes loaded, upserting into DB...")
-    for h in heroes:
-        hero = session.get(Hero, h["id"])
-        if hero is None:
-            session.add(Hero(hero_id=h["id"], name=h["name"], localized_name=h["localized_name"]))
-        else:
-            hero.name = h["name"]
-            hero.localized_name = h["localized_name"]
-    progress("  Hero upserts staged, committing...")
-    session.commit()
-    progress("  Hero sync commit done.")
+
+    # Insert only the heroes we don't already have, in a single batched
+    # write - not a per-row get()+add() loop. On a fresh (empty) database
+    # that loop was 127 separate INSERTs each contending for SQLite's write
+    # lock against the web server's concurrent reads on Render, and under
+    # active polling it could stall indefinitely between them. The bundle
+    # is static, so existing rows are already correct and need no update.
+    existing_ids = {hid for (hid,) in session.execute(select(Hero.hero_id))}
+    new_heroes = [
+        Hero(hero_id=h["id"], name=h["name"], localized_name=h["localized_name"])
+        for h in heroes if h["id"] not in existing_ids
+    ]
+    progress(f"  {len(heroes)} heroes loaded, {len(new_heroes)} new to insert...")
+    if new_heroes:
+        session.add_all(new_heroes)
+        session.commit()
+    progress("  Hero sync done.")
 
 
 def fetch_pro_player_directory(client: OpenDotaClient) -> dict[int, dict]:

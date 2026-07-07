@@ -20,7 +20,11 @@
 
 body {
   margin: 0;
-  font-family: "Jost", "Segoe UI", Roboto, sans-serif;
+  /* Jost is battlepass.ru's typeface; use it when locally installed but
+     don't pull it from Google Fonts - that CDN is unreliable/blocked from
+     Russia and a render-blocking font <link> was leaving the whole page
+     stuck on a blank screen. System sans-serif fallback instead. */
+  font-family: "Jost", -apple-system, "Segoe UI", Roboto, sans-serif;
   background: var(--bg);
   color: var(--text);
 }

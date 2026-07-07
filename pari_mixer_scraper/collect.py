@@ -688,15 +688,20 @@ def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, en
     build_path = f"{db_path}.build"
     progress("Preparing an isolated build database...")
     if os.path.exists(build_path):
+        progress("  Removing stale build file...")
         os.remove(build_path)
     if os.path.exists(db_path):
         # db_path is only ever read by the web app (the collector never
         # writes to it directly), so with no active writer this is a
         # consistent snapshot.
+        progress("  Copying live DB into build file...")
         shutil.copyfile(db_path, build_path)
 
+    progress("  Opening build engine...")
     build_engine_obj = configure_sqlite(build_engine(build_path))
+    progress("  Ensuring build schema...")
     Base.metadata.create_all(build_engine_obj)
+    progress("  Build database ready.")
     try:
         count = _run_collection_pass(build_engine_obj, league_id, progress)
     finally:

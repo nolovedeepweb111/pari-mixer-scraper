@@ -78,6 +78,16 @@ class SteamClient:
         teams = result.get("teams", [])
         return teams[0] if teams else None
 
+    def get_match_details(self, match_id: int) -> dict:
+        """Full match detail - unlike GetMatchHistory, this includes
+        picks_bans for captain's-mode games (the same structure OpenDota
+        exposes; OpenDota sources it from here). Valve reports failures as
+        {"error": ...} with HTTP 200, so surface those as exceptions."""
+        result = self._get("GetMatchDetails", "v1", {"match_id": match_id})
+        if result.get("error"):
+            raise RuntimeError(f"GetMatchDetails: {result['error']}")
+        return result
+
 
 def normalize_match(m: dict) -> dict:
     """Convert a GetMatchHistory match entry into the common shape shared

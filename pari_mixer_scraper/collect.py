@@ -270,33 +270,48 @@ def persist_match(
         ))
 
 
-def sync_draft_data(session: Session, client: OpenDotaClient, progress: ProgressFn) -> None:
+def sync_draft_data(
+    session: Session,
+    client: OpenDotaClient,
+    steam_client: SteamClient | None,
+    progress: ProgressFn,
+) -> None:
     """Backfills picks/bans for matches that don't have any draft rows yet.
-    Steam's GetMatchHistory (our primary, cheap source) doesn't include the
-    draft, so this costs one OpenDota call per match - but only once, since
-    matches already covered are skipped on later runs."""
+    Steam's GetMatchDetails is the primary source (generous rate limits,
+    same picks_bans structure - OpenDota sources its copy from there);
+    OpenDota is the per-match fallback. Costs one call per match, but only
+    once - matches already covered are skipped on later runs."""
     has_draft = {row[0] for row in session.execute(select(MatchDraftEntry.match_id))}
     all_match_ids = [row[0] for row in session.execute(select(Match.match_id))]
     missing = [m for m in all_match_ids if m not in has_draft]
     if not missing:
         return
 
+    def fetch_detail(match_id: int) -> dict:
+        if steam_client is not None:
+            try:
+                return steam_client.get_match_details(match_id)
+            except Exception as e:
+                progress(f"Steam GetMatchDetails failed for {match_id} ({e}); trying OpenDota...")
+        return client.get_match(match_id)
+
     progress(f"Fetching picks/bans for {len(missing)} match(es)...")
     fetched_empty = 0
     consecutive_failures = 0
     for i, match_id in enumerate(missing, start=1):
         try:
-            detail = client.get_match(match_id)
+            detail = fetch_detail(match_id)
             consecutive_failures = 0
         except Exception as e:
             progress(f"Could not fetch picks/bans for match {match_id}: {e}")
             consecutive_failures += 1
             if consecutive_failures >= 5:
-                # OpenDota is rate-limiting this IP for the day, not hiccuping
-                # on one match - grinding through the rest would waste minutes
-                # to fetch nothing. Stop; the next cycle backfills what's left
-                # (already-fetched drafts are kept via the seeded build).
-                progress("OpenDota looks rate-limited; deferring remaining drafts to a later run.")
+                # Both sources failing repeatedly (e.g. OpenDota rate-limits
+                # this IP for the day) - grinding through the rest would waste
+                # minutes to fetch nothing. Stop; the next cycle backfills
+                # what's left (already-fetched drafts are kept via the seeded
+                # build).
+                progress("Draft sources look rate-limited; deferring remaining drafts to a later run.")
                 break
             continue
 
@@ -692,7 +707,7 @@ def _run_collection_pass(engine, league_id: int, progress: ProgressFn,
         for step_name, step in (
             ("player name enrichment", lambda: enrich_missing_player_names(session, od_client, progress)),
             ("team name enrichment", lambda: enrich_missing_team_names(session, od_client, steam_client, progress)),
-            ("draft sync", lambda: sync_draft_data(session, od_client, progress)),
+            ("draft sync", lambda: sync_draft_data(session, od_client, steam_client, progress)),
         ):
             try:
                 step()

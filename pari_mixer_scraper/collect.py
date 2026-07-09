@@ -688,8 +688,33 @@ def main() -> None:
         help=f"OpenDota/Dotabuff league id (default: {DEFAULT_LEAGUE_ID}, Pari Mixer Cup)",
     )
     parser.add_argument("--db", default="tournament.db", help="Path to SQLite database file")
+    parser.add_argument(
+        "--promote-to", default=None,
+        help="After collecting into --db, atomically os.replace() this path with it. "
+             "The web app uses this so the swap (a file op) happens in this standalone "
+             "process, where file I/O works, rather than in its gunicorn worker thread.",
+    )
     args = parser.parse_args()
     collect(args.league_id, args.db)
+    if args.promote_to:
+        # Guard against clobbering the live DB with an empty build - e.g. a
+        # transient Steam/OpenDota outage that returned no matches would
+        # otherwise wipe the site. Only promote a build that actually has
+        # match data.
+        from sqlalchemy import func, select
+        eng = configure_sqlite(build_engine(args.db))
+        with Session(eng) as s:
+            n_matches = s.execute(select(func.count()).select_from(Match)).scalar() or 0
+        eng.dispose()
+        if n_matches > 0:
+            os.replace(args.db, args.promote_to)
+            log.info(f"Promoted {args.db} -> {args.promote_to} ({n_matches} matches)")
+        else:
+            try:
+                os.remove(args.db)
+            except OSError:
+                pass
+            log.info("Build has no matches; leaving the existing live DB unchanged")
 
 
 if __name__ == "__main__":

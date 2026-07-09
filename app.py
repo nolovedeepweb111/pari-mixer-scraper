@@ -60,51 +60,35 @@ def _run_collect() -> None:
     and rebuild from scratch rather than seeding a copy (drafts/subs are all
     re-fetched, so nothing is lost)."""
     # Unique per run so we never touch a stale/half-written build file from
-    # a prior run (and so this thread needs no os.remove before spawning).
-    stamp = f"{os.getpid()}.{int(time.monotonic() * 1000)}"
-    build_path = f"{DB_PATH}.build.{stamp}"
-    log_path = f"{DB_PATH}.collectlog.{stamp}"
+    # a prior run.
+    build_path = f"{DB_PATH}.build.{os.getpid()}.{int(time.monotonic() * 1000)}"
     try:
-        _append_log("Collector thread started; spawning process...")
-        # Spawn with os.posix_spawn directly rather than subprocess. fork()
-        # from this multi-threaded gunicorn worker deadlocked on Render, and
-        # subprocess only avoids fork when a fragile set of conditions hold,
-        # so we call posix_spawn (the async-signal-safe primitive built for
-        # spawning from threaded programs) explicitly. The child's stdout +
-        # stderr are redirected to a log file we tail, instead of a pipe -
-        # a pipe both hid the child's output behind buffering and gave no way
-        # to tell "spawn hung" from "child running silently".
+        _append_log("Spawning collector process...")
+        # The gunicorn worker THREAD cannot be trusted with blocking file I/O
+        # on Render - reading/copying files from it hung indefinitely (which
+        # is what stalled every prior approach). So this thread does no file
+        # I/O at all: it only os.posix_spawn()s the collector (posix_spawn,
+        # not fork, which deadlocked from this multi-threaded worker) and
+        # then waits on it with waitpid (a syscall, not file I/O). The child
+        # process does ALL the file work - collecting into build_path and
+        # then os.replace()-ing it over the live DB (--promote-to) - since
+        # file I/O works fine in a standalone process, exactly as the CLI
+        # does. The child's own stdout/stderr are inherited, so its progress
+        # shows up in Render's log stream.
         child_env = dict(os.environ)
         child_env["PYTHONPATH"] = str(BASE_DIR) + os.pathsep + child_env.get("PYTHONPATH", "")
-        file_actions = [
-            (os.POSIX_SPAWN_OPEN, 1, log_path,
-             os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644),
-            (os.POSIX_SPAWN_DUP2, 1, 2),
-        ]
         pid = os.posix_spawn(
             sys.executable,
             [sys.executable, "-u", "-m", "pari_mixer_scraper.collect",
-             "--db", build_path, "--league-id", str(LEAGUE_ID)],
+             "--db", build_path, "--promote-to", DB_PATH,
+             "--league-id", str(LEAGUE_ID)],
             child_env,
-            file_actions=file_actions,
         )
-        _append_log(f"Spawned collector pid {pid}; waiting...")
+        _append_log(f"Spawned collector pid {pid}; waiting for it to finish...")
 
-        # Poll for exit, streaming the child's log file as it grows.
-        log_pos = 0
         exit_code = None
         while exit_code is None:
             time.sleep(2)
-            try:
-                with open(log_path, "r", encoding="utf-8", errors="replace") as lf:
-                    lf.seek(log_pos)
-                    chunk = lf.read()
-                    log_pos = lf.tell()
-                for ln in chunk.splitlines():
-                    if ln.strip():
-                        _append_log(ln.rstrip())
-            except FileNotFoundError:
-                pass
             wpid, status = os.waitpid(pid, os.WNOHANG)
             if wpid != 0:
                 exit_code = os.waitstatus_to_exitcode(status)
@@ -114,19 +98,14 @@ def _run_collect() -> None:
             _append_log(_collect_state["error"])
             return
 
-        _append_log("Swapping the freshly built database in...")
+        # The child already swapped the fresh DB into place; just drop our
+        # pooled connections so new requests reopen it and see the new data.
         engine.dispose()
-        os.replace(build_path, DB_PATH)
-        engine.dispose()
-        _append_log("Database swap complete.")
+        _append_log("Collection complete; data refreshed.")
     except Exception as e:
         _collect_state["error"] = str(e)
         _append_log(f"ERROR: {e}")
     finally:
-        try:
-            os.remove(log_path)
-        except OSError:
-            pass
         _collect_state["running"] = False
 
 

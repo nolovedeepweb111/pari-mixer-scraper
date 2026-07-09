@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .mixercup_client import MixerCupClient
@@ -694,14 +694,30 @@ def collect(
     app._run_collect). `engine` is accepted for backward compatibility and
     ignored.
 
-    When promote_to is set, the freshly built DB is published to that path
-    in TWO stages: first the core team/roster/match data as soon as it's
-    ready (so the site shows teams within seconds), then the full DB once the
-    slow supplementary backfill (drafts, name enrichment) finishes. Both
-    publishes are atomic and guarded so a run that found no matches never
-    clobbers the live site with an empty DB."""
+    When promote_to is set, the build is SEEDED from the current live DB at
+    promote_to first, so every run is incremental: drafts and substitution
+    history already collected are carried over, not re-fetched (critical -
+    substitution events deleted upstream by mixer-cup.gg exist ONLY in our
+    live DB, and a from-scratch rebuild used to silently drop them; it also
+    re-downloaded every match's draft each run, burning OpenDota's monthly
+    quota and leaving the site draftless for minutes at a time).
+
+    The result is then published to promote_to in TWO stages: the seeded
+    build with fresh core team/roster/match data as soon as that's ready
+    (teams visible within seconds, old drafts intact), then the full DB once
+    the slow supplementary backfill (new drafts, name enrichment) finishes.
+    Both publishes are atomic and guarded so a run that ended up with no
+    matches never clobbers the live site with an empty DB."""
     progress = progress or log.info
     progress("Starting collection...")
+
+    if promote_to and os.path.exists(promote_to):
+        # Seed from the live DB. It only ever has readers (the web app) -
+        # every writer works on a build file like this one - so with no
+        # active writer this is a consistent snapshot.
+        progress("Seeding build from the live database...")
+        shutil.copyfile(promote_to, db_path)
+
     progress("Building a new database engine...")
     own_engine = configure_sqlite(build_engine(db_path))
     Base.metadata.create_all(own_engine)
@@ -712,21 +728,31 @@ def collect(
             progress("Core data published to the live site (teams visible now).")
 
     try:
-        count = _run_collection_pass(own_engine, league_id, progress, on_core_ready=publish_core)
+        new_count = _run_collection_pass(own_engine, league_id, progress, on_core_ready=publish_core)
+        if promote_to:
+            with Session(own_engine) as s:
+                total_matches = s.execute(
+                    select(func.count()).select_from(Match)
+                ).scalar() or 0
     finally:
         own_engine.dispose()
 
     if promote_to:
-        if count > 0:
+        # Guard on the build's TOTAL match count, not just newly added ones:
+        # a routine incremental run with nothing new (new_count == 0) still
+        # carries fresh results/rosters/subs worth publishing, while a build
+        # that is genuinely empty (fresh deploy + upstream outage) must never
+        # replace a live DB that has data.
+        if total_matches > 0:
             os.replace(db_path, promote_to)
-            progress(f"Full data published ({count} matches).")
+            progress(f"Full data published ({total_matches} matches, {new_count} new).")
         else:
             try:
                 os.remove(db_path)
             except OSError:
                 pass
             progress("Build has no matches; left the live DB unchanged.")
-    return count
+    return new_count
 
 
 def main() -> None:

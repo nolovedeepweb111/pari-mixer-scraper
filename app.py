@@ -90,9 +90,23 @@ def _run_collect() -> None:
         )
         _append_log(f"Spawned collector pid {pid}; waiting for it to finish...")
 
+        # Hard deadline: a full from-scratch rebuild takes ~7-10 min on this
+        # tier; anything past this is a wedged child. Kill it and free the
+        # run slot instead of sitting at running=true forever (the child's
+        # own promotes are atomic, so killing it never corrupts the live DB).
+        deadline = time.monotonic() + 30 * 60
         exit_code = None
         while exit_code is None:
             time.sleep(2)
+            if time.monotonic() > deadline:
+                _append_log("Collector exceeded 30 min - killing it.")
+                try:
+                    os.kill(pid, 9)
+                    os.waitpid(pid, 0)
+                except OSError:
+                    pass
+                _collect_state["error"] = "collector timed out and was killed"
+                return
             try:
                 wpid, status = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:

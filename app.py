@@ -65,6 +65,15 @@ def _run_collect() -> None:
     build_path = f"{DB_PATH}.build.{os.getpid()}.{int(time.monotonic() * 1000)}"
     try:
         _append_log("Collector thread started; spawning process...")
+        # close_fds=False is deliberate: it makes CPython use posix_spawn()
+        # instead of fork()+exec() here. fork() from this multi-threaded
+        # gunicorn worker deadlocked on Render (the child could inherit a
+        # lock held by another thread at fork time and never make progress),
+        # which is exactly why Popen was hanging before it printed anything.
+        # posix_spawn is async-signal-safe and built for spawning from
+        # threaded programs. It's safe with close_fds=False because every fd
+        # Python opens is CLOEXEC by default (PEP 446), so the child still
+        # inherits nothing but the stdio we hand it.
         proc = subprocess.Popen(
             [sys.executable, "-u", "-m", "pari_mixer_scraper.collect",
              "--db", build_path, "--league-id", str(LEAGUE_ID)],
@@ -72,6 +81,7 @@ def _run_collect() -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            close_fds=False,
         )
         for line in proc.stdout:
             line = line.rstrip()

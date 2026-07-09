@@ -21,7 +21,13 @@ class OpenDotaClient:
         self._last_request = 0.0
 
     def _get(self, path: str, params: dict | None = None):
-        for attempt in range(5):
+        # Only 3 attempts with short backoff: when OpenDota rate-limits this
+        # IP (it shares Render's egress with who knows what), the limit lasts
+        # for hours - long per-request retry storms just burn wall-clock time
+        # (5 attempts with exponential backoff meant ~30s wasted per request,
+        # times ~160 draft fetches). Fail fast; the caller skips the step and
+        # a later collection cycle backfills it.
+        for attempt in range(3):
             elapsed = time.monotonic() - self._last_request
             if elapsed < self.min_interval:
                 time.sleep(self.min_interval - elapsed)

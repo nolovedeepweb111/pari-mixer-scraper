@@ -283,11 +283,21 @@ def sync_draft_data(session: Session, client: OpenDotaClient, progress: Progress
 
     progress(f"Fetching picks/bans for {len(missing)} match(es)...")
     fetched_empty = 0
+    consecutive_failures = 0
     for i, match_id in enumerate(missing, start=1):
         try:
             detail = client.get_match(match_id)
+            consecutive_failures = 0
         except Exception as e:
             progress(f"Could not fetch picks/bans for match {match_id}: {e}")
+            consecutive_failures += 1
+            if consecutive_failures >= 5:
+                # OpenDota is rate-limiting this IP for the day, not hiccuping
+                # on one match - grinding through the rest would waste minutes
+                # to fetch nothing. Stop; the next cycle backfills what's left
+                # (already-fetched drafts are kept via the seeded build).
+                progress("OpenDota looks rate-limited; deferring remaining drafts to a later run.")
+                break
             continue
 
         picks_bans = detail.get("picks_bans") or []
@@ -320,13 +330,21 @@ def enrich_missing_player_names(session: Session, client: OpenDotaClient, progre
     if not missing:
         return
     progress(f"Resolving nicknames for {len(missing)} player(s) without a known name...")
+    consecutive_failures = 0
     for player in missing:
         try:
             info = client.get_player(player.account_id)
+            consecutive_failures = 0
             name = (info.get("profile") or {}).get("personaname")
             if name:
                 player.name = name
         except Exception:
+            consecutive_failures += 1
+            if consecutive_failures >= 5:
+                # Same rationale as sync_draft_data: a run of failures means
+                # OpenDota is rate-limiting the IP - defer to a later cycle.
+                progress("OpenDota looks rate-limited; deferring remaining nicknames to a later run.")
+                break
             continue
     session.commit()
 
@@ -653,17 +671,34 @@ def _run_collection_pass(engine, league_id: int, progress: ProgressFn,
         # Everything from here on is supplementary (nicknames for players
         # MixerCup didn't cover, fallback team names, draft history for the
         # "Последние драфты" tab) - the site already looks right without it.
-        progress("Syncing pro player directory...")
-        pro_directory = fetch_pro_player_directory(od_client)
-        for player in session.execute(select(Player).where(Player.name.is_(None))).scalars():
-            pro_info = pro_directory.get(player.account_id)
-            if pro_info and pro_info.get("name"):
-                player.name = pro_info["name"]
-        session.commit()
+        # Each step is isolated in its own try/except: they all lean on
+        # OpenDota, which rate-limits Render's shared IP hard (429), and an
+        # unwrapped failure here used to kill the whole run BEFORE the final
+        # publish - core data collected, then thrown away. Whatever fails
+        # today just gets backfilled by a later run (builds are seeded from
+        # the live DB, so completed work is never redone).
+        try:
+            progress("Syncing pro player directory...")
+            pro_directory = fetch_pro_player_directory(od_client)
+            for player in session.execute(select(Player).where(Player.name.is_(None))).scalars():
+                pro_info = pro_directory.get(player.account_id)
+                if pro_info and pro_info.get("name"):
+                    player.name = pro_info["name"]
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            progress(f"Pro player directory failed ({e}); skipping this step.")
 
-        enrich_missing_player_names(session, od_client, progress)
-        enrich_missing_team_names(session, od_client, steam_client, progress)
-        sync_draft_data(session, od_client, progress)
+        for step_name, step in (
+            ("player name enrichment", lambda: enrich_missing_player_names(session, od_client, progress)),
+            ("team name enrichment", lambda: enrich_missing_team_names(session, od_client, steam_client, progress)),
+            ("draft sync", lambda: sync_draft_data(session, od_client, progress)),
+        ):
+            try:
+                step()
+            except Exception as e:
+                session.rollback()
+                progress(f"{step_name} failed ({e}); skipping this step.")
 
     progress("Done.")
     return len(new_matches)

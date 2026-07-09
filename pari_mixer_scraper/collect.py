@@ -287,12 +287,23 @@ def sync_draft_data(
     if not missing:
         return
 
+    # Valve's GetMatchDetails 500s for private-lobby games (which is what
+    # this mixer tournament is played in) even though GetMatchHistory lists
+    # them fine. After a few straight failures, stop trying Steam for the
+    # rest of the run instead of burning a doomed call + log line per match.
+    steam_failures = 0
+
     def fetch_detail(match_id: int) -> dict:
-        if steam_client is not None:
+        nonlocal steam_failures
+        if steam_client is not None and steam_failures < 3:
             try:
-                return steam_client.get_match_details(match_id)
+                detail = steam_client.get_match_details(match_id)
+                steam_failures = 0
+                return detail
             except Exception as e:
-                progress(f"Steam GetMatchDetails failed for {match_id} ({e}); trying OpenDota...")
+                steam_failures += 1
+                if steam_failures == 3:
+                    progress(f"Steam GetMatchDetails keeps failing ({e}); using OpenDota only for this run.")
         return client.get_match(match_id)
 
     progress(f"Fetching picks/bans for {len(missing)} match(es)...")

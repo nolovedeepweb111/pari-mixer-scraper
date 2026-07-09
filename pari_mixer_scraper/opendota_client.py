@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 
 import requests
@@ -11,13 +12,18 @@ BASE_URL = "https://api.opendota.com/api"
 
 class OpenDotaClient:
     """Thin wrapper around the public OpenDota API with basic rate limiting
-    and retry-on-429 handling (free tier: 60 req/min, 50k req/month)."""
+    and retry-on-429 handling. Unauthenticated use shares a per-IP daily
+    quota - painful on Render, whose egress IP is shared - so if
+    OPENDOTA_API_KEY is set (opendota.com -> API keys) it's attached to
+    every request and the quota becomes ours alone."""
 
-    def __init__(self, base_url: str = BASE_URL, min_interval: float = 1.2, session: requests.Session | None = None):
+    def __init__(self, base_url: str = BASE_URL, min_interval: float = 1.2,
+                 session: requests.Session | None = None, api_key: str | None = None):
         self.base_url = base_url
         self.min_interval = min_interval
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": "pari-mixer-scraper/1.0"})
+        self.api_key = api_key if api_key is not None else os.environ.get("OPENDOTA_API_KEY")
         self._last_request = 0.0
 
     def _get(self, path: str, params: dict | None = None):
@@ -27,6 +33,9 @@ class OpenDotaClient:
         # (5 attempts with exponential backoff meant ~30s wasted per request,
         # times ~160 draft fetches). Fail fast; the caller skips the step and
         # a later collection cycle backfills it.
+        if self.api_key:
+            params = {**(params or {}), "api_key": self.api_key}
+
         for attempt in range(3):
             elapsed = time.monotonic() - self._last_request
             if elapsed < self.min_interval:

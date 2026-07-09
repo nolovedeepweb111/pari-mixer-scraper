@@ -414,17 +414,22 @@ let wasRunning = false;
 async function pollCollectStatus() {
   const res = await fetch("/api/collect/status");
   const status = await res.json();
-  const lastLine = status.log[status.log.length - 1] || "";
 
+  // Keep the user-facing text friendly - never leak internal collector
+  // details (pids, log lines, stack traces) into the header.
   if (status.running) {
-    collectStatusEl.textContent = `Обновление данных... ${lastLine}`;
-  } else if (status.error) {
-    collectStatusEl.textContent = `Ошибка обновления: ${status.error}`;
+    collectStatusEl.textContent = "Обновление данных…";
   } else {
     collectStatusEl.textContent = "";
   }
 
-  if (wasRunning && !status.running) {
+  // Refresh when a collection finishes, and also mid-run if the sidebar is
+  // still empty - the collector publishes core team data partway through
+  // (before the slow draft backfill), so this lets an already-open page
+  // show teams as soon as that first stage lands instead of waiting for the
+  // whole run to complete.
+  const sidebarEmpty = teamsEl.querySelectorAll(".team-btn").length === 0;
+  if ((wasRunning && !status.running) || (status.running && sidebarEmpty)) {
     loadTeams();
     if (activeTeamId != null) {
       loadTeamDetail(activeTeamId, activeTab);

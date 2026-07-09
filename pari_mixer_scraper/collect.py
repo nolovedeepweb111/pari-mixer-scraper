@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 
@@ -573,10 +574,17 @@ def apply_manual_roster_overrides(session: Session, progress: ProgressFn) -> Non
         progress(f"Applied {applied} manual roster override(s)")
 
 
-def _run_collection_pass(engine, league_id: int, progress: ProgressFn) -> int:
+def _run_collection_pass(engine, league_id: int, progress: ProgressFn,
+                         on_core_ready=None) -> int:
     """Does the actual collection work against `engine`, returning the
     number of newly stored matches. The caller decides what `engine`
-    points at - see collect()."""
+    points at - see collect().
+
+    on_core_ready, if given, is called once the core team/roster/match data
+    is committed but before the slow supplementary backfill (draft history,
+    nickname/team-name enrichment). The app uses it to publish teams to the
+    site fast, so the user isn't staring at an empty page during the slow
+    part."""
     progress("Engine ready, building API clients...")
 
     od_client = OpenDotaClient()
@@ -637,6 +645,11 @@ def _run_collection_pass(engine, league_id: int, progress: ProgressFn) -> int:
         session.commit()
         progress("Core team/roster data ready - filling in the slower supplementary details now.")
 
+        if on_core_ready is not None:
+            # Core data is committed, so the DB file is a consistent snapshot
+            # the caller can safely publish now (before the slow backfill).
+            on_core_ready()
+
         # Everything from here on is supplementary (nicknames for players
         # MixerCup didn't cover, fallback team names, draft history for the
         # "Последние драфты" tab) - the site already looks right without it.
@@ -656,27 +669,64 @@ def _run_collection_pass(engine, league_id: int, progress: ProgressFn) -> int:
     return len(new_matches)
 
 
-def collect(league_id: int, db_path: str, progress: ProgressFn | None = None, engine=None) -> int:
+def _atomic_publish(src: str, dst: str) -> None:
+    """Copy src onto dst atomically: copy to a temp beside dst, then
+    os.replace it in. A plain copyfile truncates dst in place, which a
+    concurrent reader (the web app) could catch mid-write; os.replace swaps
+    the inode so readers always see either the old or the new file whole."""
+    tmp = f"{dst}.publishtmp.{os.getpid()}"
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+
+
+def collect(
+    league_id: int, db_path: str, progress: ProgressFn | None = None,
+    engine=None, promote_to: str | None = None,
+) -> int:
     """Runs a full collection pass against db_path, building in place, and
     returns the number of newly stored matches.
 
     This always writes directly to db_path with its own engine. The Flask
     app does NOT call this in a background thread - writing SQLite from a
-    background thread of the gunicorn worker hung indefinitely on Render no
-    matter what (isolated file, no fsync, batched writes - all still hung),
+    background thread of the gunicorn worker hung indefinitely on Render,
     while this exact code run as a standalone process works fine. So the app
-    spawns it as a separate process pointed at a build file and swaps that
-    in itself (see app._run_collect). `engine` is accepted for backward
-    compatibility and ignored."""
+    spawns it as a separate process pointed at a build file (see
+    app._run_collect). `engine` is accepted for backward compatibility and
+    ignored.
+
+    When promote_to is set, the freshly built DB is published to that path
+    in TWO stages: first the core team/roster/match data as soon as it's
+    ready (so the site shows teams within seconds), then the full DB once the
+    slow supplementary backfill (drafts, name enrichment) finishes. Both
+    publishes are atomic and guarded so a run that found no matches never
+    clobbers the live site with an empty DB."""
     progress = progress or log.info
     progress("Starting collection...")
     progress("Building a new database engine...")
     own_engine = configure_sqlite(build_engine(db_path))
     Base.metadata.create_all(own_engine)
+
+    def publish_core() -> None:
+        if promote_to:
+            _atomic_publish(db_path, promote_to)
+            progress("Core data published to the live site (teams visible now).")
+
     try:
-        return _run_collection_pass(own_engine, league_id, progress)
+        count = _run_collection_pass(own_engine, league_id, progress, on_core_ready=publish_core)
     finally:
         own_engine.dispose()
+
+    if promote_to:
+        if count > 0:
+            os.replace(db_path, promote_to)
+            progress(f"Full data published ({count} matches).")
+        else:
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
+            progress("Build has no matches; left the live DB unchanged.")
+    return count
 
 
 def main() -> None:
@@ -690,31 +740,13 @@ def main() -> None:
     parser.add_argument("--db", default="tournament.db", help="Path to SQLite database file")
     parser.add_argument(
         "--promote-to", default=None,
-        help="After collecting into --db, atomically os.replace() this path with it. "
-             "The web app uses this so the swap (a file op) happens in this standalone "
-             "process, where file I/O works, rather than in its gunicorn worker thread.",
+        help="After collecting into --db, publish it to this path (core data first, "
+             "then the full DB) via atomic os.replace. The web app uses this so all "
+             "file ops happen in this standalone process, where file I/O works, rather "
+             "than in its gunicorn worker thread.",
     )
     args = parser.parse_args()
-    collect(args.league_id, args.db)
-    if args.promote_to:
-        # Guard against clobbering the live DB with an empty build - e.g. a
-        # transient Steam/OpenDota outage that returned no matches would
-        # otherwise wipe the site. Only promote a build that actually has
-        # match data.
-        from sqlalchemy import func, select
-        eng = configure_sqlite(build_engine(args.db))
-        with Session(eng) as s:
-            n_matches = s.execute(select(func.count()).select_from(Match)).scalar() or 0
-        eng.dispose()
-        if n_matches > 0:
-            os.replace(args.db, args.promote_to)
-            log.info(f"Promoted {args.db} -> {args.promote_to} ({n_matches} matches)")
-        else:
-            try:
-                os.remove(args.db)
-            except OSError:
-                pass
-            log.info("Build has no matches; leaving the existing live DB unchanged")
+    collect(args.league_id, args.db, promote_to=args.promote_to)
 
 
 if __name__ == "__main__":

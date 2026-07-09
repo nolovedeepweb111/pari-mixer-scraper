@@ -65,19 +65,21 @@ def _run_collect() -> None:
     build_path = f"{DB_PATH}.build.{os.getpid()}.{int(time.monotonic() * 1000)}"
     try:
         _append_log("Collector thread started; spawning process...")
-        # close_fds=False is deliberate: it makes CPython use posix_spawn()
-        # instead of fork()+exec() here. fork() from this multi-threaded
-        # gunicorn worker deadlocked on Render (the child could inherit a
-        # lock held by another thread at fork time and never make progress),
-        # which is exactly why Popen was hanging before it printed anything.
-        # posix_spawn is async-signal-safe and built for spawning from
-        # threaded programs. It's safe with close_fds=False because every fd
-        # Python opens is CLOEXEC by default (PEP 446), so the child still
-        # inherits nothing but the stdio we hand it.
+        # CPython only takes the posix_spawn() fast path (instead of
+        # fork()+exec()) when close_fds is False AND cwd is None - any cwd=
+        # forces it back to fork+exec. fork() from this multi-threaded
+        # gunicorn worker deadlocked on Render (the child inherits a lock
+        # held by another thread at fork time and never makes progress),
+        # which is why Popen hung before printing anything. So: no cwd, and
+        # PYTHONPATH set via env so `-m` still resolves the package
+        # regardless of the inherited working directory. close_fds=False is
+        # safe because Python's fds are CLOEXEC by default (PEP 446).
+        child_env = dict(os.environ)
+        child_env["PYTHONPATH"] = str(BASE_DIR) + os.pathsep + child_env.get("PYTHONPATH", "")
         proc = subprocess.Popen(
             [sys.executable, "-u", "-m", "pari_mixer_scraper.collect",
              "--db", build_path, "--league-id", str(LEAGUE_ID)],
-            cwd=str(BASE_DIR),
+            env=child_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

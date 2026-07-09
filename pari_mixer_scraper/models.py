@@ -8,15 +8,24 @@ class Base(DeclarativeBase):
     pass
 
 
-def build_engine(db_path: str) -> Engine:
+def build_engine(db_path: str, poolclass=None) -> Engine:
     """Local SQLite file. (Turso/libSQL was tried here as a persistent
     backend, but its Rust driver appears to hold the GIL during network
     I/O badly enough to make the whole app unresponsive mid-collection -
     not worth it. Back to a plain local file; see git history if
-    revisiting this.)"""
+    revisiting this.)
+
+    Pass poolclass=NullPool for the web app's engine: the collector rebuilds
+    the DB in a side file and os.replace()s it over db_path, so a pooled
+    connection would keep serving the old, now-unlinked file forever. With
+    NullPool every request opens a fresh connection to the current db_path
+    and sees the freshly promoted data immediately."""
     from sqlalchemy import create_engine
 
-    return create_engine(f"sqlite:///{db_path}")
+    kwargs = {}
+    if poolclass is not None:
+        kwargs["poolclass"] = poolclass
+    return create_engine(f"sqlite:///{db_path}", **kwargs)
 
 
 def configure_sqlite(engine: Engine) -> Engine:

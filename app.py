@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, send_from_directory
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import NullPool
 
 from pari_mixer_scraper.analysis import compute_team_stats, compute_tournament_hero_stats, generate_coach_text
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID
@@ -26,7 +27,10 @@ DB_PATH = os.environ.get("TOURNAMENT_DB", str(BASE_DIR / "tournament.db"))
 LEAGUE_ID = int(os.environ.get("LEAGUE_ID", DEFAULT_LEAGUE_ID))
 
 app = Flask(__name__, static_folder="static", static_url_path="")
-engine = configure_sqlite(build_engine(DB_PATH))
+# NullPool: the collector swaps a freshly built DB file in via os.replace,
+# so a pooled connection would keep reading the old (now-unlinked) file.
+# Opening a fresh connection per request always sees the current file.
+engine = configure_sqlite(build_engine(DB_PATH, poolclass=NullPool))
 Base.metadata.create_all(engine)
 
 _collect_state = {"running": False, "log": [], "error": None, "new_matches": None, "started_at": None}
@@ -89,18 +93,26 @@ def _run_collect() -> None:
         exit_code = None
         while exit_code is None:
             time.sleep(2)
-            wpid, status = os.waitpid(pid, os.WNOHANG)
+            try:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                # Something else (e.g. a gunicorn SIGCHLD handler) already
+                # reaped the child; we can't read its status, so assume it
+                # finished and let the NullPool app pick up whatever it
+                # promoted.
+                break
             if wpid != 0:
                 exit_code = os.waitstatus_to_exitcode(status)
 
-        if exit_code != 0:
+        if exit_code not in (None, 0):
             _collect_state["error"] = f"collector process exited with code {exit_code}"
             _append_log(_collect_state["error"])
             return
 
-        # The child already swapped the fresh DB into place; just drop our
-        # pooled connections so new requests reopen it and see the new data.
-        engine.dispose()
+        # The child already collected into a side file and, if it found
+        # matches, os.replace()d it over the live DB. Nothing to do here -
+        # the app's NullPool engine opens the current file on the next
+        # request, so the new data shows up on its own.
         _append_log("Collection complete; data refreshed.")
     except Exception as e:
         _collect_state["error"] = str(e)

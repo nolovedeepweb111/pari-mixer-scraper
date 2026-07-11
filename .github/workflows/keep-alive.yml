@@ -14,3 +14,50 @@ jobs:
           curl -sf -X POST "${{ vars.APP_URL }}/api/collect" \
             && echo "Triggered" \
             || echo "Request failed (service may already be collecting, or still waking up) - not fatal"
+
+  # Render's free-tier disk is wiped on every redeploy, and substitution
+  # history / queue positions exist ONLY in the app's database (mixer-cup
+  # deletes its own history, and queue positions were captured from our
+  # snapshots). This job saves that state to the data-backup branch, from
+  # which the collector restores it after a wipe. Pushes to data-backup do
+  # NOT trigger a Render deploy (Render only watches master).
+  backup-state:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Fetch state from the app
+        id: fetch
+        run: |
+          if curl -sf "${{ vars.APP_URL }}/api/backup" -o backup.json; then
+            python3 -c "import json; d = json.load(open('backup.json')); assert isinstance(d.get('substitution_events'), list)"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "App unreachable; skipping backup this round (not fatal)"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Commit to data-backup branch if changed
+        if: steps.fetch.outputs.ok == 'true'
+        run: |
+          set -e
+          REPO_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          if git clone --depth 1 --branch data-backup "$REPO_URL" repo 2>/dev/null; then
+            :
+          else
+            git clone --depth 1 "$REPO_URL" repo
+            cd repo
+            git checkout --orphan data-backup
+            git rm -rf . >/dev/null 2>&1 || true
+            cd ..
+          fi
+          cp backup.json repo/backup.json
+          cd repo
+          git config user.name "state-backup"
+          git config user.email "actions@users.noreply.github.com"
+          git add backup.json
+          if git diff --cached --quiet; then
+            echo "No changes since last backup"
+          else
+            git commit -m "State backup $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push origin data-backup
+          fi

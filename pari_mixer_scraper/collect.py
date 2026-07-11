@@ -576,6 +576,83 @@ def _merge_duplicate_steam_teams(session: Session, teams_by_id: dict, progress: 
         progress(f"Merged Steam team id(s) {others} into {canonical} (same mixer team)")
 
 
+# Raw view of the backup the GitHub Action commits to the data-backup
+# branch (see .github/workflows/keep-alive.yml). Public repo, so no auth.
+_DEFAULT_BACKUP_URL = (
+    "https://raw.githubusercontent.com/nolovedeepweb111/pari-mixer-scraper/data-backup/backup.json"
+)
+
+
+def restore_state_backup(session: Session, progress: ProgressFn) -> None:
+    """Re-imports data that only ever existed in our own database after
+    Render's ephemeral disk wipes it on redeploy: substitution events
+    (mixer-cup deletes its own history periodically, and each event's
+    queue_position was captured from our snapshot at sync time - neither is
+    re-fetchable) and the substitute-queue snapshot itself. Runs before
+    sync_substitution_history so that events re-fetched from mixer-cup can
+    look up queue positions in the restored snapshot. Purely additive:
+    existing rows are never overwritten, except filling a NULL
+    queue_position from the backup."""
+    import requests
+
+    from .http_utils import call_with_timeout
+
+    url = os.environ.get("BACKUP_RESTORE_URL", _DEFAULT_BACKUP_URL)
+    if not url:
+        return
+    try:
+        resp = call_with_timeout(lambda: requests.get(url, timeout=20), timeout=25)
+        if resp.status_code == 404:
+            return  # no backup committed yet
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        progress(f"State backup fetch failed ({e}); continuing without restore.")
+        return
+
+    added_events = filled_positions = added_queue = 0
+
+    existing_events = {e.event_id: e for e in session.execute(select(SubstitutionEvent)).scalars()}
+    for ev in data.get("substitution_events", []):
+        if not ev.get("event_id") or ev.get("team_id") is None:
+            continue
+        row = existing_events.get(ev["event_id"])
+        if row is None:
+            session.add(SubstitutionEvent(
+                event_id=ev["event_id"],
+                team_id=ev["team_id"],
+                event_type=ev.get("event_type") or "",
+                nickname=ev.get("nickname"),
+                rating=ev.get("rating"),
+                queue_position=ev.get("queue_position"),
+                occurred_at=ev.get("occurred_at") or "",
+            ))
+            added_events += 1
+        elif row.queue_position is None and ev.get("queue_position") is not None:
+            row.queue_position = ev["queue_position"]
+            filled_positions += 1
+
+    existing_queue = {row[0] for row in session.execute(select(QueuedPlayer.player_uuid))}
+    for qp in data.get("queued_players", []):
+        if not qp.get("player_uuid") or qp["player_uuid"] in existing_queue:
+            continue
+        session.add(QueuedPlayer(
+            player_uuid=qp["player_uuid"],
+            nickname=qp.get("nickname"),
+            rating=qp.get("rating"),
+            queue_position=qp.get("queue_position"),
+            updated_at=qp.get("updated_at") or "",
+        ))
+        added_queue += 1
+
+    if added_events or filled_positions or added_queue:
+        session.commit()
+        progress(
+            f"State backup restored: +{added_events} substitution event(s), "
+            f"{filled_positions} queue position(s) filled, +{added_queue} queued player(s)"
+        )
+
+
 def sync_queue_snapshot(
     session: Session,
     mixer_client: MixerCupClient,
@@ -705,7 +782,10 @@ def _run_collection_pass(engine, league_id: int, progress: ProgressFn,
 
     progress("Opening a session...")
     with Session(engine) as session:
-        progress("Session open. Syncing hero list...")
+        progress("Session open. Restoring state backup if available...")
+        restore_state_backup(session, progress)
+
+        progress("Syncing hero list...")
         sync_heroes(session, od_client, progress)
 
         progress(f"Fetching match list for league_id={league_id}...")

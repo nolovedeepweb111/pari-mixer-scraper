@@ -16,7 +16,8 @@ from pari_mixer_scraper.analysis import compute_team_stats, compute_tournament_h
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID
 from pari_mixer_scraper.mixercup_client import MixerCupClient, pair_substitution_events
 from pari_mixer_scraper.models import (
-    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, SubstitutionEvent, Team,
+    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, QueuedPlayer,
+    SubstitutionEvent, Team,
     build_engine, configure_sqlite,
 )
 
@@ -519,6 +520,42 @@ def api_tournament_heroes():
     with Session(engine) as session:
         stats = compute_tournament_hero_stats(session)
     return jsonify(stats)
+
+
+@app.get("/api/backup")
+def api_backup():
+    """Dump of the data that exists ONLY in our database and can't be
+    re-fetched from any upstream: substitution events (mixer-cup deletes
+    its own history periodically, and queue positions were only ever known
+    to us) and the substitute-queue snapshot. A GitHub Action commits this
+    to the repo's data-backup branch, and the collector restores it after
+    Render wipes the disk on redeploy (see collect.restore_state_backup)."""
+    with Session(engine) as session:
+        events = session.execute(
+            select(SubstitutionEvent).order_by(SubstitutionEvent.event_id)
+        ).scalars().all()
+        queued = session.execute(
+            select(QueuedPlayer).order_by(QueuedPlayer.player_uuid)
+        ).scalars().all()
+    return jsonify({
+        "substitution_events": [
+            {
+                "event_id": e.event_id, "team_id": e.team_id,
+                "event_type": e.event_type, "nickname": e.nickname,
+                "rating": e.rating, "queue_position": e.queue_position,
+                "occurred_at": e.occurred_at,
+            }
+            for e in events
+        ],
+        "queued_players": [
+            {
+                "player_uuid": q.player_uuid, "nickname": q.nickname,
+                "rating": q.rating, "queue_position": q.queue_position,
+                "updated_at": q.updated_at,
+            }
+            for q in queued
+        ],
+    })
 
 
 @app.get("/api/collect/status")

@@ -337,6 +337,44 @@ def _hero_icon_slug(internal_name: str) -> str:
     return internal_name[len(prefix):] if internal_name.startswith(prefix) else internal_name
 
 
+def _last_match_lineup(session: Session, team_id: int) -> dict | None:
+    """Who actually played the team's most recent match. The roster cards
+    only show mixer-confirmed players with at least one game, so a team can
+    display fewer than five (fresh substitute who hasn't played yet, or an
+    unlinked roster) - this fills that gap with the real last-game five."""
+    row = session.execute(
+        select(Match.match_id, Match.start_time, Match.radiant_team_id, Match.dire_team_id)
+        .where((Match.radiant_team_id == team_id) | (Match.dire_team_id == team_id))
+        .order_by(Match.start_time.desc())
+        .limit(1)
+    ).first()
+    if row is None:
+        return None
+    match_id, start_time, radiant_id, dire_id = row
+
+    lineup = session.execute(
+        select(Player.account_id, Player.name)
+        .join(MatchPlayer, MatchPlayer.account_id == Player.account_id)
+        .where(MatchPlayer.match_id == match_id, MatchPlayer.team_id == team_id)
+        .order_by(Player.name)
+    ).all()
+    if not lineup:
+        return None
+
+    opponent_id = dire_id if radiant_id == team_id else radiant_id
+    opponent = session.get(Team, opponent_id) if opponent_id else None
+    return {
+        "match_id": match_id,
+        "start_time": start_time,
+        "opponent_name": (opponent.name if opponent and opponent.name
+                          else (f"Team {opponent_id}" if opponent_id else None)),
+        "players": [
+            {"account_id": account_id, "name": name or f"account {account_id}"}
+            for account_id, name in lineup
+        ],
+    }
+
+
 def _recent_drafts(session: Session, team_id: int, limit: int = 23) -> list[dict]:
     """Full draft (both teams' picks and bans, in actual draft order) for
     this team's last few matches - not just this team's own bans, since
@@ -419,6 +457,7 @@ def api_team_detail(team_id: int):
         ).all()
 
         recent_drafts = _recent_drafts(session, team_id)
+        last_match_lineup = _last_match_lineup(session, team_id)
         mixer_uuid = team.mixer_uuid
 
     players: dict[int, dict] = {}
@@ -450,6 +489,7 @@ def api_team_detail(team_id: int):
         "players": sorted(players.values(), key=lambda p: p["name"]),
         "recent_drafts": recent_drafts,
         "next_opponent": next_opponent,
+        "last_match_lineup": last_match_lineup,
     })
 
 

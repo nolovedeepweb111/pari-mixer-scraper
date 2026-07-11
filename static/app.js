@@ -115,6 +115,24 @@ function renderComposition(team) {
     container.appendChild(nextLine);
   }
 
+  // Roster cards only cover confirmed players with at least one game, so a
+  // team can show fewer than five - complement it with who actually played
+  // their most recent match.
+  const lm = team.last_match_lineup;
+  if (team.players.length < 5 && lm && lm.players.length > 0) {
+    const when = lm.start_time
+      ? new Date(lm.start_time * 1000).toLocaleDateString("ru-RU", { day: "numeric", month: "short" })
+      : "";
+    const vs = lm.opponent_name ? ` против ${lm.opponent_name}` : "";
+    const names = lm.players
+      .map((p) => `<strong>${p.name}</strong><span class="profile-links">${profileLinks(p.account_id)}</span>`)
+      .join(", ");
+    const lineupLine = document.createElement("p");
+    lineupLine.className = "last-lineup";
+    lineupLine.innerHTML = `Состав в последнем матче${vs}${when ? ` (${when})` : ""}: ${names}`;
+    container.appendChild(lineupLine);
+  }
+
   container.appendChild(grid);
 
   if (team.recent_drafts && team.recent_drafts.length > 0) {

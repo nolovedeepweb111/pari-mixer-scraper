@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from .mixercup_client import MixerCupClient
@@ -506,8 +506,74 @@ def link_mixercup_data(
             _apply_confirmed_roster(session, steam_team_id, mixer_team)
         linked += 1
 
+    _merge_duplicate_steam_teams(session, teams_by_id, progress)
+
     session.commit()
     progress(f"MixerCup linking: {linked} matches linked, {ambiguous} ambiguous, {skipped} skipped")
+
+
+def _merge_duplicate_steam_teams(session: Session, teams_by_id: dict, progress: ProgressFn) -> None:
+    """A captain re-creating their in-game team mid-tournament gives the
+    same mixer-cup team a second Steam team_id: older matches sit under the
+    old id, newer ones under the new. Left as-is, the site shows the team
+    twice, and the older copy loses its confirmed roster (its players'
+    team_id now points at the new id), falling back to 'everyone who ever
+    played a match under it' - e.g. 10 players and an inflated MMR total.
+
+    Merge each such group under the id the team most recently played with:
+    re-point matches, match players, draft entries, player rows and
+    substitution events, drop the leftover Team rows, and re-apply the
+    confirmed roster under the canonical id."""
+    dup_uuids = [
+        u for (u,) in session.execute(
+            select(Team.mixer_uuid)
+            .where(Team.mixer_uuid.is_not(None))
+            .group_by(Team.mixer_uuid)
+            .having(func.count() > 1)
+        )
+    ]
+    for mixer_uuid in dup_uuids:
+        team_ids = [
+            t for (t,) in session.execute(
+                select(Team.team_id).where(Team.mixer_uuid == mixer_uuid)
+            )
+        ]
+        canonical, newest = None, -1
+        for tid in team_ids:
+            last = session.execute(
+                select(func.max(Match.start_time)).where(
+                    (Match.radiant_team_id == tid) | (Match.dire_team_id == tid)
+                )
+            ).scalar()
+            if last is not None and last > newest:
+                canonical, newest = tid, last
+        if canonical is None:
+            continue
+        others = [t for t in team_ids if t != canonical]
+
+        for old_id in others:
+            session.execute(update(Match).where(Match.radiant_team_id == old_id)
+                            .values(radiant_team_id=canonical))
+            session.execute(update(Match).where(Match.dire_team_id == old_id)
+                            .values(dire_team_id=canonical))
+            session.execute(update(MatchPlayer).where(MatchPlayer.team_id == old_id)
+                            .values(team_id=canonical))
+            session.execute(update(MatchDraftEntry).where(MatchDraftEntry.team_id == old_id)
+                            .values(team_id=canonical))
+            session.execute(update(Player).where(Player.team_id == old_id)
+                            .values(team_id=canonical))
+            session.execute(update(SubstitutionEvent).where(SubstitutionEvent.team_id == old_id)
+                            .values(team_id=canonical))
+            old_row = session.get(Team, old_id)
+            if old_row is not None:
+                session.delete(old_row)
+        session.flush()
+
+        mixer_team = teams_by_id.get(mixer_uuid)
+        if mixer_team is not None:
+            _apply_confirmed_roster(session, canonical, mixer_team)
+
+        progress(f"Merged Steam team id(s) {others} into {canonical} (same mixer team)")
 
 
 def sync_queue_snapshot(

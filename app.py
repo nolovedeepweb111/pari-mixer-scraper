@@ -221,6 +221,18 @@ def index():
 
 _mixer_client = MixerCupClient()
 _mixer_tournament_id_cache: int | None = None
+_mixer_tournament_name_cache: dict[int, str] = {}
+
+# mixer tournament id -> display name, for the tournament dividers on player
+# pages. Overridable via env MIXER_TOURNAMENT_LABELS="26:PARI Mixer Cup #1;27:...".
+MIXER_TOURNAMENT_LABELS: dict[int, str] = {26: "PARI Mixer Cup #1", 27: "PARI Mixer Cup #2"}
+for _pair in os.environ.get("MIXER_TOURNAMENT_LABELS", "").replace(",", ";").split(";"):
+    if ":" in _pair:
+        _tid, _label = _pair.split(":", 1)
+        try:
+            MIXER_TOURNAMENT_LABELS[int(_tid.strip())] = _label.strip()
+        except ValueError:
+            pass
 
 
 def _resolve_mixer_tournament_id() -> int | None:
@@ -237,7 +249,23 @@ def _resolve_mixer_tournament_id() -> int | None:
         return None
     if active:
         _mixer_tournament_id_cache = active["id"]
+        if active.get("name"):
+            _mixer_tournament_name_cache[active["id"]] = active["name"]
     return _mixer_tournament_id_cache
+
+
+def _tournament_label(mixer_tournament_id: int | None, league_id: int | None) -> str:
+    """Best display name for the tournament a match belongs to: the live name
+    of the active tournament, then the configured mixer-id map, then the
+    league-id map, then a generic fallback."""
+    if mixer_tournament_id is not None:
+        if mixer_tournament_id in _mixer_tournament_name_cache:
+            return _mixer_tournament_name_cache[mixer_tournament_id]
+        if mixer_tournament_id in MIXER_TOURNAMENT_LABELS:
+            return MIXER_TOURNAMENT_LABELS[mixer_tournament_id]
+    if league_id in LEAGUE_LABELS:
+        return LEAGUE_LABELS[league_id]
+    return f"Турнир · {mixer_tournament_id or league_id}"
 
 
 def _get_next_opponent(mixer_uuid: str) -> dict | None:
@@ -581,7 +609,7 @@ def api_player_detail(account_id: int):
                 Match.match_id, Match.start_time, Match.radiant_win,
                 MatchPlayer.is_radiant, MatchPlayer.team_id,
                 Match.radiant_team_id, Match.dire_team_id,
-                Hero.localized_name, Match.league_id,
+                Hero.localized_name, Match.league_id, Match.mixer_tournament_id,
             )
             .join(MatchPlayer, MatchPlayer.match_id == Match.match_id)
             .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
@@ -609,8 +637,12 @@ def api_player_detail(account_id: int):
     ]
     heroes.sort(key=lambda h: -h["games"])
 
+    # Resolve active tournament first so its live name is available to labels.
+    _resolve_mixer_tournament_id()
+
     matches = []
-    for match_id, start_time, radiant_win, is_radiant, played_for, r_id, d_id, hero, league_id in match_rows:
+    for (match_id, start_time, radiant_win, is_radiant, played_for, r_id, d_id,
+         hero, league_id, mixer_tid) in match_rows:
         opponent_id = d_id if played_for == r_id else r_id
         matches.append({
             "match_id": match_id,
@@ -622,7 +654,8 @@ def api_player_detail(account_id: int):
             "opponent_name": team_names.get(opponent_id) or (f"Team {opponent_id}" if opponent_id else "?"),
             "won": (radiant_win == is_radiant) if radiant_win is not None else None,
             "league_id": league_id,
-            "tournament_label": LEAGUE_LABELS.get(league_id, f"Турнир · лига {league_id}"),
+            "mixer_tournament_id": mixer_tid,
+            "tournament_label": _tournament_label(mixer_tid, league_id),
         })
 
     return jsonify({
@@ -639,13 +672,15 @@ def api_player_detail(account_id: int):
 
 @app.get("/api/archive/player-heroes")
 def api_archive_player_heroes():
-    """Snapshot of every player's hero pool for THIS tournament, keyed by
-    league id. The backup workflow commits it to the data-backup branch as
-    player-heroes-<league_id>.json - when the next tournament starts (new
-    league id, new file), the previous tournament's file survives there and
-    can be loaded back as 'прошлый турнир' reference data."""
+    """Snapshot of every player's hero pool for the ACTIVE tournament, keyed
+    by mixer tournament id. The backup workflow commits it to the data-backup
+    branch as player-heroes-<id>.json - when the next tournament starts (new
+    id, new file), the previous tournament's file survives there as reference
+    data. Scoped by mixer_tournament_id, not league_id: consecutive mixer
+    tournaments reuse the same dotabuff league."""
     from datetime import datetime, timezone
 
+    active = _resolve_mixer_tournament_id()
     with Session(engine) as session:
         decided = case((Match.radiant_win.is_not(None), 1), else_=0)
         won = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
@@ -659,7 +694,7 @@ def api_archive_player_heroes():
             .join(Player, Player.account_id == MatchPlayer.account_id)
             .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
             .join(Match, Match.match_id == MatchPlayer.match_id)
-            .where(Match.league_id == CURRENT_LEAGUE_ID)
+            .where(Match.mixer_tournament_id == active)
             .group_by(MatchPlayer.account_id, MatchPlayer.hero_id)
             .order_by(Player.account_id, Hero.hero_id)
         ).all()
@@ -679,6 +714,7 @@ def api_archive_player_heroes():
         })
 
     return jsonify({
+        "mixer_tournament_id": active,
         "league_id": CURRENT_LEAGUE_ID,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "players": sorted(players.values(), key=lambda p: p["account_id"]),
@@ -749,8 +785,9 @@ def api_all_substitutions():
 
 @app.get("/api/tournament/heroes")
 def api_tournament_heroes():
+    active = _resolve_mixer_tournament_id()
     with Session(engine) as session:
-        stats = compute_tournament_hero_stats(session, league_id=CURRENT_LEAGUE_ID)
+        stats = compute_tournament_hero_stats(session, mixer_tournament_id=active)
     return jsonify(stats)
 
 

@@ -511,23 +511,32 @@ def link_mixercup_data(
 
         radiant_team, dire_team = (team1, team2) if score_a > score_b else (team2, team1)
 
+        # Stamp the match with the tournament it actually belongs to (the
+        # one whose completed-games list it appears in), regardless of its
+        # shared dotabuff league_id.
+        match.mixer_tournament_id = tournament_id
+
         result = g.get("result")
         if result in ("WIN1", "WIN2"):
             team1_won = result == "WIN1"
             match.radiant_win = team1_won if radiant_team is team1 else not team1_won
 
-        for steam_team_id, mixer_team in ((match.radiant_team_id, radiant_team), (match.dire_team_id, dire_team)):
-            if steam_team_id is None:
-                continue
-            team_row = session.get(Team, steam_team_id)
-            if team_row is not None:
-                if mixer_team.get("name"):
-                    team_row.name = mixer_team["name"]
-                if mixer_team.get("id"):
-                    team_row.mixer_uuid = mixer_team["id"]
-                if apply_rosters:
+        # Team identity (name, mixer_uuid, tournament, roster) is driven ONLY
+        # by the active tournament. A steam_team_id reused across tournaments
+        # (a captain keeping their Dota team) would otherwise have its name
+        # flip to the older tournament's when past linking runs after the
+        # active one - which is exactly how "Team B3SHA" became "Team yuusha".
+        if apply_rosters:
+            for steam_team_id, mixer_team in ((match.radiant_team_id, radiant_team), (match.dire_team_id, dire_team)):
+                if steam_team_id is None:
+                    continue
+                team_row = session.get(Team, steam_team_id)
+                if team_row is not None:
+                    if mixer_team.get("name"):
+                        team_row.name = mixer_team["name"]
+                    if mixer_team.get("id"):
+                        team_row.mixer_uuid = mixer_team["id"]
                     team_row.tournament_id = tournament_id
-            if apply_rosters:
                 _apply_confirmed_roster(session, steam_team_id, mixer_team)
         linked += 1
 

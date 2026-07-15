@@ -122,14 +122,18 @@ def compute_team_stats(session: Session, team_id: int) -> TeamStats:
 
 
 def compute_tournament_hero_stats(session: Session, min_games: int = 3,
-                                  league_id: int | None = None) -> dict:
+                                  mixer_tournament_id: int | None = None) -> dict:
     """Hero stats across the whole tournament (not per-team): win rate,
     ban count, and how concentrated a hero's playtime is among just one or
     two players (a real "signature" pick vs. one every team dips into).
     min_games filters out heroes with too few appearances to say anything
-    meaningful about their win rate or player concentration. league_id
-    scopes everything to one tournament when the DB spans several."""
-    league_filter = (Match.league_id == league_id) if league_id is not None else True
+    meaningful. mixer_tournament_id scopes everything to one tournament -
+    needed because consecutive mixer tournaments reuse the same dotabuff
+    league, so league_id can't separate them."""
+    league_filter = (
+        (Match.mixer_tournament_id == mixer_tournament_id)
+        if mixer_tournament_id is not None else True
+    )
 
     decided_case = case((Match.radiant_win.is_not(None), 1), else_=0)
     won_case = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)

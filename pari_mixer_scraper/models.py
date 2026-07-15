@@ -114,6 +114,12 @@ class Match(Base):
     radiant_team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.team_id"), nullable=True)
     dire_team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.team_id"), nullable=True)
     radiant_win: Mapped[bool | None]
+    # Which mixer-cup tournament this match belongs to, set during linking.
+    # Distinct from league_id: consecutive mixer tournaments reuse the same
+    # dotabuff league (19924), so league_id alone can't tell them apart -
+    # this does. Set from whichever tournament's completed-games list the
+    # match_id appears in.
+    mixer_tournament_id: Mapped[int | None] = mapped_column(nullable=True)
 
 
 class MatchPlayer(Base):

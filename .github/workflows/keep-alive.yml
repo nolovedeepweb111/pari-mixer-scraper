@@ -44,8 +44,9 @@ jobs:
           # tournament starts (new league id) the previous tournament's
           # archive keeps existing in the branch as reference data.
           if curl -sf "${{ vars.APP_URL }}/api/archive/player-heroes" -o archive.json; then
-            LEAGUE=$(python3 -c "import json; print(json.load(open('archive.json'))['league_id'])")
-            echo "file=player-heroes-${LEAGUE}.json" >> "$GITHUB_OUTPUT"
+            # Key by mixer tournament id (league is shared across tournaments).
+            KEY=$(python3 -c "import json; d=json.load(open('archive.json')); print(d.get('mixer_tournament_id') or d.get('league_id'))")
+            echo "file=player-heroes-${KEY}.json" >> "$GITHUB_OUTPUT"
           else
             echo "Archive endpoint unreachable; skipping (not fatal)"
             echo "file=" >> "$GITHUB_OUTPUT"

@@ -352,6 +352,7 @@ async function loadPlayerPage(accountId) {
         .join("")
     : '<span class="hint">нет сыгранных матчей</span>';
 
+  let lastLabel = null;
   const matchRows = p.matches
     .map((m) => {
       const when = m.start_time
@@ -363,7 +364,15 @@ async function loadPlayerPage(accountId) {
       const formerBadge = (p.current_team_id != null && m.team_id !== p.current_team_id)
         ? ' <span class="former-team-badge">прошлая команда</span>'
         : "";
+      // Divider row whenever the tournament changes (matches are newest-first,
+      // so each tournament forms one contiguous block).
+      let divider = "";
+      if (m.tournament_label && m.tournament_label !== lastLabel) {
+        lastLabel = m.tournament_label;
+        divider = `<tr class="tournament-divider"><td colspan="5">${m.tournament_label}</td></tr>`;
+      }
       return `
+        ${divider}
         <tr>
           <td class="subs-date">${when}</td>
           <td>${m.hero}</td>

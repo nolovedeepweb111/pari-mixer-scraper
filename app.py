@@ -35,6 +35,17 @@ LEAGUE_IDS = [
 ]
 CURRENT_LEAGUE_ID = LEAGUE_IDS[-1]
 
+# league_id -> display name, for tournament dividers on player pages.
+# Override/extend via env LEAGUE_LABELS="19924:PARI Mixer Cup #1;NNNN:PARI Mixer Cup #2".
+LEAGUE_LABELS: dict[int, str] = {19924: "PARI Mixer Cup #1"}
+for _pair in os.environ.get("LEAGUE_LABELS", "").replace(",", ";").split(";"):
+    if ":" in _pair:
+        _lid, _label = _pair.split(":", 1)
+        try:
+            LEAGUE_LABELS[int(_lid.strip())] = _label.strip()
+        except ValueError:
+            pass
+
 app = Flask(__name__, static_folder="static", static_url_path="")
 # NullPool: the collector swaps a freshly built DB file in via os.replace,
 # so a pooled connection would keep reading the old (now-unlinked) file.
@@ -570,7 +581,7 @@ def api_player_detail(account_id: int):
                 Match.match_id, Match.start_time, Match.radiant_win,
                 MatchPlayer.is_radiant, MatchPlayer.team_id,
                 Match.radiant_team_id, Match.dire_team_id,
-                Hero.localized_name,
+                Hero.localized_name, Match.league_id,
             )
             .join(MatchPlayer, MatchPlayer.match_id == Match.match_id)
             .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
@@ -599,7 +610,7 @@ def api_player_detail(account_id: int):
     heroes.sort(key=lambda h: -h["games"])
 
     matches = []
-    for match_id, start_time, radiant_win, is_radiant, played_for, r_id, d_id, hero in match_rows:
+    for match_id, start_time, radiant_win, is_radiant, played_for, r_id, d_id, hero, league_id in match_rows:
         opponent_id = d_id if played_for == r_id else r_id
         matches.append({
             "match_id": match_id,
@@ -610,6 +621,8 @@ def api_player_detail(account_id: int):
             "opponent_team_id": opponent_id,
             "opponent_name": team_names.get(opponent_id) or (f"Team {opponent_id}" if opponent_id else "?"),
             "won": (radiant_win == is_radiant) if radiant_win is not None else None,
+            "league_id": league_id,
+            "tournament_label": LEAGUE_LABELS.get(league_id, f"Турнир · лига {league_id}"),
         })
 
     return jsonify({

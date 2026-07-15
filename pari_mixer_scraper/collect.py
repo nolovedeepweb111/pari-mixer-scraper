@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from .mixercup_client import MixerCupClient
@@ -449,13 +449,21 @@ def link_mixercup_data(
     mixer_client: MixerCupClient,
     tournament_id: int,
     progress: ProgressFn,
+    apply_rosters: bool = True,
 ) -> None:
     """Uses mixer-cup.gg's own GraphQL API to attach real team names and
     current roster nicknames to the matches we already collected from
     Steam/OpenDota. MixerCup's `Games.matchId` field is the Dota match_id,
     so completed games there give a direct match_id -> (team1, team2) link;
     which mixer team is which side (radiant/dire) is then determined by
-    comparing Steam account_ids against who actually played in that match."""
+    comparing Steam account_ids against who actually played in that match.
+
+    apply_rosters=False is used for PAST tournaments: it still sets each
+    match's result (radiant_win) and team names/uuids - so old match pages
+    show W/L - but does NOT touch confirmed rosters, player.team_id or team
+    merging. Those must be driven only by the ACTIVE tournament, otherwise a
+    player who competed in both tournaments would have their team flip-flop
+    every cycle."""
     try:
         teams = list(mixer_client.iter_teams(tournament_id))
         games = list(mixer_client.iter_completed_games(tournament_id))
@@ -517,14 +525,17 @@ def link_mixercup_data(
                     team_row.name = mixer_team["name"]
                 if mixer_team.get("id"):
                     team_row.mixer_uuid = mixer_team["id"]
-                team_row.tournament_id = tournament_id
-            _apply_confirmed_roster(session, steam_team_id, mixer_team)
+                if apply_rosters:
+                    team_row.tournament_id = tournament_id
+            if apply_rosters:
+                _apply_confirmed_roster(session, steam_team_id, mixer_team)
         linked += 1
 
-    _merge_duplicate_steam_teams(session, teams_by_id, progress)
+    if apply_rosters:
+        _merge_duplicate_steam_teams(session, teams_by_id, progress)
 
     session.commit()
-    progress(f"MixerCup linking: {linked} matches linked, {ambiguous} ambiguous, {skipped} skipped")
+    progress(f"MixerCup linking (tournament {tournament_id}): {linked} matches linked, {ambiguous} ambiguous, {skipped} skipped")
 
 
 # Synthetic Team ids for mixer teams that have no Steam team_id yet (no
@@ -874,6 +885,28 @@ def sync_substitution_history(
         progress(f"Substitution history: {new_count} new event(s) saved")
 
 
+def _purge_past_tournament_subs(session: Session, active_tournament_id: int, progress: ProgressFn) -> None:
+    """Deletes substitution events tied to teams from any tournament other
+    than the active one - the site only shows the current tournament's
+    substitution history."""
+    past_team_ids = [
+        t for (t,) in session.execute(
+            select(Team.team_id).where(
+                Team.tournament_id.is_not(None),
+                Team.tournament_id != active_tournament_id,
+            )
+        )
+    ]
+    if not past_team_ids:
+        return
+    deleted = session.execute(
+        delete(SubstitutionEvent).where(SubstitutionEvent.team_id.in_(past_team_ids))
+    ).rowcount
+    if deleted:
+        session.commit()
+        progress(f"Removed {deleted} substitution event(s) from past tournaments")
+
+
 def apply_manual_roster_overrides(session: Session, progress: ProgressFn) -> None:
     applied = 0
     for account_id, override in MANUAL_ROSTER_OVERRIDES.items():
@@ -964,6 +997,26 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
             sync_mixer_teams(session, mixer_client, mixer_tournament_id, progress)
             sync_substitution_history(session, mixer_client, mixer_tournament_id, progress)
             sync_queue_snapshot(session, mixer_client, mixer_tournament_id, progress)
+
+            # Past tournaments still in the DB: re-link results only (radiant_win
+            # + team names) so their match pages show W/L. Steam re-fetches
+            # matches with no result, and the active-tournament link above only
+            # covers the current tournament's games.
+            past_ids = [
+                t for (t,) in session.execute(
+                    select(Team.tournament_id)
+                    .where(Team.tournament_id.is_not(None), Team.tournament_id != mixer_tournament_id)
+                    .distinct()
+                )
+            ]
+            for pid in past_ids:
+                link_mixercup_data(session, mixer_client, pid, progress, apply_rosters=False)
+
+            # The user only wants the ACTIVE tournament's substitution history.
+            # Drop events belonging to past-tournament teams (they came back via
+            # the state-backup restore); the backup endpoint no longer dumps
+            # them, so this self-heals within a cycle or two.
+            _purge_past_tournament_subs(session, mixer_tournament_id, progress)
 
         apply_manual_roster_overrides(session, progress)
         session.commit()

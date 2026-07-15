@@ -260,6 +260,17 @@ aside h2 {
   font-weight: 600;
 }
 
+.tournament-divider td {
+  background: var(--panel-deep);
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
 .former-team-badge {
   display: inline-block;
   margin-left: 6px;

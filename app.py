@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import sys
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, abort, jsonify, redirect, request, send_from_directory, session
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
@@ -52,6 +55,77 @@ app = Flask(__name__, static_folder="static", static_url_path="")
 # Opening a fresh connection per request always sees the current file.
 engine = configure_sqlite(build_engine(DB_PATH, poolclass=NullPool))
 Base.metadata.create_all(engine)
+
+# ---------------------------------------------------------------------------
+# Access control
+#
+# Site is private when ACCESS_KEYS is set (comma-separated keys the owner
+# hands out, one per person). Each key can be activated on at most
+# MAX_DEVICES_PER_KEY browsers - the first browsers to use it claim its
+# slots, so a shared key is rejected on further devices.
+#
+# The repo is PUBLIC, and bindings must survive restarts (the /api/backup
+# git branch), so bindings are stored keyed by HMAC(key) with AUTH_SECRET -
+# the keys themselves never touch git. Device ids are random, non-secret.
+# ---------------------------------------------------------------------------
+_ACCESS_KEYS = [k.strip() for k in os.environ.get("ACCESS_KEYS", "").split(",") if k.strip()]
+AUTH_ENABLED = bool(_ACCESS_KEYS)
+# Stable across restarts without extra config: falls back to a hash of the
+# key set (changing the keys logs everyone out, which is acceptable).
+AUTH_SECRET = os.environ.get("AUTH_SECRET") or ("keyset:" + ",".join(sorted(_ACCESS_KEYS)))
+MAX_DEVICES_PER_KEY = int(os.environ.get("MAX_DEVICES_PER_KEY", "2"))
+# Protects the operational endpoints (collect/backup/archive) called by the
+# GitHub Actions workflow. If empty, those stay open (so nothing breaks
+# before the owner sets it up).
+OPS_TOKEN = os.environ.get("OPS_TOKEN", "")
+
+app.secret_key = hashlib.sha256(("session:" + AUTH_SECRET).encode()).digest()
+app.permanent_session_lifetime = timedelta(days=60)
+
+
+def _key_hash(key: str) -> str:
+    return hmac.new(AUTH_SECRET.encode(), key.encode(), hashlib.sha256).hexdigest()
+
+
+VALID_KEY_HASHES = {_key_hash(k) for k in _ACCESS_KEYS}
+_device_bindings: dict[str, set[str]] = {}  # key_hash -> {device_id}
+_bindings_lock = threading.Lock()
+
+
+def _snapshot_bindings() -> dict[str, set[str]]:
+    with _bindings_lock:
+        return {kh: set(devs) for kh, devs in _device_bindings.items() if devs}
+
+
+def _restore_access_bindings() -> None:
+    """Load device bindings from the backup branch at startup so the
+    anti-sharing state survives restarts/deploys. Only bindings for keys
+    still valid are kept (removing a key from ACCESS_KEYS drops its
+    bindings). Best-effort; runs in a thread so it never blocks boot."""
+    if not AUTH_ENABLED:
+        return
+    import requests
+
+    from pari_mixer_scraper.collect import _DEFAULT_BACKUP_URL
+    url = os.environ.get("BACKUP_RESTORE_URL", _DEFAULT_BACKUP_URL)
+    try:
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            return
+        data = r.json()
+    except Exception:
+        return
+    bindings = data.get("access_bindings") or {}
+    with _bindings_lock:
+        for kh, devs in bindings.items():
+            if kh in VALID_KEY_HASHES and isinstance(devs, list):
+                _device_bindings.setdefault(kh, set()).update(
+                    d for d in devs if isinstance(d, str)
+                )
+
+
+if AUTH_ENABLED:
+    threading.Thread(target=_restore_access_bindings, daemon=True).start()
 
 _collect_state = {"running": False, "log": [], "error": None, "new_matches": None, "started_at": None}
 _collect_lock = threading.Lock()
@@ -212,6 +286,152 @@ def _start_periodic_collect() -> None:
 
 _auto_collect_if_empty()
 _start_periodic_collect()
+
+
+# --- Access-control gate ---------------------------------------------------
+
+_LOGIN_HTML = """<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PARI Mixer Cup — вход</title>
+<style>
+  :root { --bg:#23282e; --panel:#2b323c; --border:#334056; --text:#fff; --muted:#cfd4da; --accent:#0396ff; --bad:#eb4242; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         font-family:"Jost","Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:16px;
+          padding:32px; width:100%; max-width:380px; margin:16px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  p.sub { color:var(--muted); font-size:14px; margin:0 0 20px; }
+  label { display:block; font-size:13px; color:var(--muted); margin-bottom:6px; }
+  input { width:100%; padding:11px 14px; font-size:15px; border-radius:8px;
+          border:1px solid var(--border); background:#1d2630; color:var(--text); font-family:inherit; }
+  input:focus { outline:none; border-color:var(--accent); }
+  button { width:100%; margin-top:16px; padding:11px; font-size:15px; font-weight:500;
+           border:none; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; font-family:inherit; }
+  button:hover { background:#0078d6; }
+  button:disabled { opacity:.5; cursor:default; }
+  .err { color:var(--bad); font-size:13px; margin-top:12px; min-height:16px; }
+</style></head><body>
+<form class="card" id="f">
+  <h1>PARI Mixer Cup</h1>
+  <p class="sub">Приватный доступ. Введите ваш ключ.</p>
+  <label for="key">Ключ доступа</label>
+  <input id="key" name="key" autocomplete="off" autofocus>
+  <button id="btn" type="submit">Войти</button>
+  <div class="err" id="err"></div>
+</form>
+<script>
+  // A stable per-browser id so the same device reuses its key slot, while
+  // a different device counts as a new one.
+  var dev = localStorage.getItem("pmc_device");
+  if (!dev) { dev = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()) + Date.now()); localStorage.setItem("pmc_device", dev); }
+  var f = document.getElementById("f"), btn = document.getElementById("btn"), err = document.getElementById("err");
+  f.addEventListener("submit", async function(e){
+    e.preventDefault(); err.textContent = ""; btn.disabled = true;
+    try {
+      var r = await fetch("/api/auth/login", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ key: document.getElementById("key").value, device: dev })
+      });
+      if (r.ok) { location.href = "/"; return; }
+      var d = await r.json().catch(function(){ return {}; });
+      err.textContent = d.error || "Не удалось войти.";
+    } catch (_) { err.textContent = "Ошибка сети."; }
+    btn.disabled = false;
+  });
+</script>
+</body></html>"""
+
+
+def _session_ok() -> bool:
+    kh = session.get("kh")
+    device = session.get("device")
+    if not kh or not device or kh not in VALID_KEY_HASHES:
+        return False
+    with _bindings_lock:
+        devices = _device_bindings.setdefault(kh, set())
+        if device in devices:
+            return True
+        # Bindings may have been lost (a restart before the next backup).
+        # A browser holding a validly-signed session cookie re-claims its
+        # slot if there's still room, so legitimate users aren't kicked out.
+        if len(devices) < MAX_DEVICES_PER_KEY:
+            devices.add(device)
+            return True
+    return False
+
+
+def _is_ops_path(p: str) -> bool:
+    return p == "/api/collect" or p.startswith("/api/backup") or p.startswith("/api/archive")
+
+
+@app.before_request
+def _gate():
+    if not AUTH_ENABLED:
+        return
+    p = request.path
+    if p == "/login" or p.startswith("/api/auth/") or p == "/favicon.ico":
+        return
+    if _is_ops_path(p):
+        if not OPS_TOKEN:
+            return
+        tok = request.headers.get("X-Ops-Token") or request.args.get("ops_token")
+        if tok and hmac.compare_digest(tok, OPS_TOKEN):
+            return
+        abort(403)
+    if _session_ok():
+        return
+    if p.startswith("/api/"):
+        return jsonify({"error": "unauthorized"}), 401
+    return redirect("/login")
+
+
+@app.post("/api/auth/login")
+def api_auth_login():
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip()
+    device = (data.get("device") or "").strip()[:80]
+    if not key or not device:
+        return jsonify({"error": "Введите ключ."}), 400
+    kh = _key_hash(key)
+    if kh not in VALID_KEY_HASHES:
+        return jsonify({"error": "Неверный ключ."}), 403
+    with _bindings_lock:
+        devices = _device_bindings.setdefault(kh, set())
+        if device not in devices:
+            if len(devices) >= MAX_DEVICES_PER_KEY:
+                return jsonify({
+                    "error": "Этот ключ уже используется на другом устройстве."
+                }), 403
+            devices.add(device)
+    session.permanent = True
+    session["kh"] = kh
+    session["device"] = device
+    return jsonify({"ok": True})
+
+
+@app.get("/api/auth/status")
+def api_auth_status():
+    return jsonify({"enabled": AUTH_ENABLED})
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout():
+    kh = session.get("kh")
+    device = session.get("device")
+    # Free this device's slot so the user can re-activate elsewhere.
+    if kh and device:
+        with _bindings_lock:
+            _device_bindings.get(kh, set()).discard(device)
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.get("/login")
+def login_page():
+    return _LOGIN_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 @app.get("/")
@@ -841,6 +1061,12 @@ def api_backup():
             }
             for q in queued
         ],
+        # Access-key -> device bindings, keyed by HMAC(key) so the public
+        # backup branch never exposes the keys themselves. Lets device
+        # bindings (the anti-sharing state) survive restarts and deploys.
+        "access_bindings": {
+            kh: sorted(devs) for kh, devs in _snapshot_bindings().items()
+        },
     })
 
 

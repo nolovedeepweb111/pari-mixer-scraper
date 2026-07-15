@@ -10,8 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Wake service and trigger a match collection
+        # X-Ops-Token authenticates operational endpoints when the site is
+        # private (OPS_TOKEN set in Render + as a GitHub secret). Harmless
+        # empty header when the site is open.
         run: |
-          curl -sf -X POST "${{ vars.APP_URL }}/api/collect" \
+          curl -sf -X POST -H "X-Ops-Token: ${{ secrets.OPS_TOKEN }}" "${{ vars.APP_URL }}/api/collect" \
             && echo "Triggered" \
             || echo "Request failed (service may already be collecting, or still waking up) - not fatal"
 
@@ -29,7 +32,7 @@ jobs:
       - name: Fetch state from the app
         id: fetch
         run: |
-          if curl -sf "${{ vars.APP_URL }}/api/backup" -o backup.json; then
+          if curl -sf -H "X-Ops-Token: ${{ secrets.OPS_TOKEN }}" "${{ vars.APP_URL }}/api/backup" -o backup.json; then
             python3 -c "import json; d = json.load(open('backup.json')); assert isinstance(d.get('substitution_events'), list)"
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
@@ -43,7 +46,7 @@ jobs:
           # Saved under a league-specific filename, so when the next
           # tournament starts (new league id) the previous tournament's
           # archive keeps existing in the branch as reference data.
-          if curl -sf "${{ vars.APP_URL }}/api/archive/player-heroes" -o archive.json; then
+          if curl -sf -H "X-Ops-Token: ${{ secrets.OPS_TOKEN }}" "${{ vars.APP_URL }}/api/archive/player-heroes" -o archive.json; then
             # Key by mixer tournament id (league is shared across tournaments).
             KEY=$(python3 -c "import json; d=json.load(open('archive.json')); print(d.get('mixer_tournament_id') or d.get('league_id'))")
             echo "file=player-heroes-${KEY}.json" >> "$GITHUB_OUTPUT"

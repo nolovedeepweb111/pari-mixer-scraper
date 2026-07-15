@@ -1,3 +1,16 @@
+// If the session expires or is missing (private mode), any API call returns
+// 401 - bounce to the login page instead of showing a broken site.
+(function () {
+  const origFetch = window.fetch;
+  window.fetch = async function (...args) {
+    const resp = await origFetch.apply(this, args);
+    if (resp.status === 401) {
+      location.href = "/login";
+    }
+    return resp;
+  };
+})();
+
 const teamsEl = document.getElementById("teams");
 const detailEl = document.getElementById("team-detail");
 const collectStatusEl = document.getElementById("collect-status");
@@ -554,6 +567,23 @@ async function pollCollectStatus() {
     }
   }
   wasRunning = status.running;
+}
+
+// Show the logout control only in private mode.
+const logoutBtn = document.getElementById("logout-btn");
+if (logoutBtn) {
+  fetch("/api/auth/status")
+    .then((r) => r.json())
+    .then((s) => {
+      if (s.enabled) {
+        logoutBtn.style.display = "";
+        logoutBtn.addEventListener("click", async () => {
+          try { await fetch("/api/auth/logout", { method: "POST" }); } catch (_) {}
+          location.href = "/login";
+        });
+      }
+    })
+    .catch(() => {});
 }
 
 setInterval(pollCollectStatus, 15000);

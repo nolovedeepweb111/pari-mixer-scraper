@@ -517,6 +517,7 @@ def link_mixercup_data(
                     team_row.name = mixer_team["name"]
                 if mixer_team.get("id"):
                     team_row.mixer_uuid = mixer_team["id"]
+                team_row.tournament_id = tournament_id
             _apply_confirmed_roster(session, steam_team_id, mixer_team)
         linked += 1
 
@@ -524,6 +525,64 @@ def link_mixercup_data(
 
     session.commit()
     progress(f"MixerCup linking: {linked} matches linked, {ambiguous} ambiguous, {skipped} skipped")
+
+
+# Synthetic Team ids for mixer teams that have no Steam team_id yet (no
+# match played, or the league id isn't known yet). Far above real Steam team
+# ids (~8 digits); once real matches link a Steam id to the same mixer_uuid,
+# _merge_duplicate_steam_teams folds the synthetic row into the real one.
+_SYNTHETIC_TEAM_ID_BASE = 2_000_000_000
+
+
+def sync_mixer_teams(
+    session: Session,
+    mixer_client: MixerCupClient,
+    tournament_id: int,
+    progress: ProgressFn,
+) -> None:
+    """Makes sure every team of the ACTIVE mixer tournament exists in the
+    DB with its current name, roster and tournament marker - even before a
+    single match is played (a fresh tournament has no league_id and no
+    matches yet, but its teams and rosters are already public). Teams
+    without a known Steam id get a synthetic one, replaced automatically by
+    the real id once matches start linking."""
+    try:
+        mixer_teams = list(mixer_client.iter_teams(tournament_id))
+    except Exception as e:
+        progress(f"MixerCup team sync failed: {e}")
+        return
+
+    max_synth = session.execute(
+        select(func.max(Team.team_id)).where(Team.team_id >= _SYNTHETIC_TEAM_ID_BASE)
+    ).scalar() or _SYNTHETIC_TEAM_ID_BASE
+
+    created = updated = 0
+    for mt in mixer_teams:
+        if not mt.get("id"):
+            continue
+        team_row = session.execute(
+            select(Team).where(Team.mixer_uuid == mt["id"])
+        ).scalars().first()
+        if team_row is None:
+            max_synth += 1
+            team_row = Team(
+                team_id=max_synth,
+                name=mt.get("name"),
+                mixer_uuid=mt["id"],
+                tournament_id=tournament_id,
+            )
+            session.add(team_row)
+            session.flush()
+            created += 1
+        else:
+            if mt.get("name"):
+                team_row.name = mt["name"]
+            team_row.tournament_id = tournament_id
+            updated += 1
+        _apply_confirmed_roster(session, team_row.team_id, mt)
+
+    session.commit()
+    progress(f"MixerCup team sync: {created} new team(s), {updated} updated for tournament {tournament_id}")
 
 
 def _merge_duplicate_steam_teams(session: Session, teams_by_id: dict, progress: ProgressFn) -> None:
@@ -625,6 +684,56 @@ def restore_state_backup(session: Session, progress: ProgressFn) -> None:
         return
 
     added_events = filled_positions = added_queue = 0
+    added_teams = added_players = 0
+
+    # Teams first (players and substitution events reference them). Insert
+    # missing rows; for existing ones only fill NULLs - live/freshly-linked
+    # data always wins over the backup.
+    existing_teams = {t.team_id: t for t in session.execute(select(Team)).scalars()}
+    for bt in data.get("teams", []):
+        if bt.get("team_id") is None:
+            continue
+        row = existing_teams.get(bt["team_id"])
+        if row is None:
+            session.add(Team(
+                team_id=bt["team_id"],
+                name=bt.get("name"),
+                mixer_uuid=bt.get("mixer_uuid"),
+                tournament_id=bt.get("tournament_id"),
+            ))
+            added_teams += 1
+        else:
+            if row.name is None and bt.get("name"):
+                row.name = bt["name"]
+            if row.mixer_uuid is None and bt.get("mixer_uuid"):
+                row.mixer_uuid = bt["mixer_uuid"]
+            if row.tournament_id is None and bt.get("tournament_id") is not None:
+                row.tournament_id = bt["tournament_id"]
+    session.flush()
+
+    existing_players = {p.account_id: p for p in session.execute(select(Player)).scalars()}
+    for bp in data.get("players", []):
+        if bp.get("account_id") is None:
+            continue
+        row = existing_players.get(bp["account_id"])
+        if row is None:
+            session.add(Player(
+                account_id=bp["account_id"],
+                name=bp.get("name"),
+                team_id=bp.get("team_id"),
+                roster_confirmed=bool(bp.get("roster_confirmed")),
+                mmr=bp.get("mmr"),
+                preferred_roles=bp.get("preferred_roles"),
+            ))
+            added_players += 1
+        else:
+            if row.name is None and bp.get("name"):
+                row.name = bp["name"]
+            if row.mmr is None and bp.get("mmr") is not None:
+                row.mmr = bp["mmr"]
+            if row.preferred_roles is None and bp.get("preferred_roles"):
+                row.preferred_roles = bp["preferred_roles"]
+    session.flush()
 
     existing_events = {e.event_id: e for e in session.execute(select(SubstitutionEvent)).scalars()}
     for ev in data.get("substitution_events", []):
@@ -659,11 +768,12 @@ def restore_state_backup(session: Session, progress: ProgressFn) -> None:
         ))
         added_queue += 1
 
-    if added_events or filled_positions or added_queue:
+    if added_events or filled_positions or added_queue or added_teams or added_players:
         session.commit()
         progress(
-            f"State backup restored: +{added_events} substitution event(s), "
-            f"{filled_positions} queue position(s) filled, +{added_queue} queued player(s)"
+            f"State backup restored: +{added_teams} team(s), +{added_players} player(s), "
+            f"+{added_events} substitution event(s), {filled_positions} queue position(s) "
+            f"filled, +{added_queue} queued player(s)"
         )
 
 
@@ -721,7 +831,12 @@ def sync_substitution_history(
     event_id dedupes cleanly against already-synced events, so this is
     cheap to re-run every collection pass."""
     known_event_ids = {row[0] for row in session.execute(select(SubstitutionEvent.event_id))}
-    teams = session.execute(select(Team).where(Team.mixer_uuid.is_not(None))).scalars().all()
+    # Only the active tournament's teams - events are queried per (tournament,
+    # team) pair, so old-tournament teams would just burn an empty API call
+    # each. Their history is already stored (and in the state backup).
+    teams = session.execute(
+        select(Team).where(Team.mixer_uuid.is_not(None), Team.tournament_id == tournament_id)
+    ).scalars().all()
     if not teams:
         return
 
@@ -775,11 +890,15 @@ def apply_manual_roster_overrides(session: Session, progress: ProgressFn) -> Non
         progress(f"Applied {applied} manual roster override(s)")
 
 
-def _run_collection_pass(engine, league_id: int, progress: ProgressFn,
+def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
                          on_core_ready=None) -> int:
     """Does the actual collection work against `engine`, returning the
     number of newly stored matches. The caller decides what `engine`
     points at - see collect().
+
+    league_ids is a list so a database can span tournaments: keeping earlier
+    tournaments' league ids in the list means their matches stay
+    re-fetchable from Steam after Render wipes the disk on a redeploy.
 
     on_core_ready, if given, is called once the core team/roster/match data
     is committed but before the slow supplementary backfill (draft history,
@@ -802,30 +921,30 @@ def _run_collection_pass(engine, league_id: int, progress: ProgressFn,
         progress("Syncing hero list...")
         sync_heroes(session, od_client, progress)
 
-        progress(f"Fetching match list for league_id={league_id}...")
-        matches = fetch_all_league_matches(league_id, od_client, steam_client, progress)
-        if not matches:
-            progress(
-                f"No matches found for league_id={league_id} yet. Either the tournament "
-                "hasn't been played, or matches aren't tagged with this league_id yet."
-            )
-            return 0
-
+        new_count = 0
         existing_match_ids = {row[0] for row in session.execute(select(Match.match_id))}
-        new_matches = [m for m in matches if m["match_id"] not in existing_match_ids]
-        progress(f"{len(matches)} matches total, {len(new_matches)} new")
+        for league_id in league_ids:
+            progress(f"Fetching match list for league_id={league_id}...")
+            matches = fetch_all_league_matches(league_id, od_client, steam_client, progress)
+            new_matches = [m for m in matches if m["match_id"] not in existing_match_ids]
+            progress(f"league {league_id}: {len(matches)} matches total, {len(new_matches)} new")
 
-        # Saving matches with no team name yet (rather than looking them up
-        # here via Steam/OpenDota, which is almost always a dead-end 404 for
-        # these ad-hoc mixer teams) gets a usable site up fast: real names,
-        # rosters and MMR all come from the MixerCup link-up right below,
-        # which is one cheap GraphQL call - not a slow per-team lookup loop.
-        if new_matches:
+            # Saving matches with no team name yet (rather than looking them
+            # up via Steam/OpenDota, which is almost always a dead-end 404
+            # for these ad-hoc mixer teams) gets a usable site up fast: real
+            # names, rosters and MMR all come from the MixerCup link-up right
+            # below, which is one cheap GraphQL call.
             for i, m in enumerate(new_matches, start=1):
                 progress(f"[{i}/{len(new_matches)}] Saving match {m['match_id']}")
                 persist_match(session, league_id, m, {}, {})
                 session.commit()
+                existing_match_ids.add(m["match_id"])
+                new_count += 1
 
+        # Deliberately NO early return when there are no matches: a freshly
+        # started tournament has teams and rosters on mixer-cup before a
+        # single game is played (and before its league_id is even known) -
+        # the site should show them right away.
         mixer_client = MixerCupClient()
         mixer_tournament_id = os.environ.get("MIXER_TOURNAMENT_ID")
         try:
@@ -842,6 +961,7 @@ def _run_collection_pass(engine, league_id: int, progress: ProgressFn,
 
         if mixer_tournament_id is not None:
             link_mixercup_data(session, mixer_client, mixer_tournament_id, progress)
+            sync_mixer_teams(session, mixer_client, mixer_tournament_id, progress)
             sync_substitution_history(session, mixer_client, mixer_tournament_id, progress)
             sync_queue_snapshot(session, mixer_client, mixer_tournament_id, progress)
 
@@ -887,7 +1007,7 @@ def _run_collection_pass(engine, league_id: int, progress: ProgressFn,
                 progress(f"{step_name} failed ({e}); skipping this step.")
 
     progress("Done.")
-    return len(new_matches)
+    return new_count
 
 
 def _atomic_publish(src: str, dst: str) -> None:
@@ -932,6 +1052,16 @@ def collect(
     progress = progress or log.info
     progress("Starting collection...")
 
+    # league_id accepts a single id, a comma-separated string, or a list -
+    # keeping earlier tournaments' ids in the list keeps their matches
+    # re-fetchable from Steam after a disk wipe.
+    if isinstance(league_id, str):
+        league_ids = [int(x) for x in league_id.replace(";", ",").split(",") if x.strip()]
+    elif isinstance(league_id, (list, tuple)):
+        league_ids = [int(x) for x in league_id]
+    else:
+        league_ids = [int(league_id)]
+
     if promote_to and os.path.exists(promote_to):
         # Seed from the live DB. It only ever has readers (the web app) -
         # every writer works on a build file like this one - so with no
@@ -949,22 +1079,26 @@ def collect(
             progress("Core data published to the live site (teams visible now).")
 
     try:
-        new_count = _run_collection_pass(own_engine, league_id, progress, on_core_ready=publish_core)
+        new_count = _run_collection_pass(own_engine, league_ids, progress, on_core_ready=publish_core)
         if promote_to:
             with Session(own_engine) as s:
                 total_matches = s.execute(
                     select(func.count()).select_from(Match)
                 ).scalar() or 0
+                total_teams = s.execute(
+                    select(func.count()).select_from(Team)
+                ).scalar() or 0
     finally:
         own_engine.dispose()
 
     if promote_to:
-        # Guard on the build's TOTAL match count, not just newly added ones:
-        # a routine incremental run with nothing new (new_count == 0) still
-        # carries fresh results/rosters/subs worth publishing, while a build
-        # that is genuinely empty (fresh deploy + upstream outage) must never
+        # Guard on the build's TOTAL contents, not just newly added matches:
+        # a routine incremental run with nothing new still carries fresh
+        # results/rosters/subs worth publishing, and a brand-new tournament
+        # legitimately has teams before any match exists. Only a genuinely
+        # empty build (fresh deploy + total upstream outage) must never
         # replace a live DB that has data.
-        if total_matches > 0:
+        if total_matches > 0 or total_teams > 0:
             os.replace(db_path, promote_to)
             progress(f"Full data published ({total_matches} matches, {new_count} new).")
         else:
@@ -972,7 +1106,7 @@ def collect(
                 os.remove(db_path)
             except OSError:
                 pass
-            progress("Build has no matches; left the live DB unchanged.")
+            progress("Build is empty; left the live DB unchanged.")
     return new_count
 
 
@@ -981,8 +1115,9 @@ def main() -> None:
         description="Collect player/hero data for a Dota 2 esports league into SQLite."
     )
     parser.add_argument(
-        "--league-id", type=int, default=DEFAULT_LEAGUE_ID,
-        help=f"OpenDota/Dotabuff league id (default: {DEFAULT_LEAGUE_ID}, Pari Mixer Cup)",
+        "--league-id", type=str, default=str(DEFAULT_LEAGUE_ID),
+        help=f"League id(s), comma-separated for multiple tournaments "
+             f"(default: {DEFAULT_LEAGUE_ID}, Pari Mixer Cup #1)",
     )
     parser.add_argument("--db", default="tournament.db", help="Path to SQLite database file")
     parser.add_argument(

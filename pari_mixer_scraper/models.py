@@ -78,6 +78,10 @@ class Team(Base):
     # directly for things like the team's next scheduled opponent, without
     # re-resolving Steam-team_id <-> MixerCup identity on every request.
     mixer_uuid: Mapped[str | None] = mapped_column(nullable=True)
+    # Which mixer-cup tournament this team belongs to. The site's team list
+    # only shows the active tournament's teams; earlier tournaments' teams
+    # stay in the DB (reachable from player history) but off the sidebar.
+    tournament_id: Mapped[int | None] = mapped_column(nullable=True)
 
 
 class Player(Base):

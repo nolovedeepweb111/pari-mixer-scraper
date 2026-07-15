@@ -25,7 +25,15 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 DB_PATH = os.environ.get("TOURNAMENT_DB", str(BASE_DIR / "tournament.db"))
-LEAGUE_ID = int(os.environ.get("LEAGUE_ID", DEFAULT_LEAGUE_ID))
+# Comma-separated so the database can span tournaments: keep earlier
+# tournaments' league ids in the list and their matches stay re-fetchable
+# from Steam after Render wipes the disk. The LAST id is the current
+# tournament (used for tournament-wide stats).
+LEAGUE_IDS = [
+    int(x) for x in os.environ.get("LEAGUE_ID", str(DEFAULT_LEAGUE_ID)).replace(";", ",").split(",")
+    if x.strip()
+]
+CURRENT_LEAGUE_ID = LEAGUE_IDS[-1]
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 # NullPool: the collector swaps a freshly built DB file in via os.replace,
@@ -86,7 +94,7 @@ def _run_collect() -> None:
             sys.executable,
             [sys.executable, "-u", "-m", "pari_mixer_scraper.collect",
              "--db", build_path, "--promote-to", DB_PATH,
-             "--league-id", str(LEAGUE_ID)],
+             "--league-id", ",".join(str(x) for x in LEAGUE_IDS)],
             child_env,
         )
         _append_log(f"Spawned collector pid {pid}; waiting for it to finish...")
@@ -300,7 +308,20 @@ def _roster_filter(session: Session, team_id: int):
 @app.get("/api/teams")
 def api_teams():
     with Session(engine) as session:
-        teams = session.execute(select(Team.team_id, Team.name).order_by(Team.name)).all()
+        # Sidebar shows only the ACTIVE mixer tournament's teams; earlier
+        # tournaments' teams stay in the DB (their pages remain reachable
+        # from player match history) but off the list. If the active
+        # tournament can't be resolved (mixer API down), show everything
+        # rather than an empty site.
+        active = _resolve_mixer_tournament_id()
+        team_query = select(Team.team_id, Team.name).order_by(Team.name)
+        if active is not None:
+            team_query = team_query.where(Team.tournament_id == active)
+        teams = session.execute(team_query).all()
+        if not teams:
+            teams = session.execute(
+                select(Team.team_id, Team.name).order_by(Team.name)
+            ).all()
 
         result = []
         for team_id, name in teams:
@@ -625,6 +646,7 @@ def api_archive_player_heroes():
             .join(Player, Player.account_id == MatchPlayer.account_id)
             .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
             .join(Match, Match.match_id == MatchPlayer.match_id)
+            .where(Match.league_id == CURRENT_LEAGUE_ID)
             .group_by(MatchPlayer.account_id, MatchPlayer.hero_id)
             .order_by(Player.account_id, Hero.hero_id)
         ).all()
@@ -644,7 +666,7 @@ def api_archive_player_heroes():
         })
 
     return jsonify({
-        "league_id": LEAGUE_ID,
+        "league_id": CURRENT_LEAGUE_ID,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "players": sorted(players.values(), key=lambda p: p["account_id"]),
     })
@@ -715,7 +737,7 @@ def api_all_substitutions():
 @app.get("/api/tournament/heroes")
 def api_tournament_heroes():
     with Session(engine) as session:
-        stats = compute_tournament_hero_stats(session)
+        stats = compute_tournament_hero_stats(session, league_id=CURRENT_LEAGUE_ID)
     return jsonify(stats)
 
 
@@ -734,7 +756,24 @@ def api_backup():
         queued = session.execute(
             select(QueuedPlayer).order_by(QueuedPlayer.player_uuid)
         ).scalars().all()
+        teams = session.execute(select(Team).order_by(Team.team_id)).scalars().all()
+        all_players = session.execute(select(Player).order_by(Player.account_id)).scalars().all()
     return jsonify({
+        "teams": [
+            {
+                "team_id": t.team_id, "name": t.name,
+                "mixer_uuid": t.mixer_uuid, "tournament_id": t.tournament_id,
+            }
+            for t in teams
+        ],
+        "players": [
+            {
+                "account_id": p.account_id, "name": p.name, "team_id": p.team_id,
+                "roster_confirmed": p.roster_confirmed, "mmr": p.mmr,
+                "preferred_roles": p.preferred_roles,
+            }
+            for p in all_players
+        ],
         "substitution_events": [
             {
                 "event_id": e.event_id, "team_id": e.team_id,

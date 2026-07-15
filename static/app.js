@@ -70,6 +70,19 @@ async function loadTeams() {
   }
 }
 
+const ROLE_LABELS = {
+  CARRY: "Керри",
+  MIDLANER: "Мид",
+  OFFLANER: "Оффлейн",
+  SOFT_SUPPORT: "Саппорт",
+  HARD_SUPPORT: "Фулл-саппорт",
+};
+
+function formatRoles(roles) {
+  if (!roles) return "";
+  return roles.split(",").map((r) => ROLE_LABELS[r] || r).join(" / ");
+}
+
 function renderComposition(team) {
   const container = document.createElement("div");
 
@@ -84,11 +97,14 @@ function renderComposition(team) {
         return `<li><span>${h.name}</span><span>${wr}<span class="count">×${h.games}</span></span></li>`;
       })
       .join("");
+    const rolesLine = player.roles ? `<p class="roles">${formatRoles(player.roles)}</p>` : "";
     card.innerHTML = `
-      <h3>${player.name}<span class="profile-links">${profileLinks(player.account_id)}</span></h3>
+      <h3><button class="player-link" data-account-id="${player.account_id}">${player.name}</button><span class="profile-links">${profileLinks(player.account_id)}</span></h3>
       <p class="mmr">${formatMmr(player.mmr)} MMR</p>
-      <ul>${heroItems}</ul>
+      ${rolesLine}
+      <ul>${heroItems || '<li><span class="hint">ещё не играл(а) за команду</span></li>'}</ul>
     `;
+    card.querySelector(".player-link").addEventListener("click", () => loadPlayerPage(player.account_id));
     grid.appendChild(card);
   }
 
@@ -125,11 +141,14 @@ function renderComposition(team) {
       : "";
     const vs = lm.opponent_name ? ` против ${lm.opponent_name}` : "";
     const names = lm.players
-      .map((p) => `<strong>${p.name}</strong><span class="profile-links">${profileLinks(p.account_id)}</span>`)
+      .map((p) => `<button class="player-link" data-account-id="${p.account_id}">${p.name}</button><span class="profile-links">${profileLinks(p.account_id)}</span>`)
       .join(", ");
     const lineupLine = document.createElement("p");
     lineupLine.className = "last-lineup";
     lineupLine.innerHTML = `Состав в последнем матче${vs}${when ? ` (${when})` : ""}: ${names}`;
+    for (const btn of lineupLine.querySelectorAll(".player-link")) {
+      btn.addEventListener("click", () => loadPlayerPage(Number(btn.dataset.accountId)));
+    }
     container.appendChild(lineupLine);
   }
 
@@ -303,6 +322,78 @@ async function loadTeamDetail(teamId, tab) {
 
   showTab(activeTab);
   loadTeams();
+}
+
+async function loadPlayerPage(accountId) {
+  activeTeamId = null;
+  for (const btn of teamsEl.querySelectorAll(".team-btn")) {
+    btn.classList.remove("active");
+  }
+  detailEl.innerHTML = '<p class="hint">Загружаю профиль игрока...</p>';
+  const res = await fetch(`/api/players/${accountId}`);
+  if (!res.ok) {
+    detailEl.innerHTML = '<p class="hint">Игрок не найден.</p>';
+    return;
+  }
+  const p = await res.json();
+
+  const rolesLine = p.roles ? ` · ${formatRoles(p.roles)}` : "";
+  const teamLine = p.current_team_id != null
+    ? `Команда: <button class="opponent-link" data-team-id="${p.current_team_id}">${p.current_team_name}</button>`
+    : "Сейчас не в составе команды";
+
+  const heroTags = p.heroes.length
+    ? p.heroes
+        .map((h) => {
+          const wr = h.win_rate == null ? "" : ` — ${h.win_rate}%`;
+          const cls = h.win_rate == null ? "tag-neutral" : (h.win_rate >= 50 ? "tag-pick" : "tag-ban");
+          return `<span class="tag ${cls}">${h.name} ×${h.games}${wr}</span>`;
+        })
+        .join("")
+    : '<span class="hint">нет сыгранных матчей</span>';
+
+  const matchRows = p.matches
+    .map((m) => {
+      const when = m.start_time
+        ? new Date(m.start_time * 1000).toLocaleDateString("ru-RU", { day: "numeric", month: "short" })
+        : "";
+      let result = '<span class="match-result result-unknown">?</span>';
+      if (m.won === true) result = '<span class="match-result result-win">Победа</span>';
+      if (m.won === false) result = '<span class="match-result result-loss">Поражение</span>';
+      const formerBadge = (p.current_team_id != null && m.team_id !== p.current_team_id)
+        ? ' <span class="former-team-badge">прошлая команда</span>'
+        : "";
+      return `
+        <tr>
+          <td class="subs-date">${when}</td>
+          <td>${m.hero}</td>
+          <td>${result}</td>
+          <td><button class="opponent-link" data-team-id="${m.team_id}">${m.team_name}</button>${formerBadge}</td>
+          <td>против ${m.opponent_name}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  detailEl.innerHTML = `
+    <h2>${p.name}<span class="profile-links">${profileLinks(p.account_id)}</span></h2>
+    <p class="player-meta">${formatMmr(p.mmr)} MMR${rolesLine}</p>
+    <p class="next-opponent">${teamLine}</p>
+    <div class="analysis-block player-heroes-block">
+      <h4>Пул героев за турнир</h4>
+      <div class="tag-list">${heroTags}</div>
+    </div>
+    <h3 class="history-title">История матчей</h3>
+    ${p.matches.length ? `
+      <table class="subs-table">
+        <thead><tr><th>Дата</th><th>Герой</th><th>Результат</th><th>За команду</th><th>Соперник</th></tr></thead>
+        <tbody>${matchRows}</tbody>
+      </table>` : '<p class="hint">Матчей пока нет.</p>'}
+  `;
+
+  for (const link of detailEl.querySelectorAll(".opponent-link")) {
+    link.addEventListener("click", () => loadTeamDetail(Number(link.dataset.teamId)));
+  }
 }
 
 const tournamentStatsBtn = document.getElementById("tournament-stats-btn");

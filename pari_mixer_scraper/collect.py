@@ -420,14 +420,28 @@ def _apply_confirmed_roster(session: Session, steam_team_id: int, mixer_team: di
         nickname = mp.get("nickname")
         if account_id is None:
             continue
+        roles = ",".join(mp["preferredRoles"]) if mp.get("preferredRoles") else None
         player = by_account_id.get(account_id)
         if player is None:
-            continue
+            # A freshly substituted-in player has no Player row yet (rows
+            # normally come from match data, and they haven't played for
+            # this team yet). Create it from the mixer roster so the site
+            # shows the substitution immediately, not after their first game.
+            player = session.get(Player, account_id)
+            if player is not None:
+                # Exists under another team (played elsewhere earlier in the
+                # tournament) - move them to their current team.
+                player.team_id = steam_team_id
+            else:
+                player = Player(account_id=account_id, team_id=steam_team_id)
+                session.add(player)
         player.roster_confirmed = True
         if nickname:
             player.name = nickname
         if mp.get("rating") is not None:
             player.mmr = mp["rating"]
+        if roles:
+            player.preferred_roles = roles
 
 
 def link_mixercup_data(

@@ -49,7 +49,7 @@ query Teams($filters: TeamFilterInput!, $first: Int, $offset: Int) {
             id
             name
             number
-            players { id nickname proName steamAvatar rating }
+            players { id nickname proName steamAvatar rating preferredRoles }
         }
     }
 }

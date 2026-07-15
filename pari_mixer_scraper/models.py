@@ -95,6 +95,9 @@ class Player(Base):
     # MixerCup's balancing rating (their notion of MMR), pulled from
     # PlayerNode.rating alongside roster confirmation.
     mmr: Mapped[float | None] = mapped_column(nullable=True)
+    # MixerCup's PlayerNode.preferredRoles (CARRY / MIDLANER / OFFLANER /
+    # SOFT_SUPPORT / HARD_SUPPORT), comma-joined; None when not set there.
+    preferred_roles: Mapped[str | None] = mapped_column(nullable=True)
 
 
 class Match(Base):

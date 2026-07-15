@@ -36,6 +36,20 @@ jobs:
             echo "App unreachable; skipping backup this round (not fatal)"
             echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
+      - name: Fetch per-tournament player-hero archive
+        id: archive
+        if: steps.fetch.outputs.ok == 'true'
+        run: |
+          # Saved under a league-specific filename, so when the next
+          # tournament starts (new league id) the previous tournament's
+          # archive keeps existing in the branch as reference data.
+          if curl -sf "${{ vars.APP_URL }}/api/archive/player-heroes" -o archive.json; then
+            LEAGUE=$(python3 -c "import json; print(json.load(open('archive.json'))['league_id'])")
+            echo "file=player-heroes-${LEAGUE}.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "Archive endpoint unreachable; skipping (not fatal)"
+            echo "file=" >> "$GITHUB_OUTPUT"
+          fi
       - name: Commit to data-backup branch if changed
         if: steps.fetch.outputs.ok == 'true'
         run: |
@@ -51,10 +65,13 @@ jobs:
             cd ..
           fi
           cp backup.json repo/backup.json
+          if [ -n "${{ steps.archive.outputs.file }}" ]; then
+            cp archive.json "repo/${{ steps.archive.outputs.file }}"
+          fi
           cd repo
           git config user.name "state-backup"
           git config user.email "actions@users.noreply.github.com"
-          git add backup.json
+          git add -A
           if git diff --cached --quiet; then
             echo "No changes since last backup"
           else

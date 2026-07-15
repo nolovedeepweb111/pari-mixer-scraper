@@ -304,17 +304,23 @@ def api_teams():
 
         result = []
         for team_id, name in teams:
-            player_filter = _roster_filter(session, team_id)
-            # MatchPlayer has one row per match a player appeared in, so a
-            # plain join+sum would count their mmr once per match played.
-            # distinct() collapses that back down to one row per player,
-            # matching how the team-detail endpoint computes it.
+            # The mixer-confirmed roster is authoritative and includes
+            # players who haven't played a match yet (fresh substitutes) -
+            # so count straight from Player rows when it exists.
             rows = session.execute(
                 select(Player.account_id, Player.mmr)
-                .join(MatchPlayer, MatchPlayer.account_id == Player.account_id)
-                .where(MatchPlayer.team_id == team_id, player_filter)
-                .distinct()
+                .where(Player.team_id == team_id, Player.roster_confirmed.is_(True))
             ).all()
+            if not rows:
+                # Unlinked team: fall back to everyone who played under it.
+                # MatchPlayer has one row per match, so distinct() collapses
+                # it back down to one row per player.
+                rows = session.execute(
+                    select(Player.account_id, Player.mmr)
+                    .join(MatchPlayer, MatchPlayer.account_id == Player.account_id)
+                    .where(MatchPlayer.team_id == team_id)
+                    .distinct()
+                ).all()
             # Teams with only a single player are almost always admin/test
             # teams from a stray match rather than a real tournament squad.
             if len(rows) > 1:
@@ -460,18 +466,40 @@ def api_team_detail(team_id: int):
         last_match_lineup = _last_match_lineup(session, team_id)
         mixer_uuid = team.mixer_uuid
 
+        # Confirmed roster members with no matches yet (fresh substitutes)
+        # have no MatchPlayer rows, so the inner-join query above misses
+        # them - fetch the confirmed roster separately so they still get a
+        # card (with an empty hero list) as soon as the substitution lands.
+        confirmed_players = session.execute(
+            select(Player.account_id, Player.name, Player.mmr, Player.preferred_roles)
+            .where(Player.team_id == team_id, Player.roster_confirmed.is_(True))
+        ).all()
+
+    roles_by_account = {account_id: roles for account_id, _, _, roles in confirmed_players}
+
     players: dict[int, dict] = {}
     for account_id, name, mmr, hero_id, hero_name, games, decided_games, wins in rows:
         entry = players.setdefault(account_id, {
             "account_id": account_id,
             "name": name or f"account {account_id}",
             "mmr": mmr,
+            "roles": roles_by_account.get(account_id),
             "heroes": [],
         })
         win_rate = round(100 * wins / decided_games) if decided_games else None
         entry["heroes"].append({
             "hero_id": hero_id, "name": hero_name, "games": games, "win_rate": win_rate,
         })
+
+    for account_id, name, mmr, roles in confirmed_players:
+        if account_id not in players:
+            players[account_id] = {
+                "account_id": account_id,
+                "name": name or f"account {account_id}",
+                "mmr": mmr,
+                "roles": roles,
+                "heroes": [],
+            }
 
     for entry in players.values():
         entry["heroes"].sort(key=lambda h: -h["games"])
@@ -490,6 +518,135 @@ def api_team_detail(team_id: int):
         "recent_drafts": recent_drafts,
         "next_opponent": next_opponent,
         "last_match_lineup": last_match_lineup,
+    })
+
+
+@app.get("/api/players/<int:account_id>")
+def api_player_detail(account_id: int):
+    """Personal player page: current team, mixer roles, hero pool and full
+    match history across EVERY team they played for this tournament (the
+    mixer format allows moving between teams via substitutions, and each
+    MatchPlayer row remembers which team the game was actually played for)."""
+    with Session(engine) as session:
+        player = session.get(Player, account_id)
+        if player is None:
+            return jsonify({"error": "not found"}), 404
+
+        current_team = session.get(Team, player.team_id) if player.team_id else None
+
+        decided = case((Match.radiant_win.is_not(None), 1), else_=0)
+        won = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
+        hero_rows = session.execute(
+            select(Hero.localized_name, func.count(), func.sum(decided), func.sum(won))
+            .join(MatchPlayer, MatchPlayer.hero_id == Hero.hero_id)
+            .join(Match, Match.match_id == MatchPlayer.match_id)
+            .where(MatchPlayer.account_id == account_id)
+            .group_by(Hero.hero_id)
+        ).all()
+
+        match_rows = session.execute(
+            select(
+                Match.match_id, Match.start_time, Match.radiant_win,
+                MatchPlayer.is_radiant, MatchPlayer.team_id,
+                Match.radiant_team_id, Match.dire_team_id,
+                Hero.localized_name,
+            )
+            .join(MatchPlayer, MatchPlayer.match_id == Match.match_id)
+            .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
+            .where(MatchPlayer.account_id == account_id)
+            .order_by(Match.start_time.desc())
+        ).all()
+
+        involved_ids = {tid for row in match_rows for tid in (row[4], row[5], row[6]) if tid}
+        team_names = {
+            t.team_id: t.name
+            for t in session.execute(select(Team).where(Team.team_id.in_(involved_ids))).scalars()
+        } if involved_ids else {}
+
+        name = player.name
+        mmr = player.mmr
+        roles = player.preferred_roles
+
+    heroes = [
+        {
+            "name": hero_name,
+            "games": games,
+            "win_rate": round(100 * wins / decided_games) if decided_games else None,
+        }
+        for hero_name, games, decided_games, wins in hero_rows
+    ]
+    heroes.sort(key=lambda h: -h["games"])
+
+    matches = []
+    for match_id, start_time, radiant_win, is_radiant, played_for, r_id, d_id, hero in match_rows:
+        opponent_id = d_id if played_for == r_id else r_id
+        matches.append({
+            "match_id": match_id,
+            "start_time": start_time,
+            "hero": hero,
+            "team_id": played_for,
+            "team_name": team_names.get(played_for) or (f"Team {played_for}" if played_for else "?"),
+            "opponent_team_id": opponent_id,
+            "opponent_name": team_names.get(opponent_id) or (f"Team {opponent_id}" if opponent_id else "?"),
+            "won": (radiant_win == is_radiant) if radiant_win is not None else None,
+        })
+
+    return jsonify({
+        "account_id": account_id,
+        "name": name or f"account {account_id}",
+        "mmr": mmr,
+        "roles": roles,
+        "current_team_id": current_team.team_id if current_team else None,
+        "current_team_name": (current_team.name or f"Team {current_team.team_id}") if current_team else None,
+        "heroes": heroes,
+        "matches": matches,
+    })
+
+
+@app.get("/api/archive/player-heroes")
+def api_archive_player_heroes():
+    """Snapshot of every player's hero pool for THIS tournament, keyed by
+    league id. The backup workflow commits it to the data-backup branch as
+    player-heroes-<league_id>.json - when the next tournament starts (new
+    league id, new file), the previous tournament's file survives there and
+    can be loaded back as 'прошлый турнир' reference data."""
+    from datetime import datetime, timezone
+
+    with Session(engine) as session:
+        decided = case((Match.radiant_win.is_not(None), 1), else_=0)
+        won = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
+        rows = session.execute(
+            select(
+                Player.account_id, Player.name, Player.mmr, Player.preferred_roles,
+                Hero.hero_id, Hero.localized_name,
+                func.count(), func.sum(decided), func.sum(won),
+            )
+            .select_from(MatchPlayer)
+            .join(Player, Player.account_id == MatchPlayer.account_id)
+            .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
+            .join(Match, Match.match_id == MatchPlayer.match_id)
+            .group_by(MatchPlayer.account_id, MatchPlayer.hero_id)
+            .order_by(Player.account_id, Hero.hero_id)
+        ).all()
+
+    players: dict[int, dict] = {}
+    for account_id, name, mmr, roles, hero_id, hero_name, games, decided_games, wins in rows:
+        entry = players.setdefault(account_id, {
+            "account_id": account_id,
+            "name": name,
+            "mmr": mmr,
+            "roles": roles,
+            "heroes": [],
+        })
+        entry["heroes"].append({
+            "hero_id": hero_id, "name": hero_name,
+            "games": games, "wins": wins or 0, "decided": decided_games or 0,
+        })
+
+    return jsonify({
+        "league_id": LEAGUE_ID,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "players": sorted(players.values(), key=lambda p: p["account_id"]),
     })
 
 

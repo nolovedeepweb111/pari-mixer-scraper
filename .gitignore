@@ -8,3 +8,6 @@ tournament.db-wal
 cloudflared.exe
 cloudflared.log
 gh_cli/
+repro.db
+repro.db-shm
+repro.db-wal

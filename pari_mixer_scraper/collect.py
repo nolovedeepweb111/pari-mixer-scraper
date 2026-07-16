@@ -971,6 +971,99 @@ def apply_manual_roster_overrides(session: Session, progress: ProgressFn) -> Non
         progress(f"Applied {applied} manual roster override(s)")
 
 
+def _resolve_all_tournament_ids(session: Session, active_id: int | None) -> list[int]:
+    """Every mixer tournament we should touch: the active one, any forced via
+    env MIXER_TOURNAMENT_IDS, plus any already recorded on teams/matches - so
+    a past cup keeps getting refreshed even after a redeploy wipes the disk."""
+    ids: set[int] = set()
+    if active_id is not None:
+        ids.add(active_id)
+    for raw in os.environ.get("MIXER_TOURNAMENT_IDS", "").replace(";", ",").split(","):
+        try:
+            ids.add(int(raw.strip()))
+        except ValueError:
+            pass
+    ids.update(
+        t for (t,) in session.execute(
+            select(Team.tournament_id).where(Team.tournament_id.is_not(None)).distinct()
+        )
+    )
+    ids.update(
+        t for (t,) in session.execute(
+            select(Match.mixer_tournament_id).where(Match.mixer_tournament_id.is_not(None)).distinct()
+        )
+    )
+    return sorted(ids)
+
+
+def seed_matches_from_mixer(
+    session: Session,
+    mixer_client: MixerCupClient,
+    od_client: OpenDotaClient,
+    league_id: int,
+    tournament_ids: list[int],
+    progress: ProgressFn,
+) -> int:
+    """Discover matches from mixer-cup and pull each one's details from
+    OpenDota. This is now the ONLY way matches are found: Valve's
+    GetMatchHistory returns 403 (the endpoint is locked to partners) and
+    OpenDota doesn't index this 'excluded' league, so neither can enumerate
+    the tournament's games. mixer-cup's completed-games list, however, gives
+    every match_id (plus its result), and OpenDota's per-match endpoint still
+    serves full details (result, lineup, sides, draft) for those ids."""
+    wanted: set[int] = set()
+    for tid in tournament_ids:
+        try:
+            for g in mixer_client.iter_completed_games(tid):
+                raw = g.get("matchId")
+                if not raw:
+                    continue
+                try:
+                    match_id = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                # Real Dota match ids are ~10 digits (billions); mixer-cup
+                # occasionally carries a small internal id for a game whose
+                # Dota match was never linked - skip those, OpenDota 404s them.
+                if match_id >= 1_000_000_000:
+                    wanted.add(match_id)
+        except Exception as e:
+            progress(f"MixerCup completed-games fetch failed for tournament {tid}: {e}")
+
+    existing = {row[0] for row in session.execute(select(Match.match_id))}
+    missing = sorted(wanted - existing)
+    if not missing:
+        progress(f"MixerCup match seed: all {len(wanted)} known matches already stored")
+        return 0
+    progress(f"MixerCup match seed: {len(missing)} new match(es) to fetch from OpenDota")
+
+    added = 0
+    consecutive_errors = 0
+    for i, match_id in enumerate(missing, start=1):
+        try:
+            detail = od_client.get_match(match_id)
+            consecutive_errors = 0
+        except Exception as e:
+            # A single 404 (unparsed/unknown match) is fine - skip it. But a
+            # run of failures means OpenDota is rate-limiting this shared IP
+            # (lasts hours), so stop and let a later cycle backfill the rest
+            # rather than burn the whole run hammering a closed door.
+            consecutive_errors += 1
+            if consecutive_errors >= 8:
+                progress(f"OpenDota failing repeatedly (last: {match_id}, {e}); deferring {len(missing) - i + 1} match(es) to a later run.")
+                break
+            continue
+        if not detail or detail.get("match_id") is None:
+            continue
+        persist_match(session, league_id, normalize_opendota_match(detail), {}, {})
+        session.commit()
+        added += 1
+        if i % 25 == 0:
+            progress(f"MixerCup match seed: {added} fetched so far ({i}/{len(missing)})...")
+    progress(f"MixerCup match seed: {added} match(es) added")
+    return added
+
+
 def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
                          on_core_ready=None) -> int:
     """Does the actual collection work against `engine`, returning the
@@ -1041,35 +1134,31 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
             mixer_tournament_id = None
 
         if mixer_tournament_id is not None:
+            # #1 and #2 run concurrently and share a dotabuff league, so both
+            # must be touched. Gather the full id set (active + env override +
+            # whatever teams/matches already carry) once, and use it both to
+            # seed matches and to link every tournament for results.
+            all_tournament_ids = _resolve_all_tournament_ids(session, mixer_tournament_id)
+
+            # Discover + fetch matches from mixer-cup (Steam/OpenDota can no
+            # longer enumerate this league - see seed_matches_from_mixer). Must
+            # run BEFORE linking, which only updates matches that already exist.
+            seed_matches_from_mixer(
+                session, mixer_client, od_client,
+                league_ids[0] if league_ids else DEFAULT_LEAGUE_ID,
+                all_tournament_ids, progress,
+            )
+
             # Link the ACTIVE tournament fully (rosters, team identity), then
-            # every OTHER tournament we know about for results only. #1 and #2
-            # run concurrently, so both must be linked to show W/L - and we
-            # gather the id set from teams, matches AND an env override so a
-            # tournament is never missed just because its teams lost their
-            # tournament_id.
+            # every OTHER tournament for results only.
             link_mixercup_data(session, mixer_client, mixer_tournament_id, progress)
             sync_mixer_teams(session, mixer_client, mixer_tournament_id, progress)
             sync_substitution_history(session, mixer_client, mixer_tournament_id, progress)
             sync_queue_snapshot(session, mixer_client, mixer_tournament_id, progress)
 
-            other_ids = set()
-            other_ids.update(
-                t for (t,) in session.execute(
-                    select(Team.tournament_id).where(Team.tournament_id.is_not(None)).distinct()
-                )
-            )
-            other_ids.update(
-                t for (t,) in session.execute(
-                    select(Match.mixer_tournament_id).where(Match.mixer_tournament_id.is_not(None)).distinct()
-                )
-            )
-            for raw in os.environ.get("MIXER_TOURNAMENT_IDS", "").replace(";", ",").split(","):
-                try:
-                    other_ids.add(int(raw.strip()))
-                except ValueError:
-                    pass
-            other_ids.discard(mixer_tournament_id)
-            for pid in sorted(other_ids):
+            for pid in all_tournament_ids:
+                if pid == mixer_tournament_id:
+                    continue
                 link_mixercup_data(session, mixer_client, pid, progress, apply_rosters=False)
 
             # The user only wants the ACTIVE tournament's substitution history.

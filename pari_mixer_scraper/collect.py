@@ -304,17 +304,32 @@ def sync_draft_data(
     client: OpenDotaClient,
     steam_client: SteamClient | None,
     progress: ProgressFn,
+    limit: int | None = None,
 ) -> None:
     """Backfills picks/bans for matches that don't have any draft rows yet.
     Steam's GetMatchDetails is the primary source (generous rate limits,
     same picks_bans structure - OpenDota sources its copy from there);
     OpenDota is the per-match fallback. Costs one call per match, but only
-    once - matches already covered are skipped on later runs."""
+    once - matches already covered are skipped on later runs.
+
+    Newly seeded matches already carry their draft (seed_matches_from_mixer
+    stores it from the same detail), so this only covers matches that predate
+    that - which, because every build is seeded from the live DB, would
+    otherwise stay draftless forever and leave their teams' analysis empty."""
     has_draft = {row[0] for row in session.execute(select(MatchDraftEntry.match_id))}
-    all_match_ids = [row[0] for row in session.execute(select(Match.match_id))]
+    # Newest first: the running cup's games are what people have open, and the
+    # per-run cap means the tail waits for a later cycle.
+    all_match_ids = [
+        row[0] for row in session.execute(
+            select(Match.match_id).order_by(Match.start_time.desc().nulls_last())
+        )
+    ]
     missing = [m for m in all_match_ids if m not in has_draft]
     if not missing:
         return
+    if limit is not None and len(missing) > limit:
+        progress(f"Drafts missing for {len(missing)} match(es); fetching {limit} this run, rest follows next cycle")
+        missing = missing[:limit]
 
     # Valve's GetMatchDetails 500s for private-lobby games (which is what
     # this mixer tournament is played in) even though GetMatchHistory lists
@@ -1015,6 +1030,11 @@ def _resolve_all_tournament_ids(session: Session, active_id: int | None) -> list
 # ~2 min; the rest backfills over the next few cycles (they run every ~10 min).
 SEED_MAX_MATCHES_PER_RUN = int(os.environ.get("SEED_MAX_MATCHES_PER_RUN", "60"))
 
+# Same idea for the draft backfill, which also costs one OpenDota call per
+# match. Only matches seeded before drafts were stored inline need this, so
+# the backlog is finite and drains over a few cycles.
+DRAFT_MAX_MATCHES_PER_RUN = int(os.environ.get("DRAFT_MAX_MATCHES_PER_RUN", "40"))
+
 
 def seed_matches_from_mixer(
     session: Session,
@@ -1229,10 +1249,16 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
             session.rollback()
             progress(f"Pro player directory failed ({e}); skipping this step.")
 
+        # Drafts first: they drive the team analysis cards (first pick, bans),
+        # whereas the enrichment steps only polish names. All three share the
+        # same rate-limited OpenDota budget, and when it runs out the LAST
+        # steps are the ones that get skipped - so the draft backfill must not
+        # sit behind the cosmetic ones.
         for step_name, step in (
+            ("draft sync", lambda: sync_draft_data(session, od_client, steam_client, progress,
+                                                   limit=DRAFT_MAX_MATCHES_PER_RUN)),
             ("player name enrichment", lambda: enrich_missing_player_names(session, od_client, progress)),
             ("team name enrichment", lambda: enrich_missing_team_names(session, od_client, steam_client, progress)),
-            ("draft sync", lambda: sync_draft_data(session, od_client, steam_client, progress)),
         ):
             try:
                 step()

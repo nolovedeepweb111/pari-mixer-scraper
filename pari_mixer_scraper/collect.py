@@ -277,6 +277,28 @@ def persist_match(
         ))
 
 
+def persist_draft_entries(session: Session, match_id: int, detail: dict) -> bool:
+    """Store a match's picks/bans out of an OpenDota/Steam match detail.
+    False means the detail carried no draft (not captain's mode, or OpenDota
+    hasn't parsed it) - the caller decides whether that's worth reporting."""
+    picks_bans = detail.get("picks_bans") or []
+    if not picks_bans:
+        return False
+    match = session.get(Match, match_id)
+    if match is None:
+        return False
+    for pb in picks_bans:
+        team_id = match.radiant_team_id if pb.get("team") == 0 else match.dire_team_id
+        session.add(MatchDraftEntry(
+            match_id=match_id,
+            order_num=pb.get("order", 0),
+            hero_id=pb.get("hero_id"),
+            team_id=team_id,
+            is_pick=bool(pb.get("is_pick")),
+        ))
+    return True
+
+
 def sync_draft_data(
     session: Session,
     client: OpenDotaClient,
@@ -333,21 +355,9 @@ def sync_draft_data(
                 break
             continue
 
-        picks_bans = detail.get("picks_bans") or []
-        if not picks_bans:
+        if not persist_draft_entries(session, match_id, detail):
             fetched_empty += 1
             continue
-
-        match = session.get(Match, match_id)
-        for pb in picks_bans:
-            team_id = match.radiant_team_id if pb.get("team") == 0 else match.dire_team_id
-            session.add(MatchDraftEntry(
-                match_id=match_id,
-                order_num=pb.get("order", 0),
-                hero_id=pb.get("hero_id"),
-                team_id=team_id,
-                is_pick=bool(pb.get("is_pick")),
-            ))
         session.commit()
         if i % 10 == 0 or i == len(missing):
             progress(f"  picks/bans {i}/{len(missing)}")
@@ -1056,6 +1066,11 @@ def seed_matches_from_mixer(
         if not detail or detail.get("match_id") is None:
             continue
         persist_match(session, league_id, normalize_opendota_match(detail), {}, {})
+        # The detail we just paid for already carries picks_bans - store the
+        # draft now rather than let sync_draft_data re-fetch the very same
+        # match later. That halves the OpenDota calls per match, which is the
+        # binding constraint on Render's shared (rate-limited) egress IP.
+        persist_draft_entries(session, match_id, detail)
         session.commit()
         added += 1
         if i % 25 == 0:

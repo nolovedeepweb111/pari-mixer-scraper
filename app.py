@@ -313,6 +313,9 @@ _LOGIN_HTML = """<!doctype html>
   button:hover { background:#0078d6; }
   button:disabled { opacity:.5; cursor:default; }
   .err { color:var(--bad); font-size:13px; margin-top:12px; min-height:16px; }
+  .access { margin-top:20px; padding-top:16px; border-top:1px solid var(--border);
+            color:var(--muted); font-size:13px; line-height:1.5; }
+  .access b { color:var(--text); }
 </style></head><body>
 <form class="card" id="f">
   <h1>PARI Mixer Cup</h1>
@@ -321,6 +324,10 @@ _LOGIN_HTML = """<!doctype html>
   <input id="key" name="key" autocomplete="off" autofocus>
   <button id="btn" type="submit">Войти</button>
   <div class="err" id="err"></div>
+  <div class="access">
+    Для получения доступа к сайту отправьте <b>5 USD</b> пользователю <b>zharok.pcash</b>
+    и напишите в дискорде <b>nldw111</b> или в телеграмме <b>@VaxpEe</b>
+  </div>
 </form>
 <script>
   // A stable per-browser id so the same device reuses its key slot, while

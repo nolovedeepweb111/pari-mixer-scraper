@@ -451,6 +451,15 @@ def _apply_confirmed_roster(session: Session, steam_team_id: int, mixer_team: di
             player.preferred_roles = roles
 
 
+def _team_mixer_uuid(session: Session, team_id: int | None) -> str | None:
+    """The mixer_uuid stored on a steam team row, used to orient a match's
+    sides when lineup overlap is inconclusive."""
+    if team_id is None:
+        return None
+    team_row = session.get(Team, team_id)
+    return team_row.mixer_uuid if team_row is not None else None
+
+
 def link_mixercup_data(
     session: Session,
     mixer_client: MixerCupClient,
@@ -512,11 +521,23 @@ def link_mixercup_data(
 
         score_a = len(team1_ids & radiant_ids) + len(team2_ids & dire_ids)
         score_b = len(team1_ids & dire_ids) + len(team2_ids & radiant_ids)
-        if score_a == score_b:
-            ambiguous += 1
-            continue
-
-        radiant_team, dire_team = (team1, team2) if score_a > score_b else (team2, team1)
+        if score_a != score_b:
+            radiant_team, dire_team = (team1, team2) if score_a > score_b else (team2, team1)
+        else:
+            # Lineup overlap couldn't orient the sides - rosters without
+            # account_ids, or an old match whose players we no longer refetch.
+            # Fall back to the mixer_uuid already stored on each steam team, so
+            # old games still get their result even with no fresh lineup.
+            radiant_uuid = _team_mixer_uuid(session, match.radiant_team_id)
+            dire_uuid = _team_mixer_uuid(session, match.dire_team_id)
+            t1_id, t2_id = team1["id"], team2["id"]
+            if radiant_uuid == t1_id or dire_uuid == t2_id:
+                radiant_team, dire_team = team1, team2
+            elif radiant_uuid == t2_id or dire_uuid == t1_id:
+                radiant_team, dire_team = team2, team1
+            else:
+                ambiguous += 1
+                continue
 
         # Stamp the match with the tournament it actually belongs to (the
         # one whose completed-games list it appears in), regardless of its

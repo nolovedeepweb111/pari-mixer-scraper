@@ -33,6 +33,45 @@ ProgressFn = Callable[[str], None]
 
 _HEROES_BUNDLE = Path(__file__).resolve().parent / "data" / "heroes.json"
 
+# Consecutive mixer tournaments reuse the same dotabuff league (19924), so a
+# match's tournament is decided by its start_time, not league_id: a match at
+# or after a boundary belongs to that tournament. #2 starts at the mw-vs-holl
+# series (match 8898428629, 2026-07-15 21:12 UTC). Matches before the first
+# boundary belong to the oldest tournament. Override via env
+# TOURNAMENT_BOUNDARIES="1784149947:27" (comma-separated <start_time>:<tid>).
+_OLDEST_TOURNAMENT_ID = 26
+_DEFAULT_TOURNAMENT_BOUNDARIES = [(1784149947, 27)]
+
+
+def _tournament_boundaries() -> list[tuple[int, int]]:
+    raw = os.environ.get("TOURNAMENT_BOUNDARIES")
+    if not raw:
+        return _DEFAULT_TOURNAMENT_BOUNDARIES
+    out = []
+    for pair in raw.replace(";", ",").split(","):
+        if ":" in pair:
+            ts, tid = pair.split(":", 1)
+            try:
+                out.append((int(ts.strip()), int(tid.strip())))
+            except ValueError:
+                pass
+    return out or _DEFAULT_TOURNAMENT_BOUNDARIES
+
+
+def assign_match_tournaments(session: Session, progress: ProgressFn) -> None:
+    """Deterministically stamps every match with its mixer tournament from
+    the start-time boundaries - the authoritative 'which tournament' answer
+    when tournaments share a dotabuff league. Runs after mixer linking so it
+    also covers matches mixer hasn't listed yet."""
+    session.execute(update(Match).values(mixer_tournament_id=_OLDEST_TOURNAMENT_ID))
+    for ts, tid in sorted(_tournament_boundaries()):  # ascending: later wins
+        session.execute(
+            update(Match).where(Match.start_time.is_not(None), Match.start_time >= ts)
+            .values(mixer_tournament_id=tid)
+        )
+    session.commit()
+    progress("Assigned match tournaments by start-time boundary")
+
 
 def sync_heroes(session: Session, client: OpenDotaClient | None = None, progress: ProgressFn | None = None) -> None:
     """Populates the hero list from a bundled snapshot shipped in the repo,
@@ -1026,6 +1065,10 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
             # the state-backup restore); the backup endpoint no longer dumps
             # them, so this self-heals within a cycle or two.
             _purge_past_tournament_subs(session, mixer_tournament_id, progress)
+
+        # Authoritative, deterministic tournament stamp on every match (covers
+        # matches mixer hasn't listed yet, and overrides linking).
+        assign_match_tournaments(session, progress)
 
         apply_manual_roster_overrides(session, progress)
         session.commit()

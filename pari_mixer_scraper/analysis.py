@@ -22,10 +22,16 @@ class TeamStats(TypedDict):
     own_bans: list[tuple[str, int]]
 
 
-def compute_team_stats(session: Session, team_id: int) -> TeamStats:
+def compute_team_stats(session: Session, team_id: int,
+                       tournament_id: int | None = None) -> TeamStats:
+    # Scope to the team's own tournament: a steam team_id can be reused
+    # across tournaments sharing a dotabuff league, so without this the
+    # stats mix both. None means no scoping (unlinked team).
+    tour_filter = (Match.mixer_tournament_id == tournament_id) if tournament_id is not None else True
+
     matches = session.execute(
         select(Match.match_id, Match.radiant_team_id, Match.dire_team_id, Match.radiant_win)
-        .where((Match.radiant_team_id == team_id) | (Match.dire_team_id == team_id))
+        .where((Match.radiant_team_id == team_id) | (Match.dire_team_id == team_id), tour_filter)
         .order_by(Match.start_time)
     ).all()
 
@@ -42,7 +48,8 @@ def compute_team_stats(session: Session, team_id: int) -> TeamStats:
     top_picks = session.execute(
         select(Hero.localized_name, func.count())
         .join(MatchPlayer, MatchPlayer.hero_id == Hero.hero_id)
-        .where(MatchPlayer.team_id == team_id)
+        .join(Match, Match.match_id == MatchPlayer.match_id)
+        .where(MatchPlayer.team_id == team_id, tour_filter)
         .group_by(Hero.hero_id)
         .order_by(func.count().desc())
         .limit(5)
@@ -54,7 +61,7 @@ def compute_team_stats(session: Session, team_id: int) -> TeamStats:
         select(Hero.localized_name, func.sum(won_case), func.sum(decided_case))
         .join(MatchPlayer, MatchPlayer.hero_id == Hero.hero_id)
         .join(Match, Match.match_id == MatchPlayer.match_id)
-        .where(MatchPlayer.team_id == team_id)
+        .where(MatchPlayer.team_id == team_id, tour_filter)
         .group_by(Hero.hero_id)
     ).all()
     signature = [

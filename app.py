@@ -623,14 +623,27 @@ def _hero_icon_slug(internal_name: str) -> str:
     return internal_name[len(prefix):] if internal_name.startswith(prefix) else internal_name
 
 
-def _last_match_lineup(session: Session, team_id: int) -> dict | None:
+def _team_tournament_filter(tournament_id: int | None):
+    """Restrict a team's matches to its OWN tournament. A steam team_id can
+    be reused across tournaments that share a dotabuff league (e.g. B3SHA in
+    #2 kept yuusha's #1 team_id), so without this a team page mixes both
+    tournaments' games. None (unlinked team) means no scoping."""
+    if tournament_id is not None:
+        return Match.mixer_tournament_id == tournament_id
+    return True
+
+
+def _last_match_lineup(session: Session, team_id: int, tournament_id: int | None = None) -> dict | None:
     """Who actually played the team's most recent match. The roster cards
     only show mixer-confirmed players with at least one game, so a team can
     display fewer than five (fresh substitute who hasn't played yet, or an
     unlinked roster) - this fills that gap with the real last-game five."""
     row = session.execute(
         select(Match.match_id, Match.start_time, Match.radiant_team_id, Match.dire_team_id)
-        .where((Match.radiant_team_id == team_id) | (Match.dire_team_id == team_id))
+        .where(
+            (Match.radiant_team_id == team_id) | (Match.dire_team_id == team_id),
+            _team_tournament_filter(tournament_id),
+        )
         .order_by(Match.start_time.desc())
         .limit(1)
     ).first()
@@ -661,13 +674,17 @@ def _last_match_lineup(session: Session, team_id: int) -> dict | None:
     }
 
 
-def _recent_drafts(session: Session, team_id: int, limit: int = 23) -> list[dict]:
+def _recent_drafts(session: Session, team_id: int, tournament_id: int | None = None,
+                   limit: int = 23) -> list[dict]:
     """Full draft (both teams' picks and bans, in actual draft order) for
     this team's last few matches - not just this team's own bans, since
     what the *opponent* banned against them is the more useful signal."""
     matches = session.execute(
         select(Match.match_id, Match.radiant_team_id, Match.dire_team_id, Match.radiant_win)
-        .where((Match.radiant_team_id == team_id) | (Match.dire_team_id == team_id))
+        .where(
+            (Match.radiant_team_id == team_id) | (Match.dire_team_id == team_id),
+            _team_tournament_filter(tournament_id),
+        )
         .order_by(Match.start_time.desc())
     ).all()
 
@@ -738,12 +755,15 @@ def api_team_detail(team_id: int):
             .join(MatchPlayer, MatchPlayer.account_id == Player.account_id)
             .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
             .join(Match, Match.match_id == MatchPlayer.match_id)
-            .where(MatchPlayer.team_id == team_id, player_filter)
+            .where(
+                MatchPlayer.team_id == team_id, player_filter,
+                _team_tournament_filter(team.tournament_id),
+            )
             .group_by(Player.account_id, Hero.hero_id)
         ).all()
 
-        recent_drafts = _recent_drafts(session, team_id)
-        last_match_lineup = _last_match_lineup(session, team_id)
+        recent_drafts = _recent_drafts(session, team_id, team.tournament_id)
+        last_match_lineup = _last_match_lineup(session, team_id, team.tournament_id)
         mixer_uuid = team.mixer_uuid
 
         # Confirmed roster members with no matches yet (fresh substitutes)
@@ -949,7 +969,7 @@ def api_team_analysis(team_id: int):
             return jsonify({"error": "not found"}), 404
 
         team_name = team.name or f"Team {team_id}"
-        stats = compute_team_stats(session, team_id)
+        stats = compute_team_stats(session, team_id, team.tournament_id)
         text = generate_coach_text(team_name, stats)
 
     return jsonify({

@@ -1006,6 +1006,16 @@ def _resolve_all_tournament_ids(session: Session, active_id: int | None) -> list
     return sorted(ids)
 
 
+# How many NEW matches one run may fetch. Each costs an OpenDota call (~1.2s
+# apart), so an uncapped first build after a redeploy - which starts from an
+# empty disk and has ~300 matches to pull - would run for many minutes. That
+# matters because the caller treats a long run as wedged and starts another
+# collector alongside it, and two collectors on Render's free instance thrash
+# the box until the site itself stops responding. Capping keeps every run to
+# ~2 min; the rest backfills over the next few cycles (they run every ~10 min).
+SEED_MAX_MATCHES_PER_RUN = int(os.environ.get("SEED_MAX_MATCHES_PER_RUN", "60"))
+
+
 def seed_matches_from_mixer(
     session: Session,
     mixer_client: MixerCupClient,
@@ -1013,6 +1023,7 @@ def seed_matches_from_mixer(
     league_id: int,
     tournament_ids: list[int],
     progress: ProgressFn,
+    limit: int | None = None,
 ) -> int:
     """Discover matches from mixer-cup and pull each one's details from
     OpenDota. This is now the ONLY way matches are found: Valve's
@@ -1041,11 +1052,19 @@ def seed_matches_from_mixer(
             progress(f"MixerCup completed-games fetch failed for tournament {tid}: {e}")
 
     existing = {row[0] for row in session.execute(select(Match.match_id))}
-    missing = sorted(wanted - existing)
+    # Newest first: if the cap defers some, the ones people are actually
+    # looking at (this cup's latest games) land first.
+    missing = sorted(wanted - existing, reverse=True)
     if not missing:
         progress(f"MixerCup match seed: all {len(wanted)} known matches already stored")
         return 0
-    progress(f"MixerCup match seed: {len(missing)} new match(es) to fetch from OpenDota")
+
+    total_missing = len(missing)
+    if limit is not None and total_missing > limit:
+        missing = missing[:limit]
+        progress(f"MixerCup match seed: {total_missing} match(es) missing; fetching {limit} this run, rest follows next cycle")
+    else:
+        progress(f"MixerCup match seed: {total_missing} new match(es) to fetch from OpenDota")
 
     added = 0
     consecutive_errors = 0
@@ -1162,6 +1181,7 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
                 session, mixer_client, od_client,
                 league_ids[0] if league_ids else DEFAULT_LEAGUE_ID,
                 all_tournament_ids, progress,
+                limit=SEED_MAX_MATCHES_PER_RUN,
             )
 
             # Link the ACTIVE tournament fully (rosters, team identity), then

@@ -127,11 +127,15 @@ def _restore_access_bindings() -> None:
 if AUTH_ENABLED:
     threading.Thread(target=_restore_access_bindings, daemon=True).start()
 
-_collect_state = {"running": False, "log": [], "error": None, "new_matches": None, "started_at": None}
+_collect_state = {"running": False, "log": [], "error": None, "new_matches": None,
+                  "started_at": None, "pid": None}
 _collect_lock = threading.Lock()
 # If a run has been "running" longer than this with no sign of life, treat
 # it as dead (stuck thread, killed worker that never reset the flag, etc.)
 # and allow a new attempt rather than blocking the site's data forever.
+# A run that is merely slow must NOT reach this: each run is capped (see
+# SEED_MAX_MATCHES_PER_RUN) to a couple of minutes, so anything still alive
+# this much later really is wedged.
 _STALE_RUN_SECONDS = 15 * 60
 
 
@@ -182,6 +186,7 @@ def _run_collect() -> None:
              "--league-id", ",".join(str(x) for x in LEAGUE_IDS)],
             child_env,
         )
+        _collect_state["pid"] = pid
         _append_log(f"Spawned collector pid {pid}; waiting for it to finish...")
 
         # Hard deadline: a full from-scratch rebuild takes ~7-10 min on this
@@ -236,11 +241,23 @@ def _start_collect_background(force: bool = False) -> bool:
         is_stale = started_at is not None and (time.monotonic() - started_at) > _STALE_RUN_SECONDS
         if _collect_state["running"] and not (force or is_stale):
             return False
-        if _collect_state["running"] and is_stale:
-            _append_log("Previous run looked stuck (no progress for 15+ min) - starting a new one.")
+        if _collect_state["running"]:
+            # The old child is very likely still alive and working. Starting a
+            # second one alongside it puts two collectors on a 0.1-CPU / 512MB
+            # free instance, both writing SQLite - that thrashes the box and
+            # the SITE stops responding. Kill the old one first; its promotes
+            # are atomic, so killing it mid-run never corrupts the live DB.
+            old_pid = _collect_state.get("pid")
+            _append_log("Previous run looked stuck - killing it before starting a new one.")
+            if old_pid:
+                try:
+                    os.kill(old_pid, 9)
+                except OSError:
+                    pass
         _collect_state.update({
             "running": True, "log": list(_collect_state["log"]) if is_stale else [],
             "error": None, "new_matches": None, "started_at": time.monotonic(),
+            "pid": None,
         })
         threading.Thread(target=_run_collect, daemon=True).start()
     return True

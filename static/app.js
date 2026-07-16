@@ -355,15 +355,31 @@ async function loadPlayerPage(accountId) {
     ? `Команда: <button class="opponent-link" data-team-id="${p.current_team_id}">${p.current_team_name}</button>`
     : "Сейчас не в составе команды";
 
-  const heroTags = p.heroes.length
-    ? p.heroes
-        .map((h) => {
-          const wr = h.win_rate == null ? "" : ` — ${h.win_rate}%`;
-          const cls = h.win_rate == null ? "tag-neutral" : (h.win_rate >= 50 ? "tag-pick" : "tag-ban");
-          return `<span class="tag ${cls}">${h.name} ×${h.games}${wr}</span>`;
-        })
+  const heroTagsFor = (heroes) =>
+    heroes.length
+      ? heroes
+          .map((h) => {
+            const wr = h.win_rate == null ? "" : ` — ${h.win_rate}%`;
+            const cls = h.win_rate == null ? "tag-neutral" : (h.win_rate >= 50 ? "tag-pick" : "tag-ban");
+            return `<span class="tag ${cls}">${h.name} ×${h.games}${wr}</span>`;
+          })
+          .join("")
+      : '<span class="hint">нет сыгранных матчей</span>';
+
+  // One hero pool per tournament (the two mixer cups run concurrently).
+  const heroPoolsHtml = (p.hero_pools && p.hero_pools.length)
+    ? p.hero_pools
+        .map((pool) => `
+          <div class="analysis-block player-heroes-block">
+            <h4>Пул героев · ${pool.label}</h4>
+            <div class="tag-list">${heroTagsFor(pool.heroes)}</div>
+          </div>
+        `)
         .join("")
-    : '<span class="hint">нет сыгранных матчей</span>';
+    : `<div class="analysis-block player-heroes-block">
+         <h4>Пул героев</h4>
+         <div class="tag-list"><span class="hint">нет сыгранных матчей</span></div>
+       </div>`;
 
   let lastLabel = null;
   const matchRows = p.matches
@@ -401,10 +417,7 @@ async function loadPlayerPage(accountId) {
     <h2>${p.name}<span class="profile-links">${profileLinks(p.account_id)}</span></h2>
     <p class="player-meta">${formatMmr(p.mmr)} MMR${rolesLine}</p>
     <p class="next-opponent">${teamLine}</p>
-    <div class="analysis-block player-heroes-block">
-      <h4>Пул героев за турнир</h4>
-      <div class="tag-list">${heroTags}</div>
-    </div>
+    ${heroPoolsHtml}
     <h3 class="history-title">История матчей</h3>
     ${p.matches.length ? `
       <table class="subs-table">

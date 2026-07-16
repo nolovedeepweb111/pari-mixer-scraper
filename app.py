@@ -483,9 +483,10 @@ def _tournament_label(mixer_tournament_id: int | None, league_id: int | None) ->
             return _mixer_tournament_name_cache[mixer_tournament_id]
         if mixer_tournament_id in MIXER_TOURNAMENT_LABELS:
             return MIXER_TOURNAMENT_LABELS[mixer_tournament_id]
+        return f"Турнир {mixer_tournament_id}"
     if league_id in LEAGUE_LABELS:
         return LEAGUE_LABELS[league_id]
-    return f"Турнир · {mixer_tournament_id or league_id}"
+    return "Прочие матчи"
 
 
 def _get_next_opponent(mixer_uuid: str) -> dict | None:
@@ -837,11 +838,14 @@ def api_player_detail(account_id: int):
         decided = case((Match.radiant_win.is_not(None), 1), else_=0)
         won = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
         hero_rows = session.execute(
-            select(Hero.localized_name, func.count(), func.sum(decided), func.sum(won))
+            select(
+                Match.mixer_tournament_id, Hero.localized_name,
+                func.count(), func.sum(decided), func.sum(won),
+            )
             .join(MatchPlayer, MatchPlayer.hero_id == Hero.hero_id)
             .join(Match, Match.match_id == MatchPlayer.match_id)
             .where(MatchPlayer.account_id == account_id)
-            .group_by(Hero.hero_id)
+            .group_by(Match.mixer_tournament_id, Hero.hero_id)
         ).all()
 
         match_rows = session.execute(
@@ -867,18 +871,25 @@ def api_player_detail(account_id: int):
         mmr = player.mmr
         roles = player.preferred_roles
 
-    heroes = [
-        {
+    # Resolve active tournament first so its live name is available to labels.
+    active = _resolve_mixer_tournament_id()
+
+    # Hero pool split per tournament (the two mixer cups run concurrently).
+    pools_by_tid: dict[int | None, list] = {}
+    for mixer_tid, hero_name, games, decided_games, wins in hero_rows:
+        pools_by_tid.setdefault(mixer_tid, []).append({
             "name": hero_name,
             "games": games,
             "win_rate": round(100 * wins / decided_games) if decided_games else None,
-        }
-        for hero_name, games, decided_games, wins in hero_rows
-    ]
-    heroes.sort(key=lambda h: -h["games"])
-
-    # Resolve active tournament first so its live name is available to labels.
-    _resolve_mixer_tournament_id()
+        })
+    hero_pools = []
+    for tid in sorted(pools_by_tid, key=lambda t: (t != active, -(t or 0))):
+        pool = sorted(pools_by_tid[tid], key=lambda h: -h["games"])
+        hero_pools.append({
+            "tournament_id": tid,
+            "label": _tournament_label(tid, None),
+            "heroes": pool,
+        })
 
     matches = []
     for (match_id, start_time, radiant_win, is_radiant, played_for, r_id, d_id,
@@ -905,7 +916,7 @@ def api_player_detail(account_id: int):
         "roles": roles,
         "current_team_id": current_team.team_id if current_team else None,
         "current_team_name": (current_team.name or f"Team {current_team.team_id}") if current_team else None,
-        "heroes": heroes,
+        "hero_pools": hero_pools,
         "matches": matches,
     })
 

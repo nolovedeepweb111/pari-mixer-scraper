@@ -33,44 +33,12 @@ ProgressFn = Callable[[str], None]
 
 _HEROES_BUNDLE = Path(__file__).resolve().parent / "data" / "heroes.json"
 
-# Consecutive mixer tournaments reuse the same dotabuff league (19924), so a
-# match's tournament is decided by its start_time, not league_id: a match at
-# or after a boundary belongs to that tournament. #2 starts at the mw-vs-holl
-# series (match 8898428629, 2026-07-15 21:12 UTC). Matches before the first
-# boundary belong to the oldest tournament. Override via env
-# TOURNAMENT_BOUNDARIES="1784149947:27" (comma-separated <start_time>:<tid>).
-_OLDEST_TOURNAMENT_ID = 26
-_DEFAULT_TOURNAMENT_BOUNDARIES = [(1784149947, 27)]
-
-
-def _tournament_boundaries() -> list[tuple[int, int]]:
-    raw = os.environ.get("TOURNAMENT_BOUNDARIES")
-    if not raw:
-        return _DEFAULT_TOURNAMENT_BOUNDARIES
-    out = []
-    for pair in raw.replace(";", ",").split(","):
-        if ":" in pair:
-            ts, tid = pair.split(":", 1)
-            try:
-                out.append((int(ts.strip()), int(tid.strip())))
-            except ValueError:
-                pass
-    return out or _DEFAULT_TOURNAMENT_BOUNDARIES
-
-
-def assign_match_tournaments(session: Session, progress: ProgressFn) -> None:
-    """Deterministically stamps every match with its mixer tournament from
-    the start-time boundaries - the authoritative 'which tournament' answer
-    when tournaments share a dotabuff league. Runs after mixer linking so it
-    also covers matches mixer hasn't listed yet."""
-    session.execute(update(Match).values(mixer_tournament_id=_OLDEST_TOURNAMENT_ID))
-    for ts, tid in sorted(_tournament_boundaries()):  # ascending: later wins
-        session.execute(
-            update(Match).where(Match.start_time.is_not(None), Match.start_time >= ts)
-            .values(mixer_tournament_id=tid)
-        )
-    session.commit()
-    progress("Assigned match tournaments by start-time boundary")
+# PARI Mixer Cup #1 (26) and #2 (27) run CONCURRENTLY - both have games in
+# the same weeks and share dotabuff league 19924 - so a match's tournament
+# can't be decided by time. It's decided by which mixer tournament's
+# completed-games list contains the match (set in link_mixercup_data). We
+# link every tournament we know about each cycle so both get their results.
+# Extra ids can be forced via env MIXER_TOURNAMENT_IDS="26,27".
 
 
 def sync_heroes(session: Session, client: OpenDotaClient | None = None, progress: ProgressFn | None = None) -> None:
@@ -560,22 +528,33 @@ def link_mixercup_data(
             team1_won = result == "WIN1"
             match.radiant_win = team1_won if radiant_team is team1 else not team1_won
 
-        # Team identity (name, mixer_uuid, tournament, roster) is driven ONLY
-        # by the active tournament. A steam_team_id reused across tournaments
-        # (a captain keeping their Dota team) would otherwise have its name
-        # flip to the older tournament's when past linking runs after the
-        # active one - which is exactly how "Team B3SHA" became "Team yuusha".
-        if apply_rosters:
-            for steam_team_id, mixer_team in ((match.radiant_team_id, radiant_team), (match.dire_team_id, dire_team)):
-                if steam_team_id is None:
-                    continue
-                team_row = session.get(Team, steam_team_id)
-                if team_row is not None:
+        for steam_team_id, mixer_team in ((match.radiant_team_id, radiant_team), (match.dire_team_id, dire_team)):
+            if steam_team_id is None:
+                continue
+            team_row = session.get(Team, steam_team_id)
+            if team_row is not None:
+                # Name/uuid: set when THIS tournament owns the team. Active
+                # linking always owns it; past linking only when the team
+                # isn't already claimed by a different (e.g. still-active)
+                # tournament - otherwise a steam_team_id reused across the two
+                # concurrent cups would get renamed to the other cup's name
+                # (how "Team B3SHA" became "Team yuusha").
+                owns = apply_rosters or team_row.tournament_id in (None, tournament_id)
+                if owns:
                     if mixer_team.get("name"):
                         team_row.name = mixer_team["name"]
                     if mixer_team.get("id"):
                         team_row.mixer_uuid = mixer_team["id"]
+                # Active reclaims the team; past claims only if unclaimed, so
+                # a team known only from an old cup still gets a tournament.
+                if apply_rosters:
                     team_row.tournament_id = tournament_id
+                elif team_row.tournament_id is None:
+                    team_row.tournament_id = tournament_id
+            # Rosters (which player is on the team now) are driven ONLY by the
+            # active tournament - a player competing in both cups must not have
+            # their team flip-flop each cycle.
+            if apply_rosters:
                 _apply_confirmed_roster(session, steam_team_id, mixer_team)
         linked += 1
 
@@ -1041,34 +1020,39 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
             mixer_tournament_id = None
 
         if mixer_tournament_id is not None:
+            # Link the ACTIVE tournament fully (rosters, team identity), then
+            # every OTHER tournament we know about for results only. #1 and #2
+            # run concurrently, so both must be linked to show W/L - and we
+            # gather the id set from teams, matches AND an env override so a
+            # tournament is never missed just because its teams lost their
+            # tournament_id.
             link_mixercup_data(session, mixer_client, mixer_tournament_id, progress)
             sync_mixer_teams(session, mixer_client, mixer_tournament_id, progress)
             sync_substitution_history(session, mixer_client, mixer_tournament_id, progress)
             sync_queue_snapshot(session, mixer_client, mixer_tournament_id, progress)
 
-            # Past tournaments still in the DB: re-link results only (radiant_win
-            # + team names) so their match pages show W/L. Steam re-fetches
-            # matches with no result, and the active-tournament link above only
-            # covers the current tournament's games.
-            past_ids = [
+            other_ids = set()
+            other_ids.update(
                 t for (t,) in session.execute(
-                    select(Team.tournament_id)
-                    .where(Team.tournament_id.is_not(None), Team.tournament_id != mixer_tournament_id)
-                    .distinct()
+                    select(Team.tournament_id).where(Team.tournament_id.is_not(None)).distinct()
                 )
-            ]
-            for pid in past_ids:
+            )
+            other_ids.update(
+                t for (t,) in session.execute(
+                    select(Match.mixer_tournament_id).where(Match.mixer_tournament_id.is_not(None)).distinct()
+                )
+            )
+            for raw in os.environ.get("MIXER_TOURNAMENT_IDS", "").replace(";", ",").split(","):
+                try:
+                    other_ids.add(int(raw.strip()))
+                except ValueError:
+                    pass
+            other_ids.discard(mixer_tournament_id)
+            for pid in sorted(other_ids):
                 link_mixercup_data(session, mixer_client, pid, progress, apply_rosters=False)
 
             # The user only wants the ACTIVE tournament's substitution history.
-            # Drop events belonging to past-tournament teams (they came back via
-            # the state-backup restore); the backup endpoint no longer dumps
-            # them, so this self-heals within a cycle or two.
             _purge_past_tournament_subs(session, mixer_tournament_id, progress)
-
-        # Authoritative, deterministic tournament stamp on every match (covers
-        # matches mixer hasn't listed yet, and overrides linking).
-        assign_match_tournaments(session, progress)
 
         apply_manual_roster_overrides(session, progress)
         session.commit()

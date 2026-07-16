@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -158,13 +159,18 @@ def resolve_team_names(
     steam_client: SteamClient | None,
     team_ids: set[int],
     progress: ProgressFn,
+    time_budget: int | None = None,
 ) -> dict[int, str | None]:
     """Small/amateur teams are often missing from OpenDota's team index, so
     try Valve's own GetTeamInfo (via Steam) first and fall back to OpenDota."""
     names: dict[int, str | None] = {}
+    deadline = None if time_budget is None else time.monotonic() + time_budget
     for team_id in team_ids:
         if not team_id:
             continue
+        if deadline is not None and time.monotonic() > deadline:
+            progress("Team-name resolution: time budget spent; rest follows next run.")
+            break
 
         name = None
         if steam_client is not None:
@@ -304,7 +310,7 @@ def sync_draft_data(
     client: OpenDotaClient,
     steam_client: SteamClient | None,
     progress: ProgressFn,
-    limit: int | None = None,
+    time_budget: int | None = None,
 ) -> None:
     """Backfills picks/bans for matches that don't have any draft rows yet.
     Steam's GetMatchDetails is the primary source (generous rate limits,
@@ -327,9 +333,6 @@ def sync_draft_data(
     missing = [m for m in all_match_ids if m not in has_draft]
     if not missing:
         return
-    if limit is not None and len(missing) > limit:
-        progress(f"Drafts missing for {len(missing)} match(es); fetching {limit} this run, rest follows next cycle")
-        missing = missing[:limit]
 
     # Valve's GetMatchDetails 500s for private-lobby games (which is what
     # this mixer tournament is played in) even though GetMatchHistory lists
@@ -351,9 +354,13 @@ def sync_draft_data(
         return client.get_match(match_id)
 
     progress(f"Fetching picks/bans for {len(missing)} match(es)...")
+    deadline = None if time_budget is None else time.monotonic() + time_budget
     fetched_empty = 0
     consecutive_failures = 0
     for i, match_id in enumerate(missing, start=1):
+        if deadline is not None and time.monotonic() > deadline:
+            progress(f"Draft backfill: time budget spent; {len(missing) - i + 1} match(es) left for the next run")
+            break
         try:
             detail = fetch_detail(match_id)
             consecutive_failures = 0
@@ -381,15 +388,24 @@ def sync_draft_data(
         progress(f"{fetched_empty} match(es) had no draft data (not captain's mode, or not parsed by OpenDota)")
 
 
-def enrich_missing_player_names(session: Session, client: OpenDotaClient, progress: ProgressFn) -> None:
+def enrich_missing_player_names(session: Session, client: OpenDotaClient, progress: ProgressFn,
+                                time_budget: int | None = None) -> None:
     """Steam's GetMatchHistory doesn't include nicknames, only account_id.
     Fill those in from OpenDota's player profile endpoint (best-effort)."""
     missing = session.execute(select(Player).where(Player.name.is_(None))).scalars().all()
     if not missing:
         return
     progress(f"Resolving nicknames for {len(missing)} player(s) without a known name...")
+    # Bounded like the other OpenDota phases: this is the last thing standing
+    # between the draft backfill and the final publish, so letting it run long
+    # risks the whole run being killed as wedged - taking this run's drafts,
+    # which are only published at that final step, down with it.
+    deadline = None if time_budget is None else time.monotonic() + time_budget
     consecutive_failures = 0
     for player in missing:
+        if deadline is not None and time.monotonic() > deadline:
+            progress("Nickname enrichment: time budget spent; rest follows next run.")
+            break
         try:
             info = client.get_player(player.account_id)
             consecutive_failures = 0
@@ -412,13 +428,15 @@ def enrich_missing_team_names(
     od_client: OpenDotaClient,
     steam_client: SteamClient | None,
     progress: ProgressFn,
+    time_budget: int | None = None,
 ) -> None:
     missing = session.execute(select(Team).where(Team.name.is_(None))).scalars().all()
     if not missing:
         return
     progress(f"Resolving names for {len(missing)} team(s) without a known name...")
     team_ids = {t.team_id for t in missing}
-    names = resolve_team_names(od_client, steam_client, team_ids, progress)
+    names = resolve_team_names(od_client, steam_client, team_ids, progress,
+                               time_budget=time_budget)
     for team in missing:
         name = names.get(team.team_id)
         if name:
@@ -1021,19 +1039,23 @@ def _resolve_all_tournament_ids(session: Session, active_id: int | None) -> list
     return sorted(ids)
 
 
-# How many NEW matches one run may fetch. Each costs an OpenDota call (~1.2s
-# apart), so an uncapped first build after a redeploy - which starts from an
-# empty disk and has ~300 matches to pull - would run for many minutes. That
-# matters because the caller treats a long run as wedged and starts another
-# collector alongside it, and two collectors on Render's free instance thrash
-# the box until the site itself stops responding. Capping keeps every run to
-# ~2 min; the rest backfills over the next few cycles (they run every ~10 min).
-SEED_MAX_MATCHES_PER_RUN = int(os.environ.get("SEED_MAX_MATCHES_PER_RUN", "60"))
-
-# Same idea for the draft backfill, which also costs one OpenDota call per
-# match. Only matches seeded before drafts were stored inline need this, so
-# the backlog is finite and drains over a few cycles.
-DRAFT_MAX_MATCHES_PER_RUN = int(os.environ.get("DRAFT_MAX_MATCHES_PER_RUN", "40"))
+# Budget the two expensive, OpenDota-bound phases by WALL CLOCK, not by a
+# match count. The count has to be guessed against an unknown per-call latency
+# (~1.2s at best, far worse when the shared IP is being throttled), so it is
+# either too small - a 60-match cap left ~300 matches needing five runs, and
+# runs are rare: the free instance sleeps after ~15 min idle and the GitHub
+# keep-alive is throttled to once every few HOURS, so the backfill dragged on
+# for days - or too big, running past the caller's "this run is wedged"
+# threshold, which used to stack a second collector on the box and take the
+# site down with it. A deadline gets both right: grab as much as fits, promote
+# what we got, continue next run (builds are seeded from the live DB, so
+# progress accumulates).
+SEED_TIME_BUDGET_SECONDS = int(os.environ.get("SEED_TIME_BUDGET_SECONDS", "300"))
+DRAFT_TIME_BUDGET_SECONDS = int(os.environ.get("DRAFT_TIME_BUDGET_SECONDS", "180"))
+# The cosmetic name lookups run after the draft backfill but before the final
+# publish, so they get a small budget too - the whole run must stay under the
+# caller's 15-min wedged threshold or this run's drafts never get published.
+ENRICH_TIME_BUDGET_SECONDS = int(os.environ.get("ENRICH_TIME_BUDGET_SECONDS", "60"))
 
 
 def seed_matches_from_mixer(
@@ -1043,7 +1065,7 @@ def seed_matches_from_mixer(
     league_id: int,
     tournament_ids: list[int],
     progress: ProgressFn,
-    limit: int | None = None,
+    time_budget: int | None = None,
 ) -> int:
     """Discover matches from mixer-cup and pull each one's details from
     OpenDota. This is now the ONLY way matches are found: Valve's
@@ -1080,15 +1102,15 @@ def seed_matches_from_mixer(
         return 0
 
     total_missing = len(missing)
-    if limit is not None and total_missing > limit:
-        missing = missing[:limit]
-        progress(f"MixerCup match seed: {total_missing} match(es) missing; fetching {limit} this run, rest follows next cycle")
-    else:
-        progress(f"MixerCup match seed: {total_missing} new match(es) to fetch from OpenDota")
+    progress(f"MixerCup match seed: {total_missing} new match(es) to fetch from OpenDota")
 
+    deadline = None if time_budget is None else time.monotonic() + time_budget
     added = 0
     consecutive_errors = 0
     for i, match_id in enumerate(missing, start=1):
+        if deadline is not None and time.monotonic() > deadline:
+            progress(f"MixerCup match seed: time budget spent; {total_missing - i + 1} match(es) left for the next run")
+            break
         try:
             detail = od_client.get_match(match_id)
             consecutive_errors = 0
@@ -1201,7 +1223,7 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
                 session, mixer_client, od_client,
                 league_ids[0] if league_ids else DEFAULT_LEAGUE_ID,
                 all_tournament_ids, progress,
-                limit=SEED_MAX_MATCHES_PER_RUN,
+                time_budget=SEED_TIME_BUDGET_SECONDS,
             )
 
             # Link the ACTIVE tournament fully (rosters, team identity), then
@@ -1256,9 +1278,11 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
         # sit behind the cosmetic ones.
         for step_name, step in (
             ("draft sync", lambda: sync_draft_data(session, od_client, steam_client, progress,
-                                                   limit=DRAFT_MAX_MATCHES_PER_RUN)),
-            ("player name enrichment", lambda: enrich_missing_player_names(session, od_client, progress)),
-            ("team name enrichment", lambda: enrich_missing_team_names(session, od_client, steam_client, progress)),
+                                                   time_budget=DRAFT_TIME_BUDGET_SECONDS)),
+            ("player name enrichment", lambda: enrich_missing_player_names(
+                session, od_client, progress, time_budget=ENRICH_TIME_BUDGET_SECONDS)),
+            ("team name enrichment", lambda: enrich_missing_team_names(
+                session, od_client, steam_client, progress, time_budget=ENRICH_TIME_BUDGET_SECONDS)),
         ):
             try:
                 step()

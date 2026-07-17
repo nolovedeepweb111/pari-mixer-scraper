@@ -361,7 +361,12 @@ async function loadPlayerPage(accountId) {
           .map((h) => {
             const wr = h.win_rate == null ? "" : ` — ${h.win_rate}%`;
             const cls = h.win_rate == null ? "tag-neutral" : (h.win_rate >= 50 ? "tag-pick" : "tag-ban");
-            return `<span class="tag ${cls}">${h.name} ×${h.games}${wr}</span>`;
+            // onerror strips the icon rather than leaving a broken-image glyph:
+            // it's Valve's CDN, so it can fail where the site still works.
+            const icon = h.icon
+              ? `<img class="hero-icon" src="${h.icon}" alt="" loading="lazy" onerror="this.remove()">`
+              : "";
+            return `<span class="tag tag-hero ${cls}">${icon}<span>${h.name} ×${h.games}${wr}</span></span>`;
           })
           .join("")
       : '<span class="hint">нет сыгранных матчей</span>';

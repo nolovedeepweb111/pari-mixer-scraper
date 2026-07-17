@@ -519,6 +519,21 @@ def _resolve_mixer_tournament_id() -> int | None:
     return _mixer_tournament_id_cache
 
 
+# Valve's own hero icons. The slug is the hero's INTERNAL name minus the
+# prefix, which is not the display name - several are historical (Shadow Fiend
+# is "nevermore", Timbersaw "shredder", Zeus "zuus"), so it must come from
+# Hero.name rather than be derived from what we show. All 127 verified to
+# return an image. ~5KB each, and reachable from Russia - unlike the Google
+# Fonts CDN, which is blocked and must stay out of this site.
+_HERO_ICON_BASE = "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes/icons"
+
+
+def _hero_icon_url(hero_key: str | None) -> str | None:
+    if not hero_key:
+        return None
+    return f"{_HERO_ICON_BASE}/{hero_key.replace('npc_dota_hero_', '')}.png"
+
+
 def _tournament_label(mixer_tournament_id: int | None, league_id: int | None) -> str:
     """Best display name for the tournament a match belongs to: the live name
     of the active tournament, then the configured mixer-id map, then the
@@ -884,7 +899,7 @@ def api_player_detail(account_id: int):
         won = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
         hero_rows = session.execute(
             select(
-                Match.mixer_tournament_id, Hero.localized_name,
+                Match.mixer_tournament_id, Hero.localized_name, Hero.name,
                 func.count(), func.sum(decided), func.sum(won),
             )
             .join(MatchPlayer, MatchPlayer.hero_id == Hero.hero_id)
@@ -931,9 +946,10 @@ def api_player_detail(account_id: int):
 
     # Hero pool split per tournament (the two mixer cups run concurrently).
     pools_by_tid: dict[int | None, list] = {}
-    for mixer_tid, hero_name, games, decided_games, wins in hero_rows:
+    for mixer_tid, hero_name, hero_key, games, decided_games, wins in hero_rows:
         pools_by_tid.setdefault(mixer_tid, []).append({
             "name": hero_name,
+            "icon": _hero_icon_url(hero_key),
             "games": games,
             "win_rate": round(100 * wins / decided_games) if decided_games else None,
         })

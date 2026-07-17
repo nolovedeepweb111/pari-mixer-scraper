@@ -650,6 +650,26 @@ aside h2 {
   font-size: 13px;
 }
 
+/* Hero pills carry Valve's icon. inline-flex (not inline-block) so the icon
+   and label centre against each other whatever the font metrics do. */
+.tag-hero {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 4px;
+}
+
+.hero-icon {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  object-fit: cover;
+  /* Valve's icons are transparent PNGs drawn for a dark background; the disc
+     keeps every hero the same silhouette regardless of their artwork. */
+  background: rgba(0, 0, 0, 0.35);
+  flex-shrink: 0;
+}
+
 .tag-neutral {
   background: rgba(207, 212, 218, 0.12);
   color: var(--text);

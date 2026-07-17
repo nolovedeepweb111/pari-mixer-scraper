@@ -41,6 +41,18 @@ query ActiveTournament {
 }
 """
 
+_TOURNAMENTS_QUERY = """
+query Tournaments($first: Int) {
+    tournaments(first: $first) {
+        items {
+            id
+            name
+            status
+        }
+    }
+}
+"""
+
 _TEAMS_QUERY = """
 query Teams($filters: TeamFilterInput!, $first: Int, $offset: Int) {
     teams(first: $first, offset: $offset, filters: $filters) {
@@ -146,6 +158,22 @@ class MixerCupClient:
     def get_active_tournament(self) -> dict | None:
         data = self._post(_ACTIVE_TOURNAMENT_QUERY)
         return data.get("activeTournament")
+
+    def list_tournaments(self, first: int = 20) -> list[dict]:
+        """Every tournament mixer-cup knows, newest id first: {id, name,
+        status}. status is ACTIVE / COMPLETE / REDUCTION (a cup still forming).
+
+        This is the only non-circular way to learn that a PAST cup exists.
+        Our own database can't tell us after the disk is wiped: teams all end
+        up owned by the active cup (it reclaims every reused Steam id), and a
+        freshly fetched match carries no tournament yet - that gets stamped BY
+        linking the very cup we'd be trying to discover."""
+        data = self._post(_TOURNAMENTS_QUERY, {"first": first})
+        items = (data.get("tournaments") or {}).get("items") or []
+        return sorted(
+            (t for t in items if t.get("id") is not None),
+            key=lambda t: t["id"], reverse=True,
+        )
 
     def iter_teams(self, tournament_id: int, page_size: int = 50):
         offset = 0

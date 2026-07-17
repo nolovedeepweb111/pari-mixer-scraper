@@ -1036,10 +1036,32 @@ def apply_manual_roster_overrides(session: Session, progress: ProgressFn) -> Non
         progress(f"Applied {applied} manual roster override(s)")
 
 
-def _resolve_all_tournament_ids(session: Session, active_id: int | None) -> list[int]:
-    """Every mixer tournament we should touch: the active one, any forced via
-    env MIXER_TOURNAMENT_IDS, plus any already recorded on teams/matches - so
-    a past cup keeps getting refreshed even after a redeploy wipes the disk."""
+# How many finished cups (besides the active one) to keep linking. Linking a
+# cup we have no matches for is nearly free - its games just don't resolve to
+# anything - so this only needs to be big enough to cover cups still on the
+# site, not tuned precisely.
+_MIXER_PAST_TOURNAMENTS = int(os.environ.get("MIXER_PAST_TOURNAMENTS", "2"))
+
+
+def _resolve_all_tournament_ids(
+    session: Session,
+    active_id: int | None,
+    mixer_client: MixerCupClient | None = None,
+    progress: ProgressFn | None = None,
+) -> list[int]:
+    """Every mixer tournament we should link this run.
+
+    Asking mixer-cup for its tournament list is the important part, because
+    our own database CANNOT reveal a past cup once the disk has been wiped:
+    every team ends up owned by the active cup (it reclaims each reused Steam
+    id), and a freshly fetched match has no tournament stamped on it yet -
+    that stamp is applied BY linking the cup we're trying to find. Relying on
+    our own rows made that circular, so on a fresh disk only the active cup
+    was ever linked and the previous cup's matches kept their results hidden
+    ("?") forever - the site's own bug report.
+
+    Everything else here is additive belt-and-braces: the active id, an env
+    override, and any cup our existing rows already mention."""
     ids: set[int] = set()
     if active_id is not None:
         ids.add(active_id)
@@ -1058,6 +1080,21 @@ def _resolve_all_tournament_ids(session: Session, active_id: int | None) -> list
             select(Match.mixer_tournament_id).where(Match.mixer_tournament_id.is_not(None)).distinct()
         )
     )
+
+    if mixer_client is not None:
+        try:
+            listed = mixer_client.list_tournaments()
+            recent = [t["id"] for t in listed if t["id"] != active_id][:_MIXER_PAST_TOURNAMENTS]
+            ids.update(recent)
+            if progress is not None and recent:
+                names = ", ".join(
+                    f"{t['id']} ({t['name']})" for t in listed if t["id"] in set(recent)
+                )
+                progress(f"MixerCup also linking recent tournament(s): {names}")
+        except Exception as e:
+            if progress is not None:
+                progress(f"Could not list MixerCup tournaments ({e}); linking only what we already know.")
+
     return sorted(ids)
 
 
@@ -1239,7 +1276,8 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
             # must be touched. Gather the full id set (active + env override +
             # whatever teams/matches already carry) once, and use it both to
             # seed matches and to link every tournament for results.
-            all_tournament_ids = _resolve_all_tournament_ids(session, mixer_tournament_id)
+            all_tournament_ids = _resolve_all_tournament_ids(
+                session, mixer_tournament_id, mixer_client, progress)
 
             # Backstop for matches Steam's league history didn't list. Must
             # run BEFORE linking, which only updates matches that already exist.

@@ -11,3 +11,8 @@ gh_cli/
 repro.db
 repro.db-shm
 repro.db-wal
+rev.db
+full.db
+cap_test.db
+draft_test.db
+budget_test.db

@@ -263,16 +263,36 @@ def _start_collect_background(force: bool = False) -> bool:
     return True
 
 
+# How long a cold start gets to serve pages before the collector may start.
+# A cold start is already the worst moment for a visitor: the free tier only
+# wakes on a request, so someone is always waiting on it. Spawning the
+# collector at import time put a second process on a 0.1-CPU instance while
+# gunicorn was still rendering that person's first page - a wake measured at
+# ~122s. The data isn't lost by waiting: nothing can display until the
+# collection finishes anyway, so the page may as well arrive first.
+_AUTO_COLLECT_DELAY_SECONDS = int(os.environ.get("AUTO_COLLECT_DELAY_SECONDS", "45"))
+
+
 def _auto_collect_if_empty() -> None:
     """Free hosting tiers (e.g. Render's free web service) reset the local
     filesystem on every cold start, wiping tournament.db. Rather than
     showing an empty site until someone notices and clicks "Обновить
     матчи", kick off a collection automatically whenever the database has
-    no teams yet - self-healing after a reset, harmless no-op otherwise."""
-    with Session(engine) as session:
-        has_teams = session.execute(select(Team.team_id).limit(1)).first()
-    if not has_teams:
-        _start_collect_background()
+    no teams yet - self-healing after a reset, harmless no-op otherwise.
+
+    Deferred by _AUTO_COLLECT_DELAY_SECONDS so the visitor whose request
+    woke the instance gets served before the collector competes for the CPU."""
+    def _later() -> None:
+        time.sleep(_AUTO_COLLECT_DELAY_SECONDS)
+        try:
+            with Session(engine) as session:
+                has_teams = session.execute(select(Team.team_id).limit(1)).first()
+            if not has_teams:
+                _start_collect_background()
+        except Exception as e:
+            _append_log(f"Auto-collect on empty DB failed: {e}")
+
+    threading.Thread(target=_later, daemon=True).start()
 
 
 def _collect_scheduler_loop(interval_seconds: int) -> None:

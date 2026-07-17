@@ -417,13 +417,17 @@ async function loadPlayerPage(accountId) {
     <h2>${p.name}<span class="profile-links">${profileLinks(p.account_id)}</span></h2>
     <p class="player-meta">${formatMmr(p.mmr)} MMR${rolesLine}</p>
     <p class="next-opponent">${teamLine}</p>
-    ${heroPoolsHtml}
-    <h3 class="history-title">История матчей</h3>
-    ${p.matches.length ? `
-      <table class="subs-table">
-        <thead><tr><th>Дата</th><th>Герой</th><th>Результат</th><th>За команду</th><th>Соперник</th></tr></thead>
-        <tbody>${matchRows}</tbody>
-      </table>` : '<p class="hint">Матчей пока нет.</p>'}
+    <div class="player-body">
+      <div class="player-history">
+        <h3 class="history-title">История матчей</h3>
+        ${p.matches.length ? `
+          <table class="subs-table">
+            <thead><tr><th>Дата</th><th>Герой</th><th>Результат</th><th>За команду</th><th>Соперник</th></tr></thead>
+            <tbody>${matchRows}</tbody>
+          </table>` : '<p class="hint">Матчей пока нет.</p>'}
+      </div>
+      <aside class="player-pools">${heroPoolsHtml}</aside>
+    </div>
   `;
 
   for (const link of detailEl.querySelectorAll(".opponent-link")) {

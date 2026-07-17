@@ -246,9 +246,40 @@ aside h2 {
   vertical-align: middle;
 }
 
+/* Match history (wide, the main thing) with the hero pools as a narrow
+   column beside it. align-items:start keeps the pools their own height
+   instead of stretching to the full length of the history table. */
+.player-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 16px;
+  align-items: start;
+}
+
+/* The pools stack vertically, one block per tournament. Sticky because the
+   history is long: the pool stays in view while scrolling through it. */
+.player-pools {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  position: sticky;
+  top: 16px;
+}
+
+/* Below this the side column is too narrow for the tags to read well, so
+   the pools go back to full width above the history. */
+@media (max-width: 900px) {
+  .player-body {
+    grid-template-columns: 1fr;
+  }
+  .player-pools {
+    position: static;
+    order: -1;
+  }
+}
+
 .player-heroes-block {
-  max-width: 900px;
-  margin-top: 8px;
+  margin-top: 0;
 }
 
 .history-title {
@@ -258,6 +289,12 @@ aside h2 {
   letter-spacing: 0.05em;
   margin: 24px 0 4px;
   font-weight: 600;
+}
+
+/* Inside the two-column body its usual top margin would push the history
+   down and leave the pools column starting higher than it. */
+.player-history .history-title {
+  margin-top: 0;
 }
 
 .tournament-divider td {

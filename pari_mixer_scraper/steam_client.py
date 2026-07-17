@@ -73,20 +73,13 @@ class SteamClient:
                 return
             start_at_match_id = matches[-1]["match_id"] - 1
 
-    def get_team_info(self, team_id: int) -> dict | None:
-        result = self._get("GetTeamInfo", "v1", {"team_id": team_id})
-        teams = result.get("teams", [])
-        return teams[0] if teams else None
-
-    def get_match_details(self, match_id: int) -> dict:
-        """Full match detail - unlike GetMatchHistory, this includes
-        picks_bans for captain's-mode games (the same structure OpenDota
-        exposes; OpenDota sources it from here). Valve reports failures as
-        {"error": ...} with HTTP 200, so surface those as exceptions."""
-        result = self._get("GetMatchDetails", "v1", {"match_id": match_id})
-        if result.get("error"):
-            raise RuntimeError(f"GetMatchDetails: {result['error']}")
-        return result
+    # GetMatchHistory is all this league can use from Steam. Both of the other
+    # endpoints we tried are dead ends here, each verified with a valid key:
+    #   GetMatchDetails - 500 for every match. These are private-lobby games;
+    #     GetMatchHistory lists them fine but GetMatchDetails won't serve them,
+    #     so drafts have to come from OpenDota.
+    #   GetTeamInfo - 404 for every team id. They're pickup teams, not
+    #     registered orgs; mixer-cup is where their names come from.
 
 
 def normalize_match(m: dict) -> dict:

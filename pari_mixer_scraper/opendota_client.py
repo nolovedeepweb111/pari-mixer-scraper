@@ -56,23 +56,19 @@ class OpenDotaClient:
 
         resp.raise_for_status()
 
-    def get_league(self, league_id: int):
-        return self._get(f"/leagues/{league_id}")
-
-    def get_league_matches(self, league_id: int):
-        return self._get(f"/leagues/{league_id}/matches")
+    # Only the endpoints this project actually uses. Removed, and why:
+    #   /leagues/{id}/matches - empty for our league (tier "excluded", so
+    #     OpenDota never ingests its matches); mixer-cup enumerates instead.
+    #   /teams/{id}           - answers 200 with an EMPTY body for these
+    #     teams, for the same reason; mixer-cup is the source of team names.
+    #   /proPlayers           - ~4.4MB per call to match ~2 in 10 of this
+    #     tournament's players; mixer-cup rosters give us the names for free.
 
     def get_match(self, match_id: int):
         return self._get(f"/matches/{match_id}")
 
     def get_heroes(self):
         return self._get("/heroes")
-
-    def get_pro_players(self):
-        return self._get("/proPlayers")
-
-    def get_team(self, team_id: int):
-        return self._get(f"/teams/{team_id}")
 
     def get_player(self, account_id: int):
         return self._get(f"/players/{account_id}")

@@ -75,21 +75,6 @@ def sync_heroes(session: Session, client: OpenDotaClient | None = None, progress
     progress("  Hero sync done.")
 
 
-def fetch_pro_player_directory(client: OpenDotaClient) -> dict[int, dict]:
-    """account_id -> {name, team_id} for known pro players, used to fill in
-    a cleaner nickname than the personaname on an individual match."""
-    directory: dict[int, dict] = {}
-    for p in client.get_pro_players():
-        account_id = p.get("account_id")
-        if account_id is None:
-            continue
-        directory[account_id] = {
-            "name": p.get("name") or p.get("personaname"),
-            "team_id": p.get("team_id"),
-        }
-    return directory
-
-
 def normalize_opendota_match(detail: dict) -> dict:
     players = []
     for p in detail.get("players", []):
@@ -121,15 +106,17 @@ def normalize_opendota_match(detail: dict) -> dict:
 
 def fetch_all_league_matches(
     league_id: int,
-    od_client: OpenDotaClient,
     steam_client: SteamClient | None,
     progress: ProgressFn,
 ) -> list[dict]:
-    """Combines Valve's own match history (via Steam Web API, when a key is
-    configured) with OpenDota's league index, deduped by match_id. Steam is
-    the authoritative source and is cheap (one call covers up to 100
-    matches); OpenDota is used to fill in anything Steam's league_id tagging
-    missed, at the cost of one detail request per match."""
+    """Valve's own match history for the league (via Steam Web API), which is
+    cheap: one call covers up to 100 matches.
+
+    OpenDota's league index used to be merged in here as a second source, but
+    it is dead weight for this league: /leagues/19924/matches returns an empty
+    list because the league is tier 'excluded', so OpenDota never ingests its
+    matches. Anything Steam misses is picked up by seed_matches_from_mixer,
+    which enumerates from mixer-cup instead."""
     matches_by_id: dict[int, dict] = {}
 
     if steam_client is not None:
@@ -153,58 +140,18 @@ def fetch_all_league_matches(
                     "Falling back to the (much slower, rate-limited) per-match OpenDota path."
                 )
             else:
-                progress(f"Steam API fetch failed ({e}), continuing with OpenDota only")
-
-    try:
-        od_list = od_client.get_league_matches(league_id)
-    except Exception as e:
-        progress(f"OpenDota league-matches fetch failed: {e}")
-        od_list = []
-
-    missing_ids = [m["match_id"] for m in od_list if m["match_id"] not in matches_by_id]
-    for match_id in missing_ids:
-        detail = od_client.get_match(match_id)
-        matches_by_id[match_id] = normalize_opendota_match(detail)
+                progress(f"Steam API fetch failed ({e}), continuing without a Steam match list")
 
     return list(matches_by_id.values())
 
 
-def resolve_team_names(
-    od_client: OpenDotaClient,
-    steam_client: SteamClient | None,
-    team_ids: set[int],
-    progress: ProgressFn,
-    time_budget: int | None = None,
-) -> dict[int, str | None]:
-    """Small/amateur teams are often missing from OpenDota's team index, so
-    try Valve's own GetTeamInfo (via Steam) first and fall back to OpenDota."""
-    names: dict[int, str | None] = {}
-    deadline = None if time_budget is None else time.monotonic() + time_budget
-    for team_id in team_ids:
-        if not team_id:
-            continue
-        if deadline is not None and time.monotonic() > deadline:
-            progress("Team-name resolution: time budget spent; rest follows next run.")
-            break
-
-        name = None
-        if steam_client is not None:
-            try:
-                info = steam_client.get_team_info(team_id)
-                if info:
-                    name = info.get("name")
-            except Exception as e:
-                progress(f"Steam GetTeamInfo failed for team_id={team_id}: {e}")
-
-        if not name:
-            try:
-                info = od_client.get_team(team_id)
-                name = info.get("name")
-            except Exception:
-                pass
-
-        names[team_id] = name
-    return names
+# resolve_team_names() lived here. Removed: NEITHER source can name this
+# league's ad-hoc teams. Verified with a valid Steam key - GetTeamInfo 404s
+# for every one of them (they're pickup teams, not registered orgs), and
+# OpenDota's /teams/{id} answers 200 with an empty body (it only indexes
+# leagues it ingests, and this one is tier "excluded"). mixer-cup rosters are
+# the only real source of team names, and link_mixercup_data already applies
+# them. A team still showing as "Team 12345678" is one mixer never listed.
 
 
 def upsert_team(session: Session, team_id: int | None, name: str | None) -> None:
@@ -222,23 +169,19 @@ def upsert_player(
     account_id: int | None,
     fallback_name: str | None,
     team_id: int | None,
-    pro_directory: dict[int, dict],
 ) -> None:
     if account_id is None:
         return
-    pro_info = pro_directory.get(account_id, {})
-    resolved_name = pro_info.get("name") or fallback_name
-    # team_id always comes from the match actually being processed, never
-    # from OpenDota's pro_directory: that field is the player's real-world
-    # pro team, which is unrelated to (and can silently override) which
-    # mixer-cup team_id they played under in this tournament.
-
+    # team_id always comes from the match actually being processed. It must
+    # never come from a player's "current team" in some external directory:
+    # that is unrelated to (and would silently override) the mixer-cup team
+    # they played this match under.
     player = session.get(Player, account_id)
     if player is None:
-        session.add(Player(account_id=account_id, name=resolved_name, team_id=team_id))
+        session.add(Player(account_id=account_id, name=fallback_name, team_id=team_id))
     else:
-        if resolved_name:
-            player.name = resolved_name
+        if fallback_name:
+            player.name = fallback_name
         if team_id:
             player.team_id = team_id
 
@@ -247,7 +190,6 @@ def persist_match(
     session: Session,
     league_id: int,
     match: dict,
-    pro_directory: dict[int, dict],
     team_names: dict[int, str | None],
 ) -> None:
     # Explicit flush()es at each dependency boundary (teams -> match ->
@@ -281,7 +223,7 @@ def persist_match(
         account_id = p["account_id"]
         is_radiant = bool(p["is_radiant"])
         team_id = radiant_team_id if is_radiant else dire_team_id
-        upsert_player(session, account_id, None, team_id, pro_directory)
+        upsert_player(session, account_id, None, team_id)
         player_rows.append((p, is_radiant, team_id))
     session.flush()
 
@@ -323,7 +265,6 @@ def persist_draft_entries(session: Session, match_id: int, detail: dict) -> bool
 def sync_draft_data(
     session: Session,
     client: OpenDotaClient,
-    steam_client: SteamClient | None,
     progress: ProgressFn,
     time_budget: int | None = None,
 ) -> None:
@@ -349,23 +290,13 @@ def sync_draft_data(
     if not missing:
         return
 
-    # Valve's GetMatchDetails 500s for private-lobby games (which is what
-    # this mixer tournament is played in) even though GetMatchHistory lists
-    # them fine. After a few straight failures, stop trying Steam for the
-    # rest of the run instead of burning a doomed call + log line per match.
-    steam_failures = 0
-
+    # OpenDota is the ONLY source of drafts here. Valve's GetMatchDetails was
+    # tried first for years' worth of comments' sake, but it answers 500 for
+    # every game of this league - they're played in private lobbies, which
+    # GetMatchHistory happily lists but GetMatchDetails refuses (verified on
+    # five of this league's matches with a valid key). It only ever burned
+    # three doomed calls per run before giving up.
     def fetch_detail(match_id: int) -> dict:
-        nonlocal steam_failures
-        if steam_client is not None and steam_failures < 3:
-            try:
-                detail = steam_client.get_match_details(match_id)
-                steam_failures = 0
-                return detail
-            except Exception as e:
-                steam_failures += 1
-                if steam_failures == 3:
-                    progress(f"Steam GetMatchDetails keeps failing ({e}); using OpenDota only for this run.")
         return client.get_match(match_id)
 
     progress(f"Fetching picks/bans for {len(missing)} match(es)...")
@@ -438,27 +369,6 @@ def enrich_missing_player_names(session: Session, client: OpenDotaClient, progre
     session.commit()
 
 
-def enrich_missing_team_names(
-    session: Session,
-    od_client: OpenDotaClient,
-    steam_client: SteamClient | None,
-    progress: ProgressFn,
-    time_budget: int | None = None,
-) -> None:
-    missing = session.execute(select(Team).where(Team.name.is_(None))).scalars().all()
-    if not missing:
-        return
-    progress(f"Resolving names for {len(missing)} team(s) without a known name...")
-    team_ids = {t.team_id for t in missing}
-    names = resolve_team_names(od_client, steam_client, team_ids, progress,
-                               time_budget=time_budget)
-    for team in missing:
-        name = names.get(team.team_id)
-        if name:
-            team.name = name
-    session.commit()
-
-
 def _lineup_account_ids(session: Session, match_id: int, is_radiant: bool) -> set[int]:
     rows = session.execute(
         select(MatchPlayer.account_id)
@@ -509,6 +419,35 @@ def _apply_confirmed_roster(session: Session, steam_team_id: int, mixer_team: di
             player.preferred_roles = roles
 
 
+def _apply_names_only(session: Session, mixer_team: dict) -> int:
+    """Take just the nickname/rating off a mixer roster, for players we
+    already know about.
+
+    Used for PAST tournaments, whose rosters we fetch anyway to link results.
+    Deliberately touches neither team_id nor roster_confirmed: a player who
+    competes in both concurrent cups must keep the ACTIVE cup's team, or their
+    team flip-flops every collection cycle.
+
+    Without this, a #1-only player has no name (only the active cup applies
+    rosters), and the only other source is one OpenDota call PER PLAYER - the
+    exact per-request traffic that gets this host's shared IP rate-limited.
+    The data is already in the GraphQL response we just paid for."""
+    named = 0
+    for mp in mixer_team.get("players", []):
+        account_id = mp.get("account_id")
+        if account_id is None:
+            continue
+        player = session.get(Player, account_id)
+        if player is None:
+            continue
+        if mp.get("nickname") and not player.name:
+            player.name = mp["nickname"]
+            named += 1
+        if mp.get("rating") is not None and player.mmr is None:
+            player.mmr = mp["rating"]
+    return named
+
+
 def _team_mixer_uuid(session: Session, team_id: int | None) -> str | None:
     """The mixer_uuid stored on a steam team row, used to orient a match's
     sides when lineup overlap is inconclusive."""
@@ -551,7 +490,7 @@ def link_mixercup_data(
     progress(f"MixerCup: {len(teams)} teams, {len(games)} completed games with a linked match_id")
 
     teams_by_id = {t["id"]: t for t in teams}
-    linked = ambiguous = skipped = 0
+    linked = ambiguous = skipped = named_from_mixer = 0
 
     for g in games:
         match_id_raw = g.get("matchId")
@@ -632,9 +571,12 @@ def link_mixercup_data(
                     team_row.tournament_id = tournament_id
             # Rosters (which player is on the team now) are driven ONLY by the
             # active tournament - a player competing in both cups must not have
-            # their team flip-flop each cycle.
+            # their team flip-flop each cycle. A past cup still contributes the
+            # one thing that can't hurt: names for players it alone knows.
             if apply_rosters:
                 _apply_confirmed_roster(session, steam_team_id, mixer_team)
+            else:
+                named_from_mixer += _apply_names_only(session, mixer_team)
         linked += 1
 
     if apply_rosters:
@@ -642,6 +584,8 @@ def link_mixercup_data(
 
     session.commit()
     progress(f"MixerCup linking (tournament {tournament_id}): {linked} matches linked, {ambiguous} ambiguous, {skipped} skipped")
+    if named_from_mixer:
+        progress(f"  ...and {named_from_mixer} player name(s) taken from this tournament's rosters (no OpenDota call needed)")
 
 
 # Synthetic Team ids for mixer teams that have no Steam team_id yet (no
@@ -1144,7 +1088,7 @@ def seed_matches_from_mixer(
             continue
         if not detail or detail.get("match_id") is None:
             continue
-        persist_match(session, league_id, normalize_opendota_match(detail), {}, {})
+        persist_match(session, league_id, normalize_opendota_match(detail), {})
         # The detail we just paid for already carries picks_bans - store the
         # draft now rather than let sync_draft_data re-fetch the very same
         # match later. That halves the OpenDota calls per match, which is the
@@ -1193,7 +1137,7 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
         existing_match_ids = {row[0] for row in session.execute(select(Match.match_id))}
         for league_id in league_ids:
             progress(f"Fetching match list for league_id={league_id}...")
-            matches = fetch_all_league_matches(league_id, od_client, steam_client, progress)
+            matches = fetch_all_league_matches(league_id, steam_client, progress)
             new_matches = [m for m in matches if m["match_id"] not in existing_match_ids]
             progress(f"league {league_id}: {len(matches)} matches total, {len(new_matches)} new")
 
@@ -1204,7 +1148,7 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
             # below, which is one cheap GraphQL call.
             for i, m in enumerate(new_matches, start=1):
                 progress(f"[{i}/{len(new_matches)}] Saving match {m['match_id']}")
-                persist_match(session, league_id, m, {}, {})
+                persist_match(session, league_id, m, {})
                 session.commit()
                 existing_match_ids.add(m["match_id"])
                 new_count += 1
@@ -1277,17 +1221,12 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
         # publish - core data collected, then thrown away. Whatever fails
         # today just gets backfilled by a later run (builds are seeded from
         # the live DB, so completed work is never redone).
-        try:
-            progress("Syncing pro player directory...")
-            pro_directory = fetch_pro_player_directory(od_client)
-            for player in session.execute(select(Player).where(Player.name.is_(None))).scalars():
-                pro_info = pro_directory.get(player.account_id)
-                if pro_info and pro_info.get("name"):
-                    player.name = pro_info["name"]
-            session.commit()
-        except Exception as e:
-            session.rollback()
-            progress(f"Pro player directory failed ({e}); skipping this step.")
+        # OpenDota's proPlayers directory used to be downloaded here to give
+        # nicer nicknames. Dropped: it costs a ~4.4MB transfer every run and
+        # matched 2 of 10 sampled players in this tournament (it lists pros,
+        # and a mixer cup is mostly not pros). Both cups' rosters now supply
+        # names straight from the GraphQL responses we already fetch, and the
+        # per-player lookup below covers the stragglers.
 
         # Drafts first: they drive the team analysis cards (first pick, bans),
         # whereas the enrichment steps only polish names. All three share the
@@ -1295,12 +1234,10 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
         # steps are the ones that get skipped - so the draft backfill must not
         # sit behind the cosmetic ones.
         for step_name, step in (
-            ("draft sync", lambda: sync_draft_data(session, od_client, steam_client, progress,
+            ("draft sync", lambda: sync_draft_data(session, od_client, progress,
                                                    time_budget=DRAFT_TIME_BUDGET_SECONDS)),
             ("player name enrichment", lambda: enrich_missing_player_names(
                 session, od_client, progress, time_budget=ENRICH_TIME_BUDGET_SECONDS)),
-            ("team name enrichment", lambda: enrich_missing_team_names(
-                session, od_client, steam_client, progress, time_budget=ENRICH_TIME_BUDGET_SECONDS)),
         ):
             try:
                 step()

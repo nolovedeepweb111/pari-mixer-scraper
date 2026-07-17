@@ -1068,12 +1068,21 @@ def api_tournament_heroes():
 
 @app.get("/api/backup")
 def api_backup():
-    """Dump of the data that exists ONLY in our database and can't be
-    re-fetched from any upstream: substitution events (mixer-cup deletes
-    its own history periodically, and queue positions were only ever known
-    to us) and the substitute-queue snapshot. A GitHub Action commits this
-    to the repo's data-backup branch, and the collector restores it after
-    Render wipes the disk on redeploy (see collect.restore_state_backup)."""
+    """Dump of the data that is either impossible or expensive to re-fetch.
+
+    Impossible: substitution events (mixer-cup deletes its own history
+    periodically, and queue positions were only ever known to us) and the
+    substitute-queue snapshot.
+
+    Expensive: picks/bans. OpenDota serves drafts one match at a time (~300
+    calls, minutes of wall clock) while everything else is re-fetched in
+    seconds, and the disk is wiped on every redeploy AND every cold start
+    after an idle spin-down - so without this the draft backfill restarts from
+    zero and never finishes, leaving the team analysis permanently empty.
+
+    A GitHub Action commits this to the repo's data-backup branch, and the
+    collector restores it after a wipe (see collect.restore_state_backup and
+    collect.restore_draft_backup)."""
     with Session(engine) as session:
         events = session.execute(
             select(SubstitutionEvent).order_by(SubstitutionEvent.event_id)
@@ -1083,6 +1092,22 @@ def api_backup():
         ).scalars().all()
         teams = session.execute(select(Team).order_by(Team.team_id)).scalars().all()
         all_players = session.execute(select(Player).order_by(Player.account_id)).scalars().all()
+        draft_rows = session.execute(
+            select(MatchDraftEntry.match_id, MatchDraftEntry.order_num,
+                   MatchDraftEntry.hero_id, MatchDraftEntry.team_id,
+                   MatchDraftEntry.is_pick)
+            .order_by(MatchDraftEntry.match_id, MatchDraftEntry.order_num)
+        ).all()
+
+    # Grouped per match and written as bare tuples rather than objects with
+    # repeated key names: ~7000 draft rows would otherwise dominate a file
+    # that a GitHub Action rewrites on every run.
+    drafts: dict[str, list] = {}
+    for match_id, order_num, hero_id, team_id, is_pick in draft_rows:
+        drafts.setdefault(str(match_id), []).append(
+            [order_num, hero_id, team_id, 1 if is_pick else 0]
+        )
+
     return jsonify({
         "teams": [
             {
@@ -1116,6 +1141,8 @@ def api_backup():
             }
             for q in queued
         ],
+        # match_id -> [[order, hero_id, team_id, is_pick], ...]
+        "match_drafts": drafts,
         # Access-key -> device bindings, keyed by HMAC(key) so the public
         # backup branch never exposes the keys themselves. Lets device
         # bindings (the anti-sharing state) survive restarts and deploys.

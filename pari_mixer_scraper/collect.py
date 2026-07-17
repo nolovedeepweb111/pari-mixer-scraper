@@ -717,7 +717,48 @@ _DEFAULT_BACKUP_URL = (
 )
 
 
-def restore_state_backup(session: Session, progress: ProgressFn) -> None:
+def restore_draft_backup(session: Session, data: dict | None, progress: ProgressFn) -> None:
+    """Re-import picks/bans saved by the state backup.
+
+    Drafts are the one expensive thing we collect: OpenDota serves them one
+    match at a time (~300 calls, minutes of wall clock), while everything else
+    comes back in seconds - Steam re-lists all matches in one call, mixer-cup
+    hands over teams/rosters/results in a few. Yet this host's disk is wiped
+    on every redeploy AND every cold start after an idle spin-down, so without
+    a backup the draft backfill restarts from zero and never finishes, leaving
+    the team analysis (first pick, bans) permanently empty.
+
+    Must run AFTER matches are stored: draft rows reference match_id."""
+    entries = (data or {}).get("match_drafts") or {}
+    if not entries:
+        return
+    have = {m for (m,) in session.execute(select(MatchDraftEntry.match_id).distinct())}
+    known = {m for (m,) in session.execute(select(Match.match_id))}
+    restored = 0
+    for raw_match_id, rows in entries.items():
+        try:
+            match_id = int(raw_match_id)
+        except (TypeError, ValueError):
+            continue
+        # Skip drafts we already have, and any whose match isn't stored yet -
+        # that one comes back on a later run once the match lands.
+        if match_id in have or match_id not in known:
+            continue
+        for order_num, hero_id, team_id, is_pick in rows:
+            session.add(MatchDraftEntry(
+                match_id=match_id,
+                order_num=order_num,
+                hero_id=hero_id,
+                team_id=team_id,
+                is_pick=bool(is_pick),
+            ))
+        restored += 1
+    if restored:
+        session.commit()
+        progress(f"Draft backup restored: +{restored} match(es) worth of picks/bans (no OpenDota calls needed)")
+
+
+def restore_state_backup(session: Session, progress: ProgressFn) -> dict | None:
     """Re-imports data that only ever existed in our own database after
     Render's ephemeral disk wipes it on redeploy: substitution events
     (mixer-cup deletes its own history periodically, and each event's
@@ -733,16 +774,16 @@ def restore_state_backup(session: Session, progress: ProgressFn) -> None:
 
     url = os.environ.get("BACKUP_RESTORE_URL", _DEFAULT_BACKUP_URL)
     if not url:
-        return
+        return None
     try:
         resp = call_with_timeout(lambda: requests.get(url, timeout=20), timeout=25)
         if resp.status_code == 404:
-            return  # no backup committed yet
+            return None  # no backup committed yet
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         progress(f"State backup fetch failed ({e}); continuing without restore.")
-        return
+        return None
 
     added_events = filled_positions = added_queue = 0
     added_teams = added_players = 0
@@ -836,6 +877,9 @@ def restore_state_backup(session: Session, progress: ProgressFn) -> None:
             f"+{added_events} substitution event(s), {filled_positions} queue position(s) "
             f"filled, +{added_queue} queued player(s)"
         )
+    # Handed back so the caller can restore drafts later - those reference
+    # match_id, which doesn't exist yet at this point in the run.
+    return data
 
 
 def sync_queue_snapshot(
@@ -1128,7 +1172,7 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
     progress("Opening a session...")
     with Session(engine) as session:
         progress("Session open. Restoring state backup if available...")
-        restore_state_backup(session, progress)
+        backup = restore_state_backup(session, progress)
 
         progress("Syncing hero list...")
         sync_heroes(session, od_client, progress)
@@ -1178,8 +1222,7 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
             # seed matches and to link every tournament for results.
             all_tournament_ids = _resolve_all_tournament_ids(session, mixer_tournament_id)
 
-            # Discover + fetch matches from mixer-cup (Steam/OpenDota can no
-            # longer enumerate this league - see seed_matches_from_mixer). Must
+            # Backstop for matches Steam's league history didn't list. Must
             # run BEFORE linking, which only updates matches that already exist.
             seed_matches_from_mixer(
                 session, mixer_client, od_client,
@@ -1202,6 +1245,12 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
 
             # The user only wants the ACTIVE tournament's substitution history.
             _purge_past_tournament_subs(session, mixer_tournament_id, progress)
+
+        # Matches exist now, so saved drafts can be re-attached. Do it before
+        # the core publish: it's a local insert costing no API calls, and it
+        # puts the analysis cards back on the site immediately after a wipe
+        # instead of after several runs of OpenDota backfill.
+        restore_draft_backup(session, backup, progress)
 
         apply_manual_roster_overrides(session, progress)
         session.commit()

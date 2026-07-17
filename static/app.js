@@ -407,7 +407,7 @@ async function loadPlayerPage(accountId) {
       }
       return `
         ${divider}
-        <tr>
+        <tr class="match-row" data-match-id="${m.match_id}" title="Открыть страницу матча">
           <td class="subs-date">${when}</td>
           <td>${m.hero}</td>
           <td>${result}</td>
@@ -438,7 +438,184 @@ async function loadPlayerPage(accountId) {
   for (const link of detailEl.querySelectorAll(".opponent-link")) {
     link.addEventListener("click", () => loadTeamDetail(Number(link.dataset.teamId)));
   }
+  for (const row of detailEl.querySelectorAll(".match-row")) {
+    row.addEventListener("click", (e) => {
+      // The team button inside the row keeps its own action.
+      if (e.target.closest(".opponent-link")) return;
+      loadMatchPage(Number(row.dataset.matchId), accountId);
+    });
+  }
 }
+
+function lineupTable(side, winnerSide, side_key) {
+  const winBadge = winnerSide == null
+    ? ""
+    : (winnerSide === side_key
+        ? ' <span class="match-result result-win">Победа</span>'
+        : ' <span class="match-result result-loss">Поражение</span>');
+  const hasKda = side.players.some((pl) => pl.kills != null);
+  const rows = side.players
+    .map((pl) => `
+      <tr>
+        <td class="lineup-hero"><img class="hero-icon" src="${heroIconUrl(pl.hero_icon)}" alt="" loading="lazy" onerror="this.remove()">${pl.hero}</td>
+        <td><button class="player-link" data-account-id="${pl.account_id}">${pl.name}</button></td>
+        ${hasKda ? `<td class="lineup-kda">${pl.kills ?? "—"}/${pl.deaths ?? "—"}/${pl.assists ?? "—"}</td>` : ""}
+      </tr>
+    `)
+    .join("");
+  return `
+    <div class="lineup-block">
+      <h4>${side.name}${winBadge}</h4>
+      <table class="subs-table lineup-table">
+        <thead><tr><th>Герой</th><th>Игрок</th>${hasKda ? "<th>K/D/A</th>" : ""}</tr></thead>
+        <tbody>${rows || '<tr><td colspan="3" class="hint">состав неизвестен</td></tr>'}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function loadMatchPage(matchId, backAccountId) {
+  detailEl.innerHTML = '<p class="hint">Загружаю матч...</p>';
+  const res = await fetch(`/api/matches/${matchId}`);
+  if (!res.ok) {
+    detailEl.innerHTML = '<p class="hint">Матч не найден.</p>';
+    return;
+  }
+  const m = await res.json();
+
+  const when = m.start_time
+    ? new Date(m.start_time * 1000).toLocaleString("ru-RU", { dateStyle: "long", timeStyle: "short" })
+    : "";
+  const durLine = m.duration
+    ? ` · ${Math.floor(m.duration / 60)}:${String(m.duration % 60).padStart(2, "0")}`
+    : "";
+  const winnerSide = m.radiant_win == null ? null : (m.radiant_win ? "radiant" : "dire");
+  const backBtn = backAccountId != null
+    ? `<button class="back-link" id="match-back">← к игроку</button>`
+    : "";
+
+  const draftHtml = m.has_draft
+    ? `<h3 class="history-title">Драфт</h3>
+       <div class="draft-match">
+         ${renderDraftTeamRow(m.radiant.name, m.radiant.draft)}
+         ${renderDraftTeamRow(m.dire.name, m.dire.draft)}
+       </div>`
+    : '<p class="hint">Драфт этого матча ещё не подгружен.</p>';
+
+  detailEl.innerHTML = `
+    ${backBtn}
+    <h2>${m.radiant.name} <span class="vs">против</span> ${m.dire.name}</h2>
+    <p class="player-meta">${m.tournament_label} · ${when}${durLine} · <a class="ext-link" href="https://www.dotabuff.com/matches/${m.match_id}" target="_blank" rel="noopener noreferrer">Dotabuff</a></p>
+    <div class="lineups">
+      ${lineupTable(m.radiant, winnerSide, "radiant")}
+      ${lineupTable(m.dire, winnerSide, "dire")}
+    </div>
+    ${draftHtml}
+  `;
+
+  const back = document.getElementById("match-back");
+  if (back) back.addEventListener("click", () => loadPlayerPage(backAccountId));
+  for (const btn of detailEl.querySelectorAll(".player-link")) {
+    btn.addEventListener("click", () => loadPlayerPage(Number(btn.dataset.accountId)));
+  }
+}
+
+const playersBtn = document.getElementById("players-btn");
+let leaderboardCache = null;
+
+function renderLeaderboard(sortKey, sortDesc) {
+  const data = leaderboardCache;
+  const players = [...data.players];
+  const numeric = (v) => (v == null ? -Infinity : v);
+  const keyFns = {
+    name: (p) => (p.name || "").toLowerCase(),
+    team: (p) => (p.team_name || "").toLowerCase(),
+    mmr: (p) => numeric(p.mmr),
+    games: (p) => numeric(p.games),
+    win_rate: (p) => numeric(p.win_rate),
+  };
+  const fn = keyFns[sortKey] || keyFns.mmr;
+  players.sort((a, b) => {
+    const x = fn(a), y = fn(b);
+    if (x < y) return sortDesc ? 1 : -1;
+    if (x > y) return sortDesc ? -1 : 1;
+    return 0;
+  });
+
+  const rows = players
+    .map((p, i) => {
+      const heroesHtml = p.top_heroes
+        .map((h) => `<img class="hero-icon" src="${heroIconUrl(h.icon)}" alt="${h.name}" title="${h.name} ×${h.games}" loading="lazy" onerror="this.remove()">`)
+        .join("");
+      const teamCell = p.team_id != null
+        ? `<button class="opponent-link" data-team-id="${p.team_id}">${p.team_name}</button>`
+        : '<span class="hint">—</span>';
+      const wr = p.win_rate == null
+        ? "—"
+        : `<span class="${p.win_rate >= 50 ? "wr-good" : "wr-bad"}">${p.win_rate}%</span> <span class="hint">(${p.wins}–${p.losses})</span>`;
+      return `
+        <tr>
+          <td class="lb-rank">${i + 1}</td>
+          <td><button class="player-link" data-account-id="${p.account_id}">${p.name}</button></td>
+          <td>${teamCell}</td>
+          <td>${formatMmr(p.mmr)}</td>
+          <td>${p.games}</td>
+          <td>${wr}</td>
+          <td class="lb-heroes">${heroesHtml || '<span class="hint">—</span>'}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  const arrow = (k) => (k === sortKey ? (sortDesc ? " ↓" : " ↑") : "");
+  detailEl.innerHTML = `
+    <h2>Игроки · ${data.tournament_label || "турнир"}</h2>
+    <p class="hint">Винрейт и герои — только за текущий турнир. Клик по заголовку — сортировка.</p>
+    <table class="subs-table leaderboard-table">
+      <thead><tr>
+        <th></th>
+        <th class="sortable" data-sort="name">Игрок${arrow("name")}</th>
+        <th class="sortable" data-sort="team">Команда${arrow("team")}</th>
+        <th class="sortable" data-sort="mmr">MMR${arrow("mmr")}</th>
+        <th class="sortable" data-sort="games">Игры${arrow("games")}</th>
+        <th class="sortable" data-sort="win_rate">Винрейт${arrow("win_rate")}</th>
+        <th>Топ героев</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+
+  for (const th of detailEl.querySelectorAll("th.sortable")) {
+    th.addEventListener("click", () => {
+      const key = th.dataset.sort;
+      // Second click on the same column flips the direction.
+      renderLeaderboard(key, key === sortKey ? !sortDesc : key !== "name" && key !== "team");
+    });
+  }
+  for (const btn of detailEl.querySelectorAll(".player-link")) {
+    btn.addEventListener("click", () => loadPlayerPage(Number(btn.dataset.accountId)));
+  }
+  for (const link of detailEl.querySelectorAll(".opponent-link")) {
+    link.addEventListener("click", () => loadTeamDetail(Number(link.dataset.teamId)));
+  }
+}
+
+async function loadPlayersLeaderboard() {
+  activeTeamId = null;
+  for (const btn of teamsEl.querySelectorAll(".team-btn")) {
+    btn.classList.remove("active");
+  }
+  detailEl.innerHTML = '<p class="hint">Загружаю игроков...</p>';
+  const res = await fetch("/api/players");
+  if (!res.ok) {
+    detailEl.innerHTML = '<p class="hint">Не удалось получить список игроков.</p>';
+    return;
+  }
+  leaderboardCache = await res.json();
+  renderLeaderboard("mmr", true);
+}
+
+playersBtn.addEventListener("click", loadPlayersLeaderboard);
 
 const tournamentStatsBtn = document.getElementById("tournament-stats-btn");
 

@@ -1002,6 +1002,180 @@ def api_player_detail(account_id: int):
     })
 
 
+@app.get("/api/matches/<int:match_id>")
+def api_match_detail(match_id: int):
+    """Everything we know about one game: both lineups (hero + player +
+    KDA where known) and the full draft in pick order. KDA and duration come
+    only from OpenDota-sourced details - Steam's league history doesn't carry
+    them - so they're null on many matches and the frontend shows them only
+    when present."""
+    with Session(engine) as session:
+        match = session.get(Match, match_id)
+        if match is None:
+            return jsonify({"error": "not found"}), 404
+
+        mixer_tid = match.mixer_tournament_id
+
+        def side_name(team_id):
+            # The name this team used in THIS match's tournament (ids are
+            # recycled between cups), falling back to the current name.
+            if team_id is None:
+                return "?"
+            if mixer_tid is not None:
+                row = session.get(TeamTournamentName, (team_id, mixer_tid))
+                if row is not None:
+                    return row.name
+            team = session.get(Team, team_id)
+            return team.name if team and team.name else f"Team {team_id}"
+
+        player_rows = session.execute(
+            select(
+                MatchPlayer.account_id, MatchPlayer.is_radiant,
+                MatchPlayer.kills, MatchPlayer.deaths, MatchPlayer.assists,
+                Hero.localized_name, Hero.name, Player.name,
+            )
+            .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
+            .outerjoin(Player, Player.account_id == MatchPlayer.account_id)
+            .where(MatchPlayer.match_id == match_id)
+        ).all()
+
+        draft_rows = session.execute(
+            select(
+                MatchDraftEntry.order_num, MatchDraftEntry.is_pick,
+                MatchDraftEntry.team_id, Hero.localized_name, Hero.name,
+            )
+            .join(Hero, Hero.hero_id == MatchDraftEntry.hero_id)
+            .where(MatchDraftEntry.match_id == match_id)
+            .order_by(MatchDraftEntry.order_num)
+        ).all()
+
+        radiant_id, dire_id = match.radiant_team_id, match.dire_team_id
+        result = {
+            "match_id": match_id,
+            "start_time": match.start_time,
+            "duration": match.duration,
+            "radiant_win": match.radiant_win,
+            "tournament_label": _tournament_label(mixer_tid, match.league_id),
+        }
+
+    def lineup(want_radiant: bool) -> list[dict]:
+        return [
+            {
+                "account_id": account_id,
+                "name": player_name or f"account {account_id}",
+                "hero": hero_name,
+                "hero_icon": _hero_icon_slug(internal_name),
+                "kills": kills, "deaths": deaths, "assists": assists,
+            }
+            for (account_id, is_radiant, kills, deaths, assists,
+                 hero_name, internal_name, player_name) in player_rows
+            if bool(is_radiant) == want_radiant
+        ]
+
+    def draft_side(team_id) -> list[dict]:
+        return [
+            {
+                "order": order_num,
+                "is_pick": is_pick,
+                "hero": hero_name,
+                "hero_icon": _hero_icon_slug(internal_name),
+            }
+            for order_num, is_pick, tid, hero_name, internal_name in draft_rows
+            if tid == team_id
+        ]
+
+    result["radiant"] = {
+        "team_id": radiant_id, "name": side_name(radiant_id),
+        "players": lineup(True), "draft": draft_side(radiant_id),
+    }
+    result["dire"] = {
+        "team_id": dire_id, "name": side_name(dire_id),
+        "players": lineup(False), "draft": draft_side(dire_id),
+    }
+    result["has_draft"] = bool(draft_rows)
+    return jsonify(result)
+
+
+@app.get("/api/players")
+def api_players_leaderboard():
+    """Every participant of the ACTIVE tournament: current rosters (including
+    subs who haven't played yet) plus anyone who has actually played a game in
+    it. Winrate and hero pool are scoped to the active cup - mixing in last
+    cup's games would grade players on a team that no longer exists."""
+    with Session(engine) as session:
+        active = _resolve_mixer_tournament_id()
+        tour_filter = (Match.mixer_tournament_id == active) if active is not None else True
+
+        decided = case((Match.radiant_win.is_not(None), 1), else_=0)
+        won = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
+        stat_rows = session.execute(
+            select(MatchPlayer.account_id, func.count(), func.sum(decided), func.sum(won))
+            .join(Match, Match.match_id == MatchPlayer.match_id)
+            .where(tour_filter)
+            .group_by(MatchPlayer.account_id)
+        ).all()
+        stats = {aid: (games, dec or 0, wins or 0) for aid, games, dec, wins in stat_rows}
+
+        hero_rows = session.execute(
+            select(MatchPlayer.account_id, Hero.localized_name, Hero.name, func.count())
+            .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
+            .join(Match, Match.match_id == MatchPlayer.match_id)
+            .where(tour_filter)
+            .group_by(MatchPlayer.account_id, MatchPlayer.hero_id)
+        ).all()
+        heroes_by_player: dict[int, list] = {}
+        for aid, hero_name, internal_name, count in hero_rows:
+            heroes_by_player.setdefault(aid, []).append(
+                (count, hero_name, _hero_icon_slug(internal_name))
+            )
+
+        roster_rows = session.execute(
+            select(Player, Team)
+            .join(Team, Team.team_id == Player.team_id)
+            .where(Team.tournament_id == active, Player.roster_confirmed.is_(True))
+        ).all() if active is not None else []
+        rostered = {p.account_id: (p, t) for p, t in roster_rows}
+
+        # Players who appear in games but were since subbed out still belong
+        # on the board - their games happened - just without a current team.
+        extra_ids = set(stats) - set(rostered)
+        extras = {
+            p.account_id: p
+            for p in session.execute(
+                select(Player).where(Player.account_id.in_(extra_ids))
+            ).scalars()
+        } if extra_ids else {}
+
+        players = []
+        for account_id in set(rostered) | set(stats):
+            player, team = rostered.get(account_id, (extras.get(account_id), None))
+            games, dec, wins = stats.get(account_id, (0, 0, 0))
+            top = sorted(heroes_by_player.get(account_id, []), reverse=True)[:3]
+            players.append({
+                "account_id": account_id,
+                "name": (player.name if player and player.name else f"account {account_id}"),
+                "mmr": player.mmr if player else None,
+                "roles": player.preferred_roles if player else None,
+                "team_id": team.team_id if team else None,
+                "team_name": (team.name or f"Team {team.team_id}") if team else None,
+                "games": games,
+                "wins": wins,
+                "losses": dec - wins,
+                "win_rate": round(100 * wins / dec) if dec else None,
+                "top_heroes": [
+                    {"name": name, "icon": slug, "games": count}
+                    for count, name, slug in top
+                ],
+            })
+
+    players.sort(key=lambda p: (p["mmr"] is None, -(p["mmr"] or 0)))
+    return jsonify({
+        "tournament_id": active,
+        "tournament_label": _tournament_label(active, None) if active is not None else None,
+        "players": players,
+    })
+
+
 @app.get("/api/archive/player-heroes")
 def api_archive_player_heroes():
     """Snapshot of every player's hero pool for the ACTIVE tournament, keyed

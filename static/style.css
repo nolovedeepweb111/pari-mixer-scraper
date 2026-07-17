@@ -670,6 +670,100 @@ aside h2 {
   flex-shrink: 0;
 }
 
+/* --- Match page ------------------------------------------------------- */
+
+.match-row {
+  cursor: pointer;
+}
+
+.match-row:hover td {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.back-link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 14px;
+  padding: 0;
+  margin-bottom: 8px;
+}
+
+.vs {
+  color: var(--muted);
+  font-size: 0.7em;
+  font-weight: 400;
+}
+
+.ext-link {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.lineups {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  align-items: start;
+  margin-top: 12px;
+}
+
+@media (max-width: 900px) {
+  .lineups {
+    grid-template-columns: 1fr;
+  }
+}
+
+.lineup-block h4 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.lineup-hero {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lineup-kda {
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.draft-match {
+  margin-top: 8px;
+}
+
+/* --- Players leaderboard ---------------------------------------------- */
+
+.leaderboard-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.leaderboard-table th.sortable:hover {
+  color: var(--text);
+}
+
+.lb-rank {
+  color: var(--muted);
+  width: 32px;
+}
+
+.lb-heroes {
+  white-space: nowrap;
+}
+
+.lb-heroes .hero-icon {
+  margin-right: 4px;
+  vertical-align: middle;
+}
+
+.wr-good { color: #48c432; }
+.wr-bad { color: #eb4242; }
+
 .tag-neutral {
   background: rgba(207, 212, 218, 0.12);
   color: var(--text);

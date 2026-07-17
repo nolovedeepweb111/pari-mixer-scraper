@@ -133,9 +133,9 @@ _collect_lock = threading.Lock()
 # If a run has been "running" longer than this with no sign of life, treat
 # it as dead (stuck thread, killed worker that never reset the flag, etc.)
 # and allow a new attempt rather than blocking the site's data forever.
-# A run that is merely slow must NOT reach this: each run is capped (see
-# SEED_MAX_MATCHES_PER_RUN) to a couple of minutes, so anything still alive
-# this much later really is wedged.
+# A run that is merely slow must NOT reach this: the collector budgets its
+# expensive phases by wall clock (SEED_TIME_BUDGET_SECONDS and friends) to
+# ~10 min total, so anything still alive this much later really is wedged.
 _STALE_RUN_SECONDS = 15 * 60
 
 

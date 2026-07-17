@@ -138,7 +138,22 @@ def fetch_all_league_matches(
                 matches_by_id[m["match_id"]] = m
             progress(f"Steam API: {len(matches_by_id)} matches for league_id={league_id}")
         except Exception as e:
-            progress(f"Steam API fetch failed ({e}), continuing with OpenDota only")
+            # Call out a dead key explicitly. Steam answers a revoked/expired
+            # key with a bare 403 on EVERY endpoint, which reads exactly like
+            # "Valve removed this API" - it is not, and mistaking one for the
+            # other costs a lot: Steam's league history is the cheap way to
+            # enumerate matches (one call per 100), and without it the mixer
+            # seed has to pull every match from OpenDota one by one, which
+            # this host's shared IP gets rate-limited for.
+            if "403" in str(e):
+                progress(
+                    "Steam API returned 403 for league history. This almost always means "
+                    "STEAM_API_KEY is invalid, revoked or expired - NOT that the endpoint is gone. "
+                    "Issue a fresh key at https://steamcommunity.com/dev/apikey and set STEAM_API_KEY. "
+                    "Falling back to the (much slower, rate-limited) per-match OpenDota path."
+                )
+            else:
+                progress(f"Steam API fetch failed ({e}), continuing with OpenDota only")
 
     try:
         od_list = od_client.get_league_matches(league_id)
@@ -1067,13 +1082,16 @@ def seed_matches_from_mixer(
     progress: ProgressFn,
     time_budget: int | None = None,
 ) -> int:
-    """Discover matches from mixer-cup and pull each one's details from
-    OpenDota. This is now the ONLY way matches are found: Valve's
-    GetMatchHistory returns 403 (the endpoint is locked to partners) and
-    OpenDota doesn't index this 'excluded' league, so neither can enumerate
-    the tournament's games. mixer-cup's completed-games list, however, gives
-    every match_id (plus its result), and OpenDota's per-match endpoint still
-    serves full details (result, lineup, sides, draft) for those ids."""
+    """Backstop match discovery: take the match ids from mixer-cup's
+    completed-games list and pull each one's details from OpenDota.
+
+    This covers whatever Steam's league history didn't (OpenDota's own league
+    index can't help - this league is tier 'excluded', so it returns nothing).
+    It only fetches ids we don't already have, so with a WORKING STEAM_API_KEY
+    it costs nothing: Steam has already supplied the list. With a dead key it
+    becomes the only path, at one OpenDota call per match - slow, and prone to
+    rate-limiting on a shared egress IP. If this is doing all the work, fix
+    the Steam key rather than tuning the budgets."""
     wanted: set[int] = set()
     for tid in tournament_ids:
         try:

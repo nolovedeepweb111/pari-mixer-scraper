@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from .mixercup_client import MixerCupClient
 from .models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, QueuedPlayer,
-    SubstitutionEvent, Team,
+    SubstitutionEvent, Team, TeamTournamentName,
     build_engine, configure_sqlite,
 )
 from .opendota_client import OpenDotaClient
@@ -419,6 +419,16 @@ def _apply_confirmed_roster(session: Session, steam_team_id: int, mixer_team: di
             player.preferred_roles = roles
 
 
+def _record_tournament_name(session: Session, team_id: int, tournament_id: int, name: str) -> None:
+    """Remember a team's name within one tournament (see TeamTournamentName).
+    Upsert: mixer-cup is authoritative and a captain can rename mid-cup."""
+    row = session.get(TeamTournamentName, (team_id, tournament_id))
+    if row is None:
+        session.add(TeamTournamentName(team_id=team_id, tournament_id=tournament_id, name=name))
+    elif row.name != name:
+        row.name = name
+
+
 def _apply_names_only(session: Session, mixer_team: dict) -> int:
     """Take just the nickname/rating off a mixer roster, for players we
     already know about.
@@ -549,6 +559,13 @@ def link_mixercup_data(
         for steam_team_id, mixer_team in ((match.radiant_team_id, radiant_team), (match.dire_team_id, dire_team)):
             if steam_team_id is None:
                 continue
+            # Record what this team is called IN THIS tournament, whoever owns
+            # the row. Teams.name can hold only one name, and mixer-cup recycles
+            # the same Steam registrations every cup, so without this an older
+            # cup's matches get labelled with the current cup's names.
+            if mixer_team.get("name"):
+                _record_tournament_name(session, steam_team_id, tournament_id, mixer_team["name"])
+
             team_row = session.get(Team, steam_team_id)
             if team_row is not None:
                 # Name/uuid: set when THIS tournament owns the team. Active
@@ -640,6 +657,8 @@ def sync_mixer_teams(
                 team_row.name = mt["name"]
             team_row.tournament_id = tournament_id
             updated += 1
+        if mt.get("name"):
+            _record_tournament_name(session, team_row.team_id, tournament_id, mt["name"])
         _apply_confirmed_roster(session, team_row.team_id, mt)
 
     session.commit()

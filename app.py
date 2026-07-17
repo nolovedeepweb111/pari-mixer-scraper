@@ -20,6 +20,7 @@ from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID
 from pari_mixer_scraper.mixercup_client import MixerCupClient, pair_substitution_events
 from pari_mixer_scraper.models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, QueuedPlayer,
+    TeamTournamentName,
     SubstitutionEvent, Team,
     build_engine, configure_sqlite,
 )
@@ -910,6 +911,16 @@ def api_player_detail(account_id: int):
             t.team_id: t.name
             for t in session.execute(select(Team).where(Team.team_id.in_(involved_ids))).scalars()
         } if involved_ids else {}
+        # A player's history spans both concurrent cups, and mixer-cup reuses
+        # the same Steam team registrations in each - so Teams.name (always the
+        # ACTIVE cup's name) mislabels the older cup's matches. Resolve each
+        # match's teams by the tournament that match belongs to.
+        names_by_tour = {
+            (r.team_id, r.tournament_id): r.name
+            for r in session.execute(
+                select(TeamTournamentName).where(TeamTournamentName.team_id.in_(involved_ids))
+            ).scalars()
+        } if involved_ids else {}
 
         name = player.name
         mmr = player.mmr
@@ -939,14 +950,24 @@ def api_player_detail(account_id: int):
     for (match_id, start_time, radiant_win, is_radiant, played_for, r_id, d_id,
          hero, league_id, mixer_tid) in match_rows:
         opponent_id = d_id if played_for == r_id else r_id
+
+        def name_in_this_match(team_id):
+            # The name this team went by in THIS match's tournament; only fall
+            # back to Teams.name when that cup never listed them.
+            if team_id is None:
+                return "?"
+            return (names_by_tour.get((team_id, mixer_tid))
+                    or team_names.get(team_id)
+                    or f"Team {team_id}")
+
         matches.append({
             "match_id": match_id,
             "start_time": start_time,
             "hero": hero,
             "team_id": played_for,
-            "team_name": team_names.get(played_for) or (f"Team {played_for}" if played_for else "?"),
+            "team_name": name_in_this_match(played_for),
             "opponent_team_id": opponent_id,
-            "opponent_name": team_names.get(opponent_id) or (f"Team {opponent_id}" if opponent_id else "?"),
+            "opponent_name": name_in_this_match(opponent_id),
             "won": (radiant_win == is_radiant) if radiant_win is not None else None,
             "league_id": league_id,
             "mixer_tournament_id": mixer_tid,

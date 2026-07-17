@@ -82,6 +82,30 @@ class Team(Base):
     # only shows the active tournament's teams; earlier tournaments' teams
     # stay in the DB (reachable from player history) but off the sidebar.
     tournament_id: Mapped[int | None] = mapped_column(nullable=True)
+    # NOTE: `name` above is this team's name in the tournament that owns it -
+    # i.e. the ACTIVE one. It is the wrong name to print next to an older
+    # tournament's match: mixer-cup recycles the same Steam team registrations
+    # every cup, so one team_id is "Team mw" in #2 and was "Team vls" in #1.
+    # Use TeamTournamentName for anything shown against a specific match.
+
+
+class TeamTournamentName(Base):
+    """What a Steam team_id was called in one particular mixer tournament.
+
+    Needed because mixer-cup reuses its pool of registered Dota teams: every
+    team in cup #2 carries a team_id that already played ~23 games in cup #1
+    under a different name. Teams.name can only hold one of those, so showing
+    it against a #1 match mislabels the opponent (measured: 5 of 8 sampled
+    teams were shown a name they never had in that cup). mixer-cup does know
+    the old names - we fetch them anyway to link results - so they're recorded
+    here per tournament instead of thrown away.
+
+    Rebuilt from mixer-cup on every collection, so it needs no backup."""
+    __tablename__ = "team_tournament_names"
+
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.team_id"), primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
 
 
 class Player(Base):

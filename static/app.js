@@ -453,22 +453,33 @@ function lineupTable(side, winnerSide, side_key) {
     : (winnerSide === side_key
         ? ' <span class="match-result result-win">Победа</span>'
         : ' <span class="match-result result-loss">Поражение</span>');
+  // These columns exist only for OpenDota-sourced matches; a Steam-only match
+  // has none, so each column shows itself only if any player carries it.
   const hasKda = side.players.some((pl) => pl.kills != null);
+  const hasGpm = side.players.some((pl) => pl.gpm != null);
+  const hasXpm = side.players.some((pl) => pl.xpm != null);
+  const hasNw = side.players.some((pl) => pl.net_worth != null);
+  const num = (v) => (v == null ? "—" : v.toLocaleString("ru-RU"));
   const rows = side.players
     .map((pl) => `
       <tr>
         <td class="lineup-hero"><img class="hero-icon" src="${heroIconUrl(pl.hero_icon)}" alt="" loading="lazy" onerror="this.remove()">${pl.hero}</td>
         <td><button class="player-link" data-account-id="${pl.account_id}">${pl.name}</button></td>
         ${hasKda ? `<td class="lineup-kda">${pl.kills ?? "—"}/${pl.deaths ?? "—"}/${pl.assists ?? "—"}</td>` : ""}
+        ${hasNw ? `<td class="lineup-num">${num(pl.net_worth)}</td>` : ""}
+        ${hasGpm ? `<td class="lineup-num">${num(pl.gpm)}</td>` : ""}
+        ${hasXpm ? `<td class="lineup-num">${num(pl.xpm)}</td>` : ""}
       </tr>
     `)
     .join("");
+  const head = `<tr><th>Герой</th><th>Игрок</th>${hasKda ? "<th>K/D/A</th>" : ""}${hasNw ? '<th title="Нетворс">NW</th>' : ""}${hasGpm ? '<th title="Золото в минуту">GPM</th>' : ""}${hasXpm ? '<th title="Опыт в минуту">XPM</th>' : ""}</tr>`;
+  const cols = 2 + [hasKda, hasNw, hasGpm, hasXpm].filter(Boolean).length;
   return `
     <div class="lineup-block">
       <h4>${side.name}${winBadge}</h4>
       <table class="subs-table lineup-table">
-        <thead><tr><th>Герой</th><th>Игрок</th>${hasKda ? "<th>K/D/A</th>" : ""}</tr></thead>
-        <tbody>${rows || '<tr><td colspan="3" class="hint">состав неизвестен</td></tr>'}</tbody>
+        <thead>${head}</thead>
+        <tbody>${rows || `<tr><td colspan="${cols}" class="hint">состав неизвестен</td></tr>`}</tbody>
       </table>
     </div>
   `;

@@ -1032,6 +1032,7 @@ def api_match_detail(match_id: int):
             select(
                 MatchPlayer.account_id, MatchPlayer.is_radiant,
                 MatchPlayer.kills, MatchPlayer.deaths, MatchPlayer.assists,
+                MatchPlayer.gold_per_min, MatchPlayer.xp_per_min, MatchPlayer.net_worth,
                 Hero.localized_name, Hero.name, Player.name,
             )
             .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
@@ -1059,18 +1060,23 @@ def api_match_detail(match_id: int):
         }
 
     def lineup(want_radiant: bool) -> list[dict]:
-        return [
+        rows = [
             {
                 "account_id": account_id,
                 "name": player_name or f"account {account_id}",
                 "hero": hero_name,
                 "hero_icon": _hero_icon_slug(internal_name),
                 "kills": kills, "deaths": deaths, "assists": assists,
+                "gpm": gpm, "xpm": xpm, "net_worth": net_worth,
             }
-            for (account_id, is_radiant, kills, deaths, assists,
+            for (account_id, is_radiant, kills, deaths, assists, gpm, xpm, net_worth,
                  hero_name, internal_name, player_name) in player_rows
             if bool(is_radiant) == want_radiant
         ]
+        # Strongest first when we know net worth - the carry at the top reads
+        # more naturally than draft-slot order.
+        rows.sort(key=lambda r: (r["net_worth"] is None, -(r["net_worth"] or 0)))
+        return rows
 
     def draft_side(team_id) -> list[dict]:
         return [
@@ -1329,6 +1335,13 @@ def api_backup():
                    MatchDraftEntry.is_pick)
             .order_by(MatchDraftEntry.match_id, MatchDraftEntry.order_num)
         ).all()
+        stat_rows = session.execute(
+            select(MatchPlayer.match_id, MatchPlayer.account_id,
+                   MatchPlayer.kills, MatchPlayer.deaths, MatchPlayer.assists,
+                   MatchPlayer.gold_per_min, MatchPlayer.xp_per_min, MatchPlayer.net_worth)
+            .where(MatchPlayer.gold_per_min.is_not(None))
+            .order_by(MatchPlayer.match_id, MatchPlayer.account_id)
+        ).all()
 
     # Grouped per match and written as bare tuples rather than objects with
     # repeated key names: ~7000 draft rows would otherwise dominate a file
@@ -1338,6 +1351,13 @@ def api_backup():
         drafts.setdefault(str(match_id), []).append(
             [order_num, hero_id, team_id, 1 if is_pick else 0]
         )
+
+    # Same reasoning for per-player stats: they come from the same expensive
+    # OpenDota fetch as drafts and are equally worth keeping across a wipe.
+    # [account_id, k, d, a, gpm, xpm, net_worth]
+    match_stats: dict[str, list] = {}
+    for match_id, account_id, k, d, a, gpm, xpm, nw in stat_rows:
+        match_stats.setdefault(str(match_id), []).append([account_id, k, d, a, gpm, xpm, nw])
 
     return jsonify({
         "teams": [
@@ -1374,6 +1394,8 @@ def api_backup():
         ],
         # match_id -> [[order, hero_id, team_id, is_pick], ...]
         "match_drafts": drafts,
+        # match_id -> [[account_id, k, d, a, gpm, xpm, net_worth], ...]
+        "match_player_stats": match_stats,
         # Access-key -> device bindings, keyed by HMAC(key) so the public
         # backup branch never exposes the keys themselves. Lets device
         # bindings (the anti-sharing state) survive restarts and deploys.

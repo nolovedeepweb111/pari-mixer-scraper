@@ -157,6 +157,13 @@ class MatchPlayer(Base):
     kills: Mapped[int | None]
     deaths: Mapped[int | None]
     assists: Mapped[int | None]
+    # Per-game economy. Like KDA, only OpenDota's per-match detail carries
+    # these - Steam's cheap league-history bulk endpoint doesn't - so they're
+    # null on matches only ever seen through Steam, and the match page shows
+    # them only when present.
+    gold_per_min: Mapped[int | None] = mapped_column(nullable=True)
+    xp_per_min: Mapped[int | None] = mapped_column(nullable=True)
+    net_worth: Mapped[int | None] = mapped_column(nullable=True)
 
 
 class MatchDraftEntry(Base):

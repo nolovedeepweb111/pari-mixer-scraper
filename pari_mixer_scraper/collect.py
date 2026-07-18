@@ -91,6 +91,12 @@ def normalize_opendota_match(detail: dict) -> dict:
             "kills": p.get("kills"),
             "deaths": p.get("deaths"),
             "assists": p.get("assists"),
+            "gold_per_min": p.get("gold_per_min"),
+            "xp_per_min": p.get("xp_per_min"),
+            # OpenDota calls end-game net worth "total_gold" in the players
+            # array; net_worth is only present on parsed matches, total_gold
+            # is on all of them, so prefer the former and fall back.
+            "net_worth": p.get("net_worth") or p.get("total_gold"),
         })
 
     return {
@@ -237,19 +243,68 @@ def persist_match(
             kills=p.get("kills"),
             deaths=p.get("deaths"),
             assists=p.get("assists"),
+            gold_per_min=p.get("gold_per_min"),
+            xp_per_min=p.get("xp_per_min"),
+            net_worth=p.get("net_worth"),
         ))
+
+
+def update_player_stats(session: Session, match_id: int, detail: dict) -> int:
+    """Fill in per-player KDA and economy from an OpenDota match detail onto
+    rows that already exist (usually created from Steam's league history,
+    which carries the lineup but none of these numbers). Returns how many
+    rows got a value they were missing.
+
+    Keyed by account_id within the match. Only fills nulls, so re-running is
+    cheap and never clobbers a value we already have."""
+    players = detail.get("players") or []
+    if not players:
+        return 0
+    by_account = {
+        mp.account_id: mp
+        for mp in session.execute(
+            select(MatchPlayer).where(MatchPlayer.match_id == match_id)
+        ).scalars()
+    }
+    updated = 0
+    for p in players:
+        mp = by_account.get(p.get("account_id"))
+        if mp is None:
+            continue
+        net_worth = p.get("net_worth") or p.get("total_gold")
+        changed = False
+        for field, value in (
+            ("kills", p.get("kills")), ("deaths", p.get("deaths")),
+            ("assists", p.get("assists")), ("gold_per_min", p.get("gold_per_min")),
+            ("xp_per_min", p.get("xp_per_min")), ("net_worth", net_worth),
+        ):
+            if value is not None and getattr(mp, field) is None:
+                setattr(mp, field, value)
+                changed = True
+        if changed:
+            updated += 1
+    return updated
 
 
 def persist_draft_entries(session: Session, match_id: int, detail: dict) -> bool:
     """Store a match's picks/bans out of an OpenDota/Steam match detail.
     False means the detail carried no draft (not captain's mode, or OpenDota
-    hasn't parsed it) - the caller decides whether that's worth reporting."""
+    hasn't parsed it) - the caller decides whether that's worth reporting.
+
+    Idempotent: if the match already has draft rows (e.g. restored from the
+    backup) it leaves them alone and reports success, so a caller fetching a
+    detail only for its stats can't double-insert and trip the primary key."""
     picks_bans = detail.get("picks_bans") or []
     if not picks_bans:
         return False
     match = session.get(Match, match_id)
     if match is None:
         return False
+    already = session.execute(
+        select(MatchDraftEntry.match_id).where(MatchDraftEntry.match_id == match_id).limit(1)
+    ).first()
+    if already:
+        return True
     for pb in picks_bans:
         team_id = match.radiant_team_id if pb.get("team") == 0 else match.dire_team_id
         session.add(MatchDraftEntry(
@@ -268,17 +323,23 @@ def sync_draft_data(
     progress: ProgressFn,
     time_budget: int | None = None,
 ) -> None:
-    """Backfills picks/bans for matches that don't have any draft rows yet.
-    Steam's GetMatchDetails is the primary source (generous rate limits,
-    same picks_bans structure - OpenDota sources its copy from there);
-    OpenDota is the per-match fallback. Costs one call per match, but only
-    once - matches already covered are skipped on later runs.
+    """Backfills each match's draft AND per-player stats (KDA + economy) from
+    one OpenDota match detail - a single call gives both. Only OpenDota has
+    them: Steam's cheap league history carries the lineup but no numbers, and
+    its GetMatchDetails 500s on this league's private lobbies.
 
-    Newly seeded matches already carry their draft (seed_matches_from_mixer
-    stores it from the same detail), so this only covers matches that predate
-    that - which, because every build is seeded from the live DB, would
-    otherwise stay draftless forever and leave their teams' analysis empty."""
+    A match is fetched if it's missing EITHER its draft or its stats. Stats
+    matter separately because drafts come back from the state backup after a
+    wipe (so the match already has draft rows) while the players' KDA would
+    still be null - without this that match would never be revisited."""
     has_draft = {row[0] for row in session.execute(select(MatchDraftEntry.match_id))}
+    # A match "has stats" once any of its players carries a gpm; matches from
+    # Steam start with all-null economy, so this flags exactly those.
+    has_stats = {
+        row[0] for row in session.execute(
+            select(MatchPlayer.match_id).where(MatchPlayer.gold_per_min.is_not(None)).distinct()
+        )
+    }
     # Newest first: the running cup's games are what people have open, and the
     # per-run cap means the tail waits for a later cycle.
     all_match_ids = [
@@ -286,7 +347,7 @@ def sync_draft_data(
             select(Match.match_id).order_by(Match.start_time.desc().nulls_last())
         )
     ]
-    missing = [m for m in all_match_ids if m not in has_draft]
+    missing = [m for m in all_match_ids if m not in has_draft or m not in has_stats]
     if not missing:
         return
 
@@ -299,39 +360,39 @@ def sync_draft_data(
     def fetch_detail(match_id: int) -> dict:
         return client.get_match(match_id)
 
-    progress(f"Fetching picks/bans for {len(missing)} match(es)...")
+    progress(f"Fetching draft + stats for {len(missing)} match(es)...")
     deadline = None if time_budget is None else time.monotonic() + time_budget
-    fetched_empty = 0
+    no_draft = 0
     consecutive_failures = 0
     for i, match_id in enumerate(missing, start=1):
         if deadline is not None and time.monotonic() > deadline:
-            progress(f"Draft backfill: time budget spent; {len(missing) - i + 1} match(es) left for the next run")
+            progress(f"Match-detail backfill: time budget spent; {len(missing) - i + 1} match(es) left for the next run")
             break
         try:
             detail = fetch_detail(match_id)
             consecutive_failures = 0
         except Exception as e:
-            progress(f"Could not fetch picks/bans for match {match_id}: {e}")
+            progress(f"Could not fetch detail for match {match_id}: {e}")
             consecutive_failures += 1
             if consecutive_failures >= 5:
-                # Both sources failing repeatedly (e.g. OpenDota rate-limits
-                # this IP for the day) - grinding through the rest would waste
-                # minutes to fetch nothing. Stop; the next cycle backfills
-                # what's left (already-fetched drafts are kept via the seeded
-                # build).
-                progress("Draft sources look rate-limited; deferring remaining drafts to a later run.")
+                # OpenDota rate-limiting this IP lasts hours - grinding the
+                # rest would waste minutes fetching nothing. Stop; the next
+                # cycle continues (work so far is committed and, for drafts,
+                # kept via the state backup).
+                progress("OpenDota looks rate-limited; deferring remaining match details to a later run.")
                 break
             continue
 
-        if not persist_draft_entries(session, match_id, detail):
-            fetched_empty += 1
-            continue
+        got_draft = persist_draft_entries(session, match_id, detail)
+        update_player_stats(session, match_id, detail)
+        if not got_draft:
+            no_draft += 1
         session.commit()
         if i % 10 == 0 or i == len(missing):
-            progress(f"  picks/bans {i}/{len(missing)}")
+            progress(f"  match details {i}/{len(missing)}")
 
-    if fetched_empty:
-        progress(f"{fetched_empty} match(es) had no draft data (not captain's mode, or not parsed by OpenDota)")
+    if no_draft:
+        progress(f"{no_draft} match(es) had no draft data (not captain's mode, or not parsed by OpenDota)")
 
 
 def enrich_missing_player_names(session: Session, client: OpenDotaClient, progress: ProgressFn,
@@ -775,6 +836,48 @@ def restore_draft_backup(session: Session, data: dict | None, progress: Progress
     if restored:
         session.commit()
         progress(f"Draft backup restored: +{restored} match(es) worth of picks/bans (no OpenDota calls needed)")
+
+
+def restore_match_stats_backup(session: Session, data: dict | None, progress: ProgressFn) -> None:
+    """Re-import per-player KDA + economy saved by the state backup. Same
+    rationale as the drafts (one expensive OpenDota fetch, immutable once
+    known); fills only null columns so it never overwrites live data. Must
+    run AFTER matches/players are stored - it updates existing MatchPlayer
+    rows rather than creating them."""
+    entries = (data or {}).get("match_player_stats") or {}
+    if not entries:
+        return
+    restored = 0
+    for raw_match_id, rows in entries.items():
+        try:
+            match_id = int(raw_match_id)
+        except (TypeError, ValueError):
+            continue
+        mps = {
+            mp.account_id: mp
+            for mp in session.execute(
+                select(MatchPlayer).where(MatchPlayer.match_id == match_id)
+            ).scalars()
+        }
+        if not mps:
+            continue  # match not stored yet; a later run will catch it
+        touched = False
+        for account_id, k, d, a, gpm, xpm, nw in rows:
+            mp = mps.get(account_id)
+            if mp is None:
+                continue
+            for field, value in (
+                ("kills", k), ("deaths", d), ("assists", a),
+                ("gold_per_min", gpm), ("xp_per_min", xpm), ("net_worth", nw),
+            ):
+                if value is not None and getattr(mp, field) is None:
+                    setattr(mp, field, value)
+                    touched = True
+        if touched:
+            restored += 1
+    if restored:
+        session.commit()
+        progress(f"Match-stats backup restored: +{restored} match(es) worth of KDA/economy (no OpenDota calls needed)")
 
 
 def restore_state_backup(session: Session, progress: ProgressFn) -> dict | None:
@@ -1303,11 +1406,12 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
             # The user only wants the ACTIVE tournament's substitution history.
             _purge_past_tournament_subs(session, mixer_tournament_id, progress)
 
-        # Matches exist now, so saved drafts can be re-attached. Do it before
-        # the core publish: it's a local insert costing no API calls, and it
-        # puts the analysis cards back on the site immediately after a wipe
-        # instead of after several runs of OpenDota backfill.
+        # Matches exist now, so saved drafts and player stats can be
+        # re-attached. Do it before the core publish: local inserts costing no
+        # API calls, they put the drafts and match-page KDA back right after a
+        # wipe instead of after several runs of OpenDota backfill.
         restore_draft_backup(session, backup, progress)
+        restore_match_stats_backup(session, backup, progress)
 
         apply_manual_roster_overrides(session, progress)
         session.commit()

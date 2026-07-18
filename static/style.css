@@ -727,9 +727,11 @@ aside h2 {
   gap: 8px;
 }
 
-.lineup-kda {
+.lineup-kda,
+.lineup-num {
   white-space: nowrap;
   color: var(--muted);
+  text-align: right;
 }
 
 .draft-match {

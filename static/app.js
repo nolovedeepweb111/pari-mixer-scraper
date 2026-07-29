@@ -1,5 +1,3 @@
-// If the session expires or is missing (private mode), any API call returns
-// 401 - bounce to the login page instead of showing a broken site.
 // 401 means a session that used to be valid no longer is - bounce to the
 // login page instead of showing a broken site. A 403 is different: it is a
 // visitor without a key reaching for the running cup, which is a normal state
@@ -50,9 +48,9 @@ function renderLockPanel(container) {
       <h2>Текущий турнир — по ключу</h2>
       <p>Статистика идущего турнира: составы, пулы героев, драфты, замены и аналитика
          соперников. Прошедшие турниры открыты полностью — выберите их в шапке.</p>
-      <p class="lock-offer">Для получения доступа отправьте <b>${o.price || "—"}</b>
-         пользователю <b>${o.recipient || "—"}</b> и напишите в дискорде
-         <b>${o.discord || "—"}</b> или в телеграмме <b>${o.telegram || "—"}</b>.</p>
+      <p class="lock-offer">Для получения доступа отправьте <b>${escapeHtml(o.price || "—")}</b>
+         пользователю <b>${escapeHtml(o.recipient || "—")}</b> и напишите в дискорде
+         <b>${escapeHtml(o.discord || "—")}</b> или в телеграмме <b>${escapeHtml(o.telegram || "—")}</b>.</p>
       <button id="lock-login">У меня есть ключ</button>
     </div>
   `;
@@ -83,7 +81,8 @@ function renderCupSwitcher() {
   sel.innerHTML = shown
     .map((t) => {
       const mark = t.locked ? " 🔒" : t.is_active ? " · сейчас" : "";
-      return `<option value="${t.slug}">${t.label}${mark}</option>`;
+      // The label is the tournament's name as mixer-cup reports it.
+      return `<option value="${escapeHtml(t.slug)}">${escapeHtml(t.label)}${mark}</option>`;
     })
     .join("");
   sel.onchange = () => navigate(`/${sel.value}`);
@@ -93,7 +92,15 @@ function renderCupSwitcher() {
 function syncCupSwitcher() {
   const sel = document.getElementById("cup-switcher");
   const slug = slugFor(currentCupId());
-  if (sel && slug && sel.querySelector(`option[value="${slug}"]`)) sel.value = slug;
+  if (!sel || !slug) return;
+  // Looked up by walking the options rather than with an attribute selector
+  // built from the slug, which would be a query-injection hazard.
+  for (const option of sel.options) {
+    if (option.value === slug) {
+      sel.value = slug;
+      return;
+    }
+  }
 }
 
 function slugFor(tournamentId) {
@@ -208,9 +215,11 @@ function formatMmr(value) {
   return value == null ? "?" : Math.round(value).toLocaleString("ru-RU");
 }
 
-// Mandatory for notes: they are the one thing on this site typed in by a
-// person, and every note is shown to every other key holder, so an unescaped
-// "<img onerror=...>" would run in their browser.
+// Every value that reaches innerHTML goes through this. Most of them are typed
+// in by somebody: notes are written here, and nicknames, team names and
+// tournament names all come from what players registered on mixer-cup. Any of
+// those can carry "<img src=x onerror=...>", and on a site where people share a
+// key that runs in the next visitor's browser.
 function escapeHtml(value) {
   return String(value == null ? "" : value)
     .replace(/&/g, "&amp;")
@@ -221,7 +230,9 @@ function escapeHtml(value) {
 }
 
 function heroIconUrl(slug) {
-  return `https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes/icons/${slug}.png`;
+  // encodeURIComponent, not plain interpolation: the slug lands inside a src=""
+  // attribute, so anything odd in it would otherwise break out of the URL.
+  return `https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes/icons/${encodeURIComponent(slug || "")}.png`;
 }
 
 const STEAM_ID64_BASE = 76561197960265728n;
@@ -249,14 +260,16 @@ function renderDraftTeamRow(teamName, entries) {
     .map((e) => `
       <div class="draft-cell ${e.is_pick ? "cell-pick" : "cell-ban"}">
         <span class="cell-order">${e.order + 1}</span>
-        <img src="${heroIconUrl(e.hero_icon)}" alt="${e.hero}" title="${e.hero}">
+        <img src="${escapeHtml(heroIconUrl(e.hero_icon))}" alt="${escapeHtml(e.hero)}" title="${escapeHtml(e.hero)}">
         <span class="cell-label">${e.is_pick ? "PICK" : "BAN"}</span>
       </div>
     `)
     .join("");
+  // Escaped here rather than at the call sites, so passing a team name in is
+  // safe by default.
   return `
     <div class="draft-team-row">
-      <span class="draft-team-label">${teamName}</span>
+      <span class="draft-team-label">${escapeHtml(teamName)}</span>
       <div class="draft-cells">${cells || '<span class="hint">нет данных</span>'}</div>
     </div>
   `;
@@ -324,12 +337,12 @@ function renderComposition(team) {
     const heroItems = player.heroes
       .map((h) => {
         const wr = h.win_rate == null ? "" : `<span class="winrate ${h.win_rate >= 50 ? "wr-good" : "wr-bad"}">${h.win_rate}%</span>`;
-        return `<li><span>${h.name}</span><span>${wr}<span class="count">×${h.games}</span></span></li>`;
+        return `<li><span>${escapeHtml(h.name)}</span><span>${wr}<span class="count">×${h.games}</span></span></li>`;
       })
       .join("");
-    const rolesLine = player.roles ? `<p class="roles">${formatRoles(player.roles)}</p>` : "";
+    const rolesLine = player.roles ? `<p class="roles">${escapeHtml(formatRoles(player.roles))}</p>` : "";
     card.innerHTML = `
-      <h3><button class="player-link" data-account-id="${player.account_id}">${player.name}</button><span class="profile-links">${profileLinks(player.account_id)}</span></h3>
+      <h3><button class="player-link" data-account-id="${player.account_id}">${escapeHtml(player.name)}</button><span class="profile-links">${profileLinks(player.account_id)}</span></h3>
       <p class="mmr">${formatMmr(player.mmr)} MMR</p>
       ${rolesLine}
       <ul>${heroItems || `<li><span class="hint">${team.hero_pools_locked ? "пул героев — по ключу" : "ещё не играл(а) за команду"}</span></li>`}</ul>
@@ -354,8 +367,8 @@ function renderComposition(team) {
       ? new Date(opp.planned_time).toLocaleString("ru-RU", { dateStyle: "medium", timeStyle: "short" })
       : "время пока не назначено";
     const opponentLabel = opp.opponent_team_id != null
-      ? `<button class="opponent-link" data-team-id="${opp.opponent_team_id}">${opp.opponent_name}</button>`
-      : `<strong>${opp.opponent_name}</strong>`;
+      ? `<button class="opponent-link" data-team-id="${opp.opponent_team_id}">${escapeHtml(opp.opponent_name)}</button>`
+      : `<strong>${escapeHtml(opp.opponent_name)}</strong>`;
     const nextLine = document.createElement("p");
     nextLine.className = "next-opponent";
     nextLine.innerHTML = `Следующий соперник: ${opponentLabel} · ${when}`;
@@ -376,9 +389,9 @@ function renderComposition(team) {
     const when = lm.start_time
       ? new Date(lm.start_time * 1000).toLocaleDateString("ru-RU", { day: "numeric", month: "short" })
       : "";
-    const vs = lm.opponent_name ? ` против ${lm.opponent_name}` : "";
+    const vs = lm.opponent_name ? ` против ${escapeHtml(lm.opponent_name)}` : "";
     const names = lm.players
-      .map((p) => `<button class="player-link" data-account-id="${p.account_id}">${p.name}</button><span class="profile-links">${profileLinks(p.account_id)}</span>`)
+      .map((p) => `<button class="player-link" data-account-id="${p.account_id}">${escapeHtml(p.name)}</button><span class="profile-links">${profileLinks(p.account_id)}</span>`)
       .join(", ");
     const lineupLine = document.createElement("p");
     lineupLine.className = "last-lineup";
@@ -418,7 +431,7 @@ function renderComposition(team) {
 
 function heroTagList(items, cssClass) {
   if (!items || items.length === 0) return '<span class="hint">нет данных</span>';
-  return items.map((i) => `<span class="tag ${cssClass}">${i.hero} ×${i.count}</span>`).join("");
+  return items.map((i) => `<span class="tag ${cssClass}">${escapeHtml(i.hero)} ×${i.count}</span>`).join("");
 }
 
 async function renderAnalysisTab(teamId, container, scope) {
@@ -432,12 +445,14 @@ async function renderAnalysisTab(teamId, container, scope) {
 
   const signatureHtml = a.signature_heroes.length
     ? a.signature_heroes
-        .map((h) => `<span class="tag tag-pick">${h.hero} — ${h.win_rate}% (${h.wins}/${h.games})</span>`)
+        .map((h) => `<span class="tag tag-pick">${escapeHtml(h.hero)} — ${h.win_rate}% (${h.wins}/${h.games})</span>`)
         .join("")
     : '<span class="hint">нет данных</span>';
 
   container.innerHTML = `
-    <p class="coach-text">${a.text}</p>
+    <!-- Assembled on the server, but out of the team's name - so it carries
+         whatever the captain called their team. -->
+    <p class="coach-text">${escapeHtml(a.text)}</p>
     <div class="analysis-grid">
       <div class="analysis-block">
         <h4>Топ пиков</h4>
@@ -482,11 +497,11 @@ async function renderSubstitutionsTab(teamId, container) {
       const when = new Date(s.at).toLocaleString("ru-RU", { dateStyle: "medium", timeStyle: "short" });
       let text;
       if (s.out && s.in) {
-        text = `<strong>${s.out}</strong> → <strong>${s.in}</strong>`;
+        text = `<strong>${escapeHtml(s.out)}</strong> → <strong>${escapeHtml(s.in)}</strong>`;
       } else if (s.out) {
-        text = `<strong>${s.out}</strong> вышел из состава`;
+        text = `<strong>${escapeHtml(s.out)}</strong> вышел из состава`;
       } else {
-        text = `<strong>${s.in}</strong> добавлен в состав`;
+        text = `<strong>${escapeHtml(s.in)}</strong> добавлен в состав`;
       }
       if (s.rating_diff != null) {
         const cls = s.rating_diff >= 0 ? "rating-diff-up" : "rating-diff-down";
@@ -529,13 +544,13 @@ async function loadTeamDetail(teamId, tab, tournamentId) {
   // Past cups keep no substitution history (only the active cup's is stored),
   // so that tab would always be empty there.
   const historyBadge = team.is_historical && team.tournament_label
-    ? ` <span class="tournament-badge">${team.tournament_label}</span>`
+    ? ` <span class="tournament-badge">${escapeHtml(team.tournament_label)}</span>`
     : "";
   const subsTab = team.is_historical
     ? ""
     : '<button class="tab-btn" data-tab="substitutions">Замены</button>';
   detailEl.innerHTML = `
-    <h2>${team.name}${historyBadge}</h2>
+    <h2>${escapeHtml(team.name)}${historyBadge}</h2>
     <div class="tabs">
       <button class="tab-btn" data-tab="composition">Состав</button>
       <button class="tab-btn" data-tab="analysis">Аналитика</button>
@@ -672,9 +687,9 @@ async function loadPlayerPage(accountId) {
   }
   const p = await res.json();
 
-  const rolesLine = p.roles ? ` · ${formatRoles(p.roles)}` : "";
+  const rolesLine = p.roles ? ` · ${escapeHtml(formatRoles(p.roles))}` : "";
   const teamLine = p.current_team_id != null
-    ? `Команда: <button class="opponent-link" data-team-id="${p.current_team_id}">${p.current_team_name}</button>`
+    ? `Команда: <button class="opponent-link" data-team-id="${p.current_team_id}">${escapeHtml(p.current_team_name)}</button>`
     // Don't claim they are on no team when we are simply not showing which.
     : p.current_team_locked
       ? "Команда текущего турнира — по ключу"
@@ -689,9 +704,9 @@ async function loadPlayerPage(accountId) {
             // onerror strips the icon rather than leaving a broken-image glyph:
             // it's Valve's CDN, so it can fail where the site still works.
             const icon = h.icon
-              ? `<img class="hero-icon" src="${h.icon}" alt="" loading="lazy" onerror="this.remove()">`
+              ? `<img class="hero-icon" src="${escapeHtml(h.icon)}" alt="" loading="lazy" onerror="this.remove()">`
               : "";
-            return `<span class="tag tag-hero ${cls}">${icon}<span>${h.name} ×${h.games}${wr}</span></span>`;
+            return `<span class="tag tag-hero ${cls}">${icon}<span>${escapeHtml(h.name)} ×${h.games}${wr}</span></span>`;
           })
           .join("")
       : '<span class="hint">нет сыгранных матчей</span>';
@@ -708,7 +723,7 @@ async function loadPlayerPage(accountId) {
       ? p.hero_pools
           .map((pool) => `
             <div class="analysis-block player-heroes-block">
-              <h4>Пул героев · ${pool.label}</h4>
+              <h4>Пул героев · ${escapeHtml(pool.label)}</h4>
               <div class="tag-list">${heroTagsFor(pool.heroes)}</div>
             </div>
           `)
@@ -732,23 +747,23 @@ async function loadPlayerPage(accountId) {
       let divider = "";
       if (m.tournament_label && m.tournament_label !== lastLabel) {
         lastLabel = m.tournament_label;
-        divider = `<tr class="tournament-divider"><td colspan="5">${m.tournament_label}</td></tr>`;
+        divider = `<tr class="tournament-divider"><td colspan="5">${escapeHtml(m.tournament_label)}</td></tr>`;
       }
       return `
         ${divider}
         <tr class="match-row" data-match-id="${m.match_id}" title="Открыть страницу матча">
           <td class="subs-date">${when}</td>
-          <td>${m.hero}</td>
+          <td>${escapeHtml(m.hero)}</td>
           <td>${result}</td>
-          <td><button class="opponent-link" data-team-id="${m.team_id}" data-tournament-id="${m.mixer_tournament_id ?? ""}">${m.team_name}</button>${formerBadge}</td>
-          <td>против ${m.opponent_name}</td>
+          <td><button class="opponent-link" data-team-id="${m.team_id}" data-tournament-id="${m.mixer_tournament_id ?? ""}">${escapeHtml(m.team_name)}</button>${formerBadge}</td>
+          <td>против ${escapeHtml(m.opponent_name)}</td>
         </tr>
       `;
     })
     .join("");
 
   detailEl.innerHTML = `
-    <h2>${p.name}<span class="profile-links">${profileLinks(p.account_id)}</span></h2>
+    <h2>${escapeHtml(p.name)}<span class="profile-links">${profileLinks(p.account_id)}</span></h2>
     <p class="player-meta">${formatMmr(p.mmr)} MMR${rolesLine}</p>
     <p class="next-opponent">${teamLine}</p>
     <div class="player-body">
@@ -801,8 +816,8 @@ function lineupTable(side, winnerSide, side_key) {
   const rows = side.players
     .map((pl) => `
       <tr>
-        <td class="lineup-hero"><img class="hero-icon" src="${heroIconUrl(pl.hero_icon)}" alt="" loading="lazy" onerror="this.remove()">${pl.hero}</td>
-        <td><button class="player-link" data-account-id="${pl.account_id}">${pl.name}</button></td>
+        <td class="lineup-hero"><img class="hero-icon" src="${escapeHtml(heroIconUrl(pl.hero_icon))}" alt="" loading="lazy" onerror="this.remove()">${escapeHtml(pl.hero)}</td>
+        <td><button class="player-link" data-account-id="${pl.account_id}">${escapeHtml(pl.name)}</button></td>
         ${hasKda ? `<td class="lineup-kda">${pl.kills ?? "—"}/${pl.deaths ?? "—"}/${pl.assists ?? "—"}</td>` : ""}
         ${hasNw ? `<td class="lineup-num">${num(pl.net_worth)}</td>` : ""}
         ${hasGpm ? `<td class="lineup-num">${num(pl.gpm)}</td>` : ""}
@@ -814,7 +829,7 @@ function lineupTable(side, winnerSide, side_key) {
   const cols = 2 + [hasKda, hasNw, hasGpm, hasXpm].filter(Boolean).length;
   return `
     <div class="lineup-block">
-      <h4>${side.name}${winBadge}</h4>
+      <h4>${escapeHtml(side.name)}${winBadge}</h4>
       <table class="subs-table lineup-table">
         <thead>${head}</thead>
         <tbody>${rows || `<tr><td colspan="${cols}" class="hint">состав неизвестен</td></tr>`}</tbody>
@@ -856,8 +871,8 @@ async function loadMatchPage(matchId) {
 
   detailEl.innerHTML = `
     ${backBtn}
-    <h2>${m.radiant.name} <span class="vs">против</span> ${m.dire.name}</h2>
-    <p class="player-meta">${m.tournament_label} · ${when}${durLine} · <a class="ext-link" href="https://www.dotabuff.com/matches/${m.match_id}" target="_blank" rel="noopener noreferrer">Dotabuff</a></p>
+    <h2>${escapeHtml(m.radiant.name)} <span class="vs">против</span> ${escapeHtml(m.dire.name)}</h2>
+    <p class="player-meta">${escapeHtml(m.tournament_label)} · ${when}${durLine} · <a class="ext-link" href="https://www.dotabuff.com/matches/${m.match_id}" target="_blank" rel="noopener noreferrer">Dotabuff</a></p>
     <div class="lineups">
       ${lineupTable(m.radiant, winnerSide, "radiant")}
       ${lineupTable(m.dire, winnerSide, "dire")}
@@ -897,10 +912,10 @@ function renderLeaderboard(sortKey, sortDesc) {
   const rows = players
     .map((p, i) => {
       const heroesHtml = p.top_heroes
-        .map((h) => `<img class="hero-icon" src="${heroIconUrl(h.icon)}" alt="${h.name}" title="${h.name} ×${h.games}" loading="lazy" onerror="this.remove()">`)
+        .map((h) => `<img class="hero-icon" src="${escapeHtml(heroIconUrl(h.icon))}" alt="${escapeHtml(h.name)}" title="${escapeHtml(h.name)} ×${h.games}" loading="lazy" onerror="this.remove()">`)
         .join("");
       const teamCell = p.team_id != null
-        ? `<button class="opponent-link" data-team-id="${p.team_id}">${p.team_name}</button>`
+        ? `<button class="opponent-link" data-team-id="${p.team_id}">${escapeHtml(p.team_name)}</button>`
         : '<span class="hint">—</span>';
       const wr = p.win_rate == null
         ? "—"
@@ -908,7 +923,7 @@ function renderLeaderboard(sortKey, sortDesc) {
       return `
         <tr>
           <td class="lb-rank">${i + 1}</td>
-          <td><button class="player-link" data-account-id="${p.account_id}">${p.name}</button></td>
+          <td><button class="player-link" data-account-id="${p.account_id}">${escapeHtml(p.name)}</button></td>
           <td>${teamCell}</td>
           <td>${formatMmr(p.mmr)}</td>
           <td>${p.games}</td>
@@ -921,7 +936,7 @@ function renderLeaderboard(sortKey, sortDesc) {
 
   const arrow = (k) => (k === sortKey ? (sortDesc ? " ↓" : " ↑") : "");
   detailEl.innerHTML = `
-    <h2>Игроки · ${data.tournament_label || "турнир"}</h2>
+    <h2>Игроки · ${escapeHtml(data.tournament_label || "турнир")}</h2>
     <p class="hint">Винрейт${data.hero_pools_locked ? "" : " и герои"} — только за этот турнир. Клик по заголовку — сортировка.${
       data.hero_pools_locked ? " Топ героев — по ключу." : ""}</p>
     <table class="subs-table leaderboard-table">
@@ -973,7 +988,7 @@ async function loadAllSubstitutions(tournamentId) {
   detailEl.innerHTML = '<p class="hint">Загружаю замены...</p>';
   const res = await fetch(`/api/substitutions${scopeQuery(tournamentId)}`);
   const data = await res.json();
-  const title = `Замены · ${data.tournament_label || "турнир"}`;
+  const title = `Замены · ${escapeHtml(data.tournament_label || "турнир")}`;
 
   if (!data.substitutions.length) {
     detailEl.innerHTML = `<h2>${title}</h2><p class="hint">Замен в этом турнире не сохранилось.</p>`;
@@ -984,10 +999,10 @@ async function loadAllSubstitutions(tournamentId) {
     .map((s) => {
       const when = new Date(s.at).toLocaleString("ru-RU", { dateStyle: "medium", timeStyle: "short" });
       const outCell = s.out
-        ? `${s.out}${s.out_rating != null ? ` <span class="sub-mmr">${formatMmr(s.out_rating)}</span>` : ""}`
+        ? `${escapeHtml(s.out)}${s.out_rating != null ? ` <span class="sub-mmr">${formatMmr(s.out_rating)}</span>` : ""}`
         : "—";
       const inCell = s.in
-        ? `${s.in}${s.in_rating != null ? ` <span class="sub-mmr">${formatMmr(s.in_rating)}</span>` : ""}`
+        ? `${escapeHtml(s.in)}${s.in_rating != null ? ` <span class="sub-mmr">${formatMmr(s.in_rating)}</span>` : ""}`
         : "—";
       let diffCell = "—";
       if (s.rating_diff != null) {
@@ -998,7 +1013,7 @@ async function loadAllSubstitutions(tournamentId) {
       return `
         <tr>
           <td class="subs-date">${when}</td>
-          <td><button class="opponent-link" data-team-id="${s.team_id}">${s.team_name}</button></td>
+          <td><button class="opponent-link" data-team-id="${s.team_id}">${escapeHtml(s.team_name)}</button></td>
           <td>${outCell}</td>
           <td>${inCell}</td>
           <td>${diffCell}</td>

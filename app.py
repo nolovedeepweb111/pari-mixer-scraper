@@ -7,7 +7,8 @@ import re
 import sys
 import threading
 import time
-from datetime import timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -17,11 +18,11 @@ from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
-from pari_mixer_scraper.analysis import compute_team_stats, compute_tournament_hero_stats, generate_coach_text
+from pari_mixer_scraper.analysis import compute_team_stats, generate_coach_text
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID
 from pari_mixer_scraper.mixercup_client import MixerCupClient, pair_substitution_events
 from pari_mixer_scraper.models import (
-    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, QueuedPlayer,
+    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, PlayerNote, QueuedPlayer,
     TeamTournamentName,
     SubstitutionEvent, Team,
     build_engine, configure_sqlite, ensure_schema,
@@ -605,7 +606,6 @@ app.url_map.converters["tslug"] = _TournamentSlugConverter
 
 @app.get("/<tslug:slug>")
 @app.get("/<tslug:slug>/players")
-@app.get("/<tslug:slug>/heroes")
 @app.get("/<tslug:slug>/subs")
 @app.get("/<tslug:slug>/team/<int:team_id>")
 @app.get("/<tslug:slug>/team/<int:team_id>/<any(composition, analysis, subs):section>")
@@ -1430,6 +1430,100 @@ def api_player_detail(account_id: int):
     })
 
 
+# --- Player notes ----------------------------------------------------------
+# Scouting notes anybody with a key can leave on a player, visible to everyone
+# else who has one - hence the author field: there are no accounts here, only
+# shared keys, so a note says who wrote it by hand. Reading and writing both
+# need a key even in PUBLIC_ARCHIVE mode.
+NOTE_TEXT_LIMIT = 2000
+NOTE_AUTHOR_LIMIT = 40
+NOTES_PER_PLAYER_LIMIT = 200
+
+
+def _viewer_key_hash() -> str | None:
+    """Hash of the access key this request came with. None when no keys are
+    configured at all (a fully open site), which is also why deleting is only
+    offered when we can tell notes apart by author."""
+    return session.get("kh")
+
+
+def _notes_for(db: Session, account_id: int) -> list[dict]:
+    mine = _viewer_key_hash()
+    notes = db.execute(
+        select(PlayerNote)
+        .where(PlayerNote.account_id == account_id)
+        .order_by(PlayerNote.created_at.desc())
+    ).scalars().all()
+    return [
+        {
+            "note_id": n.note_id,
+            "author": n.author,
+            "text": n.text,
+            "created_at": n.created_at,
+            # Only the key that wrote a note may remove it.
+            "can_delete": bool(mine) and n.author_key_hash == mine,
+        }
+        for n in notes
+    ]
+
+
+@app.get("/api/players/<int:account_id>/notes")
+def api_player_notes(account_id: int):
+    if not _viewer_has_key():
+        return _deny_tournament()
+    with Session(engine) as db:
+        return jsonify({"notes": _notes_for(db, account_id)})
+
+
+@app.post("/api/players/<int:account_id>/notes")
+def api_player_note_create(account_id: int):
+    if not _viewer_has_key():
+        return _deny_tournament()
+    data = request.get_json(silent=True) or {}
+    author = (data.get("author") or "").strip()[:NOTE_AUTHOR_LIMIT]
+    text = (data.get("text") or "").strip()[:NOTE_TEXT_LIMIT]
+    if not author or not text:
+        return jsonify({"error": "Заполните ник и текст."}), 400
+
+    with Session(engine) as db:
+        if db.get(Player, account_id) is None:
+            return jsonify({"error": "not found"}), 404
+        count = db.execute(
+            select(func.count()).select_from(PlayerNote)
+            .where(PlayerNote.account_id == account_id)
+        ).scalar() or 0
+        if count >= NOTES_PER_PLAYER_LIMIT:
+            return jsonify({"error": "Слишком много заметок об этом игроке."}), 409
+        db.add(PlayerNote(
+            note_id=uuid.uuid4().hex,
+            account_id=account_id,
+            author=author,
+            text=text,
+            author_key_hash=_viewer_key_hash(),
+            created_at=datetime.now(timezone.utc).isoformat(),
+        ))
+        db.commit()
+        return jsonify({"notes": _notes_for(db, account_id)}), 201
+
+
+@app.delete("/api/players/<int:account_id>/notes/<note_id>")
+def api_player_note_delete(account_id: int, note_id: str):
+    if not _viewer_has_key():
+        return _deny_tournament()
+    with Session(engine) as db:
+        note = db.get(PlayerNote, note_id)
+        if note is None or note.account_id != account_id:
+            return jsonify({"error": "not found"}), 404
+        mine = _viewer_key_hash()
+        # A note restored from a backup written before author_key_hash existed
+        # belongs to nobody, so nobody can delete it.
+        if not mine or note.author_key_hash != mine:
+            return jsonify({"error": "Удалять можно только свои заметки."}), 403
+        db.delete(note)
+        db.commit()
+        return jsonify({"notes": _notes_for(db, account_id)})
+
+
 @app.get("/api/matches/<int:match_id>")
 def api_match_detail(match_id: int):
     """Everything we know about one game: both lineups (hero + player +
@@ -1641,8 +1735,6 @@ def api_archive_player_heroes():
     id, new file), the previous tournament's file survives there as reference
     data. Scoped by mixer_tournament_id, not league_id: consecutive mixer
     tournaments reuse the same dotabuff league."""
-    from datetime import datetime, timezone
-
     active = _resolve_mixer_tournament_id()
     with Session(engine) as session:
         decided = case((Match.radiant_win.is_not(None), 1), else_=0)
@@ -1767,22 +1859,10 @@ def api_all_substitutions():
     })
 
 
-@app.get("/api/tournament/heroes")
-def api_tournament_heroes():
-    scope = _requested_scope()
-    if not _may_see_tournament(scope):
-        return _deny_tournament()
-    with Session(engine) as session:
-        stats = compute_tournament_hero_stats(session, mixer_tournament_id=scope)
-    stats["tournament_id"] = scope
-    stats["tournament_label"] = _tournament_label(scope, None) if scope is not None else None
-    # Hero win rates and ban counts say nothing about a particular player, so
-    # they stay. "signature_by_player" names who monopolises a hero, which is a
-    # hero pool read from the other end.
-    stats["hero_pools_locked"] = not _may_see_hero_pools()
-    if stats["hero_pools_locked"]:
-        stats["signature_by_player"] = []
-    return jsonify(stats)
+# The tournament-wide hero stats page (win rates, ban counts, which heroes one
+# player had to themselves) lived here. Removed at the owner's call: it read as
+# trivia rather than something you act on, unlike the per-team and per-player
+# views. compute_tournament_hero_stats() went with it.
 
 
 @app.get("/api/backup")
@@ -1808,6 +1888,9 @@ def api_backup():
         ).scalars().all()
         queued = session.execute(
             select(QueuedPlayer).order_by(QueuedPlayer.player_uuid)
+        ).scalars().all()
+        notes = session.execute(
+            select(PlayerNote).order_by(PlayerNote.created_at)
         ).scalars().all()
         teams = session.execute(select(Team).order_by(Team.team_id)).scalars().all()
         all_players = session.execute(select(Player).order_by(Player.account_id)).scalars().all()
@@ -1874,6 +1957,16 @@ def api_backup():
                 "updated_at": q.updated_at,
             }
             for q in queued
+        ],
+        # The only authored data here - nothing else in this file would be lost
+        # for good if it went missing (see models.PlayerNote).
+        "player_notes": [
+            {
+                "note_id": n.note_id, "account_id": n.account_id,
+                "author": n.author, "text": n.text,
+                "author_key_hash": n.author_key_hash, "created_at": n.created_at,
+            }
+            for n in notes
         ],
         # match_id -> [[order, hero_id, team_id, is_pick], ...]
         "match_drafts": drafts,

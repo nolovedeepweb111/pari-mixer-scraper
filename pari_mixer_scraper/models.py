@@ -239,6 +239,29 @@ class SubstitutionEvent(Base):
     occurred_at: Mapped[str]
 
 
+class PlayerNote(Base):
+    """A scouting note somebody with a key wrote about a player.
+
+    The only data in this database that is authored here rather than fetched:
+    everything else can be re-collected from Steam, mixer-cup or OpenDota, and
+    a note cannot. That makes it the most fragile thing we store - the host
+    wipes its disk on redeploy - so notes go into /api/backup and come back in
+    restore_state_backup, and the collector merges them forward before it
+    promotes a rebuilt database over the live one.
+
+    author is free text the writer types (there are no accounts, only shared
+    access keys). author_key_hash is the HMAC of the key that wrote it, which
+    is what lets us allow deleting your own notes without knowing who you are."""
+    __tablename__ = "player_notes"
+
+    note_id: Mapped[str] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("players.account_id"))
+    author: Mapped[str]
+    text: Mapped[str]
+    author_key_hash: Mapped[str | None] = mapped_column(nullable=True)
+    created_at: Mapped[str]
+
+
 class QueuedPlayer(Base):
     """Last known state of a player in the tournament's substitute queue
     (mixer-cup.gg participantList, status BID), refreshed on every collect

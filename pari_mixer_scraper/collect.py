@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from .mixercup_client import MixerCupClient
 from .models import (
-    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, QueuedPlayer,
+    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, PlayerNote, QueuedPlayer,
     SubstitutionEvent, Team, TeamTournamentName,
     build_engine, configure_sqlite, ensure_schema,
 )
@@ -983,6 +983,26 @@ def restore_state_backup(session: Session, progress: ProgressFn) -> dict | None:
             if row.tournament_id is None and ev.get("tournament_id") is not None:
                 row.tournament_id = ev["tournament_id"]
 
+    existing_notes = {row[0] for row in session.execute(select(PlayerNote.note_id))}
+    known_accounts = {row[0] for row in session.execute(select(Player.account_id))}
+    added_notes = 0
+    for bn in data.get("player_notes", []):
+        if not bn.get("note_id") or bn["note_id"] in existing_notes:
+            continue
+        # The note references a player row; if that player isn't stored yet,
+        # a later run picks the note up.
+        if bn.get("account_id") not in known_accounts:
+            continue
+        session.add(PlayerNote(
+            note_id=bn["note_id"],
+            account_id=bn["account_id"],
+            author=bn.get("author") or "",
+            text=bn.get("text") or "",
+            author_key_hash=bn.get("author_key_hash"),
+            created_at=bn.get("created_at") or "",
+        ))
+        added_notes += 1
+
     existing_queue = {row[0] for row in session.execute(select(QueuedPlayer.player_uuid))}
     for qp in data.get("queued_players", []):
         if not qp.get("player_uuid") or qp["player_uuid"] in existing_queue:
@@ -996,12 +1016,12 @@ def restore_state_backup(session: Session, progress: ProgressFn) -> dict | None:
         ))
         added_queue += 1
 
-    if added_events or filled_positions or added_queue or added_teams or added_players:
+    if added_events or filled_positions or added_queue or added_teams or added_players or added_notes:
         session.commit()
         progress(
             f"State backup restored: +{added_teams} team(s), +{added_players} player(s), "
             f"+{added_events} substitution event(s), {filled_positions} queue position(s) "
-            f"filled, +{added_queue} queued player(s)"
+            f"filled, +{added_queue} queued player(s), +{added_notes} note(s)"
         )
     # Handed back so the caller can restore drafts later - those reference
     # match_id, which doesn't exist yet at this point in the run.
@@ -1508,6 +1528,47 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
     return new_count
 
 
+def _carry_over_notes(build_path: str, live_path: str, progress: ProgressFn) -> None:
+    """Copies player notes that appeared in the LIVE database after this build
+    was seeded from it.
+
+    Every build starts as a copy of the live file and is swapped over it at the
+    end, so whatever was written to the live database in between is destroyed by
+    the swap. For collected data that is harmless - the next run re-fetches it -
+    but a note is authored here and exists nowhere else, and a run takes
+    minutes. So live notes are merged forward right before each publish."""
+    import sqlite3
+
+    if not os.path.exists(live_path):
+        return
+    conn = sqlite3.connect(build_path)
+    try:
+        conn.execute("ATTACH DATABASE ? AS live", (live_path,))
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM live.sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "player_notes" not in tables:
+            return  # live file predates notes
+        cur = conn.execute(
+            'INSERT OR IGNORE INTO "player_notes"'
+            ' ("note_id", "account_id", "author", "text", "author_key_hash", "created_at")'
+            ' SELECT "note_id", "account_id", "author", "text", "author_key_hash", "created_at"'
+            ' FROM live."player_notes"'
+            # A note whose player somehow isn't in the rebuild would break the
+            # foreign key; skip it rather than fail the publish.
+            ' WHERE "account_id" IN (SELECT "account_id" FROM "players")'
+        )
+        conn.commit()
+        if cur.rowcount > 0:
+            progress(f"Carried {cur.rowcount} note(s) written during this run into the new database")
+    except Exception as e:
+        progress(f"Could not carry notes forward ({e}); publishing anyway.")
+    finally:
+        conn.close()
+
+
 def _atomic_publish(src: str, dst: str) -> None:
     """Copy src onto dst atomically: copy to a temp beside dst, then
     os.replace it in. A plain copyfile truncates dst in place, which a
@@ -1576,6 +1637,7 @@ def collect(
 
     def publish_core() -> None:
         if promote_to:
+            _carry_over_notes(db_path, promote_to, progress)
             _atomic_publish(db_path, promote_to)
             progress("Core data published to the live site (teams visible now).")
 
@@ -1600,6 +1662,8 @@ def collect(
         # empty build (fresh deploy + total upstream outage) must never
         # replace a live DB that has data.
         if total_matches > 0 or total_teams > 0:
+            # Anything written to the live site while the slow phases ran.
+            _carry_over_notes(db_path, promote_to, progress)
             os.replace(db_path, promote_to)
             progress(f"Full data published ({total_matches} matches, {new_count} new).")
         else:

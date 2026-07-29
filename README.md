@@ -181,7 +181,6 @@ GitHub Actions — поправить `cron` в `.github/workflows/keep-alive.ym
 | `/mixercup2/team/10186631` | команда — состав и игры **того** турнира |
 | `/mixercup2/team/10186631/analysis` | сразу вкладка аналитики (ещё есть `/subs`) |
 | `/mixercup2/players` | лидерборд турнира |
-| `/mixercup2/heroes` | статистика по героям турнира |
 | `/mixercup2/subs` | замены турнира |
 | `/player/1840524315` | игрок: сквозная история по всем турнирам |
 | `/match/8919550204` | матч: составы, KDA и драфт |
@@ -266,8 +265,18 @@ python -m pari_mixer_scraper.report --db tournament.db
 - `matches(match_id, league_id, start_time, duration, radiant_team_id, dire_team_id, radiant_win)`
 - `match_players(match_id, account_id, hero_id, team_id, is_radiant, kills, deaths, assists)`
 
+- `player_notes(note_id, account_id, author, text, author_key_hash, created_at)`
+
 `match_players` — основная таблица для вопроса "какой игрок на каком герое
 играл"; на ней строятся и веб-эндпоинты, и `report.py`.
+
+`player_notes` — единственные данные, которые здесь пишутся, а не скачиваются:
+всё остальное можно собрать заново из Steam, mixer-cup и OpenDota, а заметку
+нельзя. Поэтому она попадает в `/api/backup`, восстанавливается из него и
+переносится сборщиком в новую базу перед подменой (`_carry_over_notes`) — иначе
+заметка, написанная во время сбора, пропала бы вместе со старым файлом.
+Заметки, созданные после последнего коммита бэкапа, при сбросе диска всё же
+теряются: интервал задаётся расписанием в `.github/workflows/keep-alive.yml`.
 
 ## API веб-приложения
 
@@ -282,6 +291,12 @@ python -m pari_mixer_scraper.report --db tournament.db
   тогдашнее название. Нужен потому, что mixer-cup переиспользует одни и те же
   зарегистрированные в доте команды из кубка в кубок. Тот же параметр
   понимает `/api/teams/<team_id>/analysis`.
+- `GET/POST /api/players/<account_id>/notes`, `DELETE .../notes/<note_id>` —
+  заметки об игроке. Общие для всех, у кого есть ключ: каждая подписана ником,
+  который автор ввёл сам (аккаунтов нет, есть общие ключи). Читать и писать
+  можно только с ключом, удалять — только свои: заметка помнит HMAC ключа,
+  которым была создана. Лимиты: 2000 символов текста, 40 ника, 200 заметок на
+  игрока.
 - `POST /api/collect` — запускает сбор данных в фоновом потоке (409, если уже запущен).
 - `GET /api/collect/status` — статус текущего/последнего сбора и лог.
 

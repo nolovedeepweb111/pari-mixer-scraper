@@ -121,7 +121,6 @@ function parsePath(pathname) {
   const cup = cups.bySlug.get(slug);
   const tournamentId = cup ? cup.id : null;
   if (parts[1] === "players") return { view: "players", slug, tournamentId };
-  if (parts[1] === "heroes") return { view: "heroes", slug, tournamentId };
   if (parts[1] === "subs") return { view: "subs", slug, tournamentId };
   if (parts[1] === "team" && parts[2]) {
     // "subs" reads better in an address than the internal tab name.
@@ -185,8 +184,6 @@ async function renderRoute() {
       return loadTeamDetail(route.teamId, route.tab, route.tournamentId);
     case "players":
       return loadPlayersLeaderboard(cupId);
-    case "heroes":
-      return loadTournamentStats(cupId);
     case "subs":
       return loadAllSubstitutions(cupId);
     case "player":
@@ -209,6 +206,18 @@ if (homeLink) {
 
 function formatMmr(value) {
   return value == null ? "?" : Math.round(value).toLocaleString("ru-RU");
+}
+
+// Mandatory for notes: they are the one thing on this site typed in by a
+// person, and every note is shown to every other key holder, so an unescaped
+// "<img onerror=...>" would run in their browser.
+function escapeHtml(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function heroIconUrl(slug) {
@@ -565,6 +574,95 @@ async function loadTeamDetail(teamId, tab, tournamentId) {
   showTab(activeTab);
 }
 
+// --- Player notes ----------------------------------------------------------
+// Shared between everyone holding a key: each note carries the nickname its
+// author typed, so a scouting board reads as a conversation. The nickname is
+// remembered locally so it doesn't have to be retyped.
+const NOTE_AUTHOR_STORAGE = "pmc_note_author";
+
+function renderNotes(container, accountId, notes) {
+  const saved = localStorage.getItem(NOTE_AUTHOR_STORAGE) || "";
+  const items = notes.length
+    ? notes
+        .map((n) => {
+          const when = new Date(n.created_at).toLocaleString("ru-RU", {
+            dateStyle: "medium", timeStyle: "short",
+          });
+          const del = n.can_delete
+            ? `<button class="note-delete" data-note-id="${escapeHtml(n.note_id)}" title="Удалить">×</button>`
+            : "";
+          return `
+            <li class="note">
+              <div class="note-head">
+                <b>${escapeHtml(n.author)}</b>
+                <span class="note-date">${when}</span>
+                ${del}
+              </div>
+              <div class="note-text">${escapeHtml(n.text)}</div>
+            </li>`;
+        })
+        .join("")
+    : '<li class="hint">Пока никто ничего не написал.</li>';
+
+  container.innerHTML = `
+    <h4>Заметки</h4>
+    <ul class="note-list">${items}</ul>
+    <form class="note-form">
+      <input class="note-author" placeholder="Ваш ник" maxlength="40" value="${escapeHtml(saved)}">
+      <textarea class="note-text-input" placeholder="Что стоит помнить об этом игроке" rows="3" maxlength="2000"></textarea>
+      <button type="submit">Добавить</button>
+      <span class="note-error"></span>
+    </form>
+  `;
+
+  const form = container.querySelector(".note-form");
+  const authorEl = container.querySelector(".note-author");
+  const textEl = container.querySelector(".note-text-input");
+  const errEl = container.querySelector(".note-error");
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    errEl.textContent = "";
+    const author = authorEl.value.trim();
+    const text = textEl.value.trim();
+    if (!author || !text) {
+      errEl.textContent = "Заполните ник и текст.";
+      return;
+    }
+    localStorage.setItem(NOTE_AUTHOR_STORAGE, author);
+    const res = await fetch(`/api/players/${accountId}/notes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ author, text }),
+    });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      errEl.textContent = d.error || d.message || "Не удалось сохранить.";
+      return;
+    }
+    renderNotes(container, accountId, (await res.json()).notes);
+  });
+
+  for (const btn of container.querySelectorAll(".note-delete")) {
+    btn.addEventListener("click", async () => {
+      const res = await fetch(`/api/players/${accountId}/notes/${btn.dataset.noteId}`, {
+        method: "DELETE",
+      });
+      if (res.ok) renderNotes(container, accountId, (await res.json()).notes);
+    });
+  }
+}
+
+async function loadNotes(container, accountId) {
+  const res = await fetch(`/api/players/${accountId}/notes`);
+  if (!res.ok) {
+    // Without a key notes are neither readable nor writable.
+    container.innerHTML = '<h4>Заметки</h4><p class="hint">По ключу.</p>';
+    return;
+  }
+  renderNotes(container, accountId, (await res.json()).notes);
+}
+
 async function loadPlayerPage(accountId) {
   detailEl.innerHTML = '<p class="hint">Загружаю профиль игрока...</p>';
   const res = await fetch(`/api/players/${accountId}`);
@@ -662,9 +760,14 @@ async function loadPlayerPage(accountId) {
             <tbody>${matchRows}</tbody>
           </table>` : '<p class="hint">Матчей пока нет.</p>'}
       </div>
-      <aside class="player-pools">${heroPoolsHtml}</aside>
+      <aside class="player-pools">
+        ${heroPoolsHtml}
+        <div class="analysis-block player-notes-block" id="player-notes"></div>
+      </aside>
     </div>
   `;
+
+  loadNotes(detailEl.querySelector("#player-notes"), accountId);
 
   for (const link of detailEl.querySelectorAll(".opponent-link")) {
     // A row from a past cup carries that cup's id, so the link points at that
@@ -863,59 +966,6 @@ async function loadPlayersLeaderboard(tournamentId) {
 }
 
 playersBtn.addEventListener("click", () => navigate(cupPath(currentCupId(), "players")));
-
-const tournamentStatsBtn = document.getElementById("tournament-stats-btn");
-
-function renderTournamentHeroStats(data) {
-  const winRateHtml = data.top_win_rate.length
-    ? data.top_win_rate
-        .map((h) => `<span class="tag tag-pick">${h.hero} — ${h.win_rate}% (${h.wins}/${h.games})</span>`)
-        .join("")
-    : '<span class="hint">нет данных</span>';
-
-  const bannedHtml = data.most_banned.length
-    ? data.most_banned.map((h) => `<span class="tag tag-ban">${h.hero} ×${h.bans}</span>`).join("")
-    : '<span class="hint">нет данных</span>';
-
-  const monopolyHtml = data.hero_pools_locked
-    ? '<span class="hint">по ключу — здесь видно, за кем закреплены герои турнира</span>'
-    : data.signature_by_player.length
-      ? data.signature_by_player
-          .map((h) => {
-            const players = h.top_players.map((p) => `${p.name} (${p.games})`).join(", ");
-            return `<span class="tag tag-neutral">${h.hero} — ${h.concentration}%: ${players}</span>`;
-          })
-          .join("")
-      : '<span class="hint">нет данных</span>';
-
-  detailEl.innerHTML = `
-    <h2>Статистика по героям · ${data.tournament_label || "турнир"}</h2>
-    <p class="hint">Учитываются герои минимум с ${data.min_games} играми.</p>
-    <div class="analysis-grid">
-      <div class="analysis-block">
-        <h4>Самые успешные герои (win rate)</h4>
-        <div class="tag-list">${winRateHtml}</div>
-      </div>
-      <div class="analysis-block">
-        <h4>Чаще всего банят</h4>
-        <div class="tag-list">${bannedHtml}</div>
-      </div>
-      <div class="analysis-block">
-        <h4>Играют почти всегда одни и те же</h4>
-        <div class="tag-list">${monopolyHtml}</div>
-      </div>
-    </div>
-  `;
-}
-
-async function loadTournamentStats(tournamentId) {
-  detailEl.innerHTML = '<p class="hint">Считаю статистику...</p>';
-  const res = await fetch(`/api/tournament/heroes${scopeQuery(tournamentId)}`);
-  const data = await res.json();
-  renderTournamentHeroStats(data);
-}
-
-tournamentStatsBtn.addEventListener("click", () => navigate(cupPath(currentCupId(), "heroes")));
 
 const allSubsBtn = document.getElementById("all-subs-btn");
 

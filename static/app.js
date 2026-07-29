@@ -18,6 +18,146 @@ const collectStatusEl = document.getElementById("collect-status");
 let activeTeamId = null;
 let activeTab = "composition";
 
+// --- Routing ---------------------------------------------------------------
+// Every view has an address (/mixercup2/team/123), so pages can be linked to
+// and the browser's back button works. The server answers all of them with the
+// same shell (see app.spa_route); this router reads location.pathname and
+// decides what to render. Which cup's incarnation of a team is on screen comes
+// from the URL too - a Steam team id is reused cup after cup.
+let route = { view: "cup" };
+let cups = { activeId: null, activeSlug: null, list: [], bySlug: new Map(), byId: new Map() };
+let sidebarTournamentId; // undefined until the sidebar has been filled once
+
+async function loadTournaments() {
+  const res = await fetch("/api/tournaments");
+  const data = await res.json();
+  cups = {
+    activeId: data.active_id,
+    activeSlug: data.active_slug,
+    list: data.tournaments,
+    bySlug: new Map(data.tournaments.map((t) => [t.slug, t])),
+    byId: new Map(data.tournaments.map((t) => [t.id, t])),
+  };
+  renderCupSwitcher();
+}
+
+function renderCupSwitcher() {
+  const sel = document.getElementById("cup-switcher");
+  if (!sel) return;
+  // A cup with no games of its own is only worth listing while it's the live
+  // one (a freshly opened cup has rosters before it has matches).
+  const shown = cups.list.filter((t) => t.has_matches || t.is_active);
+  if (shown.length < 2) return;
+  sel.innerHTML = shown
+    .map((t) => `<option value="${t.slug}">${t.label}${t.is_active ? " · сейчас" : ""}</option>`)
+    .join("");
+  sel.onchange = () => navigate(`/${sel.value}`);
+  sel.style.display = "";
+}
+
+function syncCupSwitcher() {
+  const sel = document.getElementById("cup-switcher");
+  const slug = slugFor(currentCupId());
+  if (sel && slug && sel.querySelector(`option[value="${slug}"]`)) sel.value = slug;
+}
+
+function slugFor(tournamentId) {
+  const cup = cups.byId.get(tournamentId);
+  return (cup && cup.slug) || cups.activeSlug;
+}
+
+function cupPath(tournamentId, rest) {
+  const slug = slugFor(tournamentId);
+  // No cup resolved yet (mixer-cup unreachable on a cold start): stay on the
+  // root, which always means "whatever cup is current".
+  if (!slug) return rest ? `/${rest}` : "/";
+  return rest ? `/${slug}/${rest}` : `/${slug}`;
+}
+
+function parsePath(pathname) {
+  const parts = pathname.replace(/^\/+|\/+$/g, "").split("/").filter(Boolean);
+  if (parts.length === 0) {
+    return { view: "cup", slug: cups.activeSlug, tournamentId: cups.activeId };
+  }
+  if (parts[0] === "player") return { view: "player", accountId: Number(parts[1]) };
+  if (parts[0] === "match") return { view: "match", matchId: Number(parts[1]) };
+
+  const slug = parts[0];
+  const cup = cups.bySlug.get(slug);
+  const tournamentId = cup ? cup.id : null;
+  if (parts[1] === "players") return { view: "players", slug, tournamentId };
+  if (parts[1] === "heroes") return { view: "heroes", slug, tournamentId };
+  if (parts[1] === "subs") return { view: "subs", slug, tournamentId };
+  if (parts[1] === "team" && parts[2]) {
+    // "subs" reads better in an address than the internal tab name.
+    const tab = parts[3] === "subs" ? "substitutions" : parts[3] || "composition";
+    return { view: "team", slug, tournamentId, teamId: Number(parts[2]), tab };
+  }
+  return { view: "cup", slug, tournamentId };
+}
+
+// The cup the visitor is currently browsing - the header's buttons stay
+// inside it, so "Игроки" on /mixercup1 means that cup's players.
+function currentCupId() {
+  return route.tournamentId != null ? route.tournamentId : cups.activeId;
+}
+
+function navigate(path, replace) {
+  if (path === location.pathname) return renderRoute();
+  if (replace) history.replaceState({}, "", path);
+  else history.pushState({}, "", path);
+  return renderRoute();
+}
+
+// The scope every list endpoint takes; omitted for the live cup so the root
+// page keeps working even before the cup list has loaded.
+function scopeQuery(tournamentId) {
+  return tournamentId != null && tournamentId !== cups.activeId
+    ? `?tournament=${tournamentId}`
+    : "";
+}
+
+async function renderRoute() {
+  route = parsePath(location.pathname);
+  // A slug we have no tournament for: say so instead of quietly showing the
+  // current cup under an address that promises another one.
+  if (route.slug && !cups.bySlug.has(route.slug)) {
+    detailEl.innerHTML = '<p class="hint">Такого турнира нет. Выберите турнир в шапке.</p>';
+    return;
+  }
+  const cupId = currentCupId();
+  syncCupSwitcher();
+  if (route.view !== "team") activeTeamId = null;
+  if (sidebarTournamentId !== cupId) await loadTeams(cupId);
+  else highlightSidebar();
+
+  switch (route.view) {
+    case "team":
+      return loadTeamDetail(route.teamId, route.tab, route.tournamentId);
+    case "players":
+      return loadPlayersLeaderboard(cupId);
+    case "heroes":
+      return loadTournamentStats(cupId);
+    case "subs":
+      return loadAllSubstitutions(cupId);
+    case "player":
+      return loadPlayerPage(route.accountId);
+    case "match":
+      return loadMatchPage(route.matchId);
+    default:
+      detailEl.innerHTML = '<p class="hint">Выберите команду слева</p>';
+      highlightSidebar();
+  }
+}
+
+window.addEventListener("popstate", renderRoute);
+
+const homeLink = document.getElementById("home-link");
+if (homeLink) {
+  homeLink.style.cursor = "pointer";
+  homeLink.addEventListener("click", () => navigate(cupPath(currentCupId())));
+}
+
 function formatMmr(value) {
   return value == null ? "?" : Math.round(value).toLocaleString("ru-RU");
 }
@@ -64,9 +204,16 @@ function renderDraftTeamRow(teamName, entries) {
   `;
 }
 
-async function loadTeams() {
-  const res = await fetch("/api/teams");
+function highlightSidebar() {
+  for (const btn of teamsEl.querySelectorAll(".team-btn")) {
+    btn.classList.toggle("active", Number(btn.dataset.teamId) === activeTeamId);
+  }
+}
+
+async function loadTeams(tournamentId) {
+  const res = await fetch(`/api/teams${scopeQuery(tournamentId)}`);
   const teams = await res.json();
+  sidebarTournamentId = tournamentId;
 
   teamsEl.innerHTML = "";
   if (teams.length === 0) {
@@ -76,11 +223,17 @@ async function loadTeams() {
 
   for (const team of teams) {
     const btn = document.createElement("button");
-    btn.className = "team-btn" + (team.team_id === activeTeamId ? " active" : "");
-    btn.textContent = `${team.name} (${team.player_count}) · ${formatMmr(team.total_mmr)} MMR`;
-    btn.onclick = () => loadTeamDetail(team.team_id);
+    btn.className = "team-btn";
+    btn.dataset.teamId = team.team_id;
+    // A finished cup has no meaningful team total (see api_team_detail), so
+    // the MMR half of the label is dropped rather than shown as "?".
+    btn.textContent = team.total_mmr != null
+      ? `${team.name} (${team.player_count}) · ${formatMmr(team.total_mmr)} MMR`
+      : `${team.name} (${team.player_count})`;
+    btn.onclick = () => navigate(cupPath(tournamentId, `team/${team.team_id}`));
     teamsEl.appendChild(btn);
   }
+  highlightSidebar();
 }
 
 const ROLE_LABELS = {
@@ -117,14 +270,19 @@ function renderComposition(team) {
       ${rolesLine}
       <ul>${heroItems || '<li><span class="hint">ещё не играл(а) за команду</span></li>'}</ul>
     `;
-    card.querySelector(".player-link").addEventListener("click", () => loadPlayerPage(player.account_id));
+    card.querySelector(".player-link").addEventListener("click", () => navigate(`/player/${player.account_id}`));
     grid.appendChild(card);
   }
 
-  const mmrLine = document.createElement("p");
-  mmrLine.className = "total-mmr";
-  mmrLine.textContent = `Суммарный MMR: ${formatMmr(team.total_mmr)}`;
-  container.appendChild(mmrLine);
+  // Null for a past cup's page (a squad that changed all cup has no single
+  // total) and for teams whose ratings we never learned - in both cases the
+  // line says nothing, so it's left out entirely.
+  if (team.total_mmr != null) {
+    const mmrLine = document.createElement("p");
+    mmrLine.className = "total-mmr";
+    mmrLine.textContent = `Суммарный MMR: ${formatMmr(team.total_mmr)}`;
+    container.appendChild(mmrLine);
+  }
 
   if (team.next_opponent) {
     const opp = team.next_opponent;
@@ -139,7 +297,9 @@ function renderComposition(team) {
     nextLine.innerHTML = `Следующий соперник: ${opponentLabel} · ${when}`;
     const link = nextLine.querySelector(".opponent-link");
     if (link) {
-      link.addEventListener("click", () => loadTeamDetail(opp.opponent_team_id));
+      // Always the live cup: the next opponent only exists there.
+      link.addEventListener("click", () =>
+        navigate(cupPath(cups.activeId, `team/${opp.opponent_team_id}`)));
     }
     container.appendChild(nextLine);
   }
@@ -160,7 +320,7 @@ function renderComposition(team) {
     lineupLine.className = "last-lineup";
     lineupLine.innerHTML = `Состав в последнем матче${vs}${when ? ` (${when})` : ""}: ${names}`;
     for (const btn of lineupLine.querySelectorAll(".player-link")) {
-      btn.addEventListener("click", () => loadPlayerPage(Number(btn.dataset.accountId)));
+      btn.addEventListener("click", () => navigate(`/player/${btn.dataset.accountId}`));
     }
     container.appendChild(lineupLine);
   }
@@ -197,9 +357,9 @@ function heroTagList(items, cssClass) {
   return items.map((i) => `<span class="tag ${cssClass}">${i.hero} ×${i.count}</span>`).join("");
 }
 
-async function renderAnalysisTab(teamId, container) {
+async function renderAnalysisTab(teamId, container, scope) {
   container.innerHTML = '<p class="hint">Считаю аналитику...</p>';
-  const res = await fetch(`/api/teams/${teamId}/analysis`);
+  const res = await fetch(`/api/teams/${teamId}/analysis${scope || ""}`);
   if (!res.ok) {
     container.innerHTML = '<p class="hint">Не удалось получить аналитику.</p>';
     return;
@@ -287,29 +447,41 @@ async function renderSubstitutionsTab(teamId, container) {
   container.innerHTML = `<ul class="sub-list">${rows}</ul>`;
 }
 
-async function loadTeamDetail(teamId, tab) {
+async function loadTeamDetail(teamId, tab, tournamentId) {
   activeTeamId = teamId;
   activeTab = tab || "composition";
-  for (const btn of teamsEl.querySelectorAll(".team-btn")) {
-    btn.classList.remove("active");
-  }
+  highlightSidebar();
 
-  const res = await fetch(`/api/teams/${teamId}`);
+  // Opens the incarnation of this team that played in the requested cup;
+  // without it a link out of a past cup's match lands on today's squad.
+  const scope = scopeQuery(tournamentId);
+  const res = await fetch(`/api/teams/${teamId}${scope}`);
   if (!res.ok) {
     detailEl.innerHTML = '<p class="hint">Команда не найдена.</p>';
     return;
   }
   const team = await res.json();
 
+  // Past cups keep no substitution history (only the active cup's is stored),
+  // so that tab would always be empty there.
+  const historyBadge = team.is_historical && team.tournament_label
+    ? ` <span class="tournament-badge">${team.tournament_label}</span>`
+    : "";
+  const subsTab = team.is_historical
+    ? ""
+    : '<button class="tab-btn" data-tab="substitutions">Замены</button>';
   detailEl.innerHTML = `
-    <h2>${team.name}</h2>
+    <h2>${team.name}${historyBadge}</h2>
     <div class="tabs">
       <button class="tab-btn" data-tab="composition">Состав</button>
       <button class="tab-btn" data-tab="analysis">Аналитика</button>
-      <button class="tab-btn" data-tab="substitutions">Замены</button>
+      ${subsTab}
     </div>
     <div id="tab-content"></div>
   `;
+  if (team.is_historical && activeTab === "substitutions") {
+    activeTab = "composition";
+  }
 
   const tabContent = detailEl.querySelector("#tab-content");
   const tabButtons = detailEl.querySelectorAll(".tab-btn");
@@ -323,25 +495,22 @@ async function loadTeamDetail(teamId, tab) {
       tabContent.innerHTML = "";
       tabContent.appendChild(renderComposition(team));
     } else if (tab === "analysis") {
-      renderAnalysisTab(teamId, tabContent);
+      renderAnalysisTab(teamId, tabContent, scope);
     } else {
       renderSubstitutionsTab(teamId, tabContent);
     }
   }
 
   for (const btn of tabButtons) {
-    btn.addEventListener("click", () => showTab(btn.dataset.tab));
+    const segment = { composition: "", analysis: "/analysis", substitutions: "/subs" }[btn.dataset.tab];
+    const base = cupPath(tournamentId, `team/${teamId}`);
+    btn.addEventListener("click", () => navigate(base + segment));
   }
 
   showTab(activeTab);
-  loadTeams();
 }
 
 async function loadPlayerPage(accountId) {
-  activeTeamId = null;
-  for (const btn of teamsEl.querySelectorAll(".team-btn")) {
-    btn.classList.remove("active");
-  }
   detailEl.innerHTML = '<p class="hint">Загружаю профиль игрока...</p>';
   const res = await fetch(`/api/players/${accountId}`);
   if (!res.ok) {
@@ -411,7 +580,7 @@ async function loadPlayerPage(accountId) {
           <td class="subs-date">${when}</td>
           <td>${m.hero}</td>
           <td>${result}</td>
-          <td><button class="opponent-link" data-team-id="${m.team_id}">${m.team_name}</button>${formerBadge}</td>
+          <td><button class="opponent-link" data-team-id="${m.team_id}" data-tournament-id="${m.mixer_tournament_id ?? ""}">${m.team_name}</button>${formerBadge}</td>
           <td>против ${m.opponent_name}</td>
         </tr>
       `;
@@ -436,13 +605,17 @@ async function loadPlayerPage(accountId) {
   `;
 
   for (const link of detailEl.querySelectorAll(".opponent-link")) {
-    link.addEventListener("click", () => loadTeamDetail(Number(link.dataset.teamId)));
+    // A row from a past cup carries that cup's id, so the link points at that
+    // cup's address and opens the squad that actually played the match.
+    const tid = link.dataset.tournamentId;
+    link.addEventListener("click", () =>
+      navigate(cupPath(tid ? Number(tid) : cups.activeId, `team/${link.dataset.teamId}`)));
   }
   for (const row of detailEl.querySelectorAll(".match-row")) {
     row.addEventListener("click", (e) => {
       // The team button inside the row keeps its own action.
       if (e.target.closest(".opponent-link")) return;
-      loadMatchPage(Number(row.dataset.matchId), accountId);
+      navigate(`/match/${row.dataset.matchId}`);
     });
   }
 }
@@ -485,7 +658,7 @@ function lineupTable(side, winnerSide, side_key) {
   `;
 }
 
-async function loadMatchPage(matchId, backAccountId) {
+async function loadMatchPage(matchId) {
   detailEl.innerHTML = '<p class="hint">Загружаю матч...</p>';
   const res = await fetch(`/api/matches/${matchId}`);
   if (!res.ok) {
@@ -501,8 +674,10 @@ async function loadMatchPage(matchId, backAccountId) {
     ? ` · ${Math.floor(m.duration / 60)}:${String(m.duration % 60).padStart(2, "0")}`
     : "";
   const winnerSide = m.radiant_win == null ? null : (m.radiant_win ? "radiant" : "dire");
-  const backBtn = backAccountId != null
-    ? `<button class="back-link" id="match-back">← к игроку</button>`
+  // With real addresses the browser's own history is the way back, so the
+  // button just steps back rather than needing to know where it came from.
+  const backBtn = history.length > 1
+    ? `<button class="back-link" id="match-back">← назад</button>`
     : "";
 
   const draftHtml = m.has_draft
@@ -525,9 +700,9 @@ async function loadMatchPage(matchId, backAccountId) {
   `;
 
   const back = document.getElementById("match-back");
-  if (back) back.addEventListener("click", () => loadPlayerPage(backAccountId));
+  if (back) back.addEventListener("click", () => history.back());
   for (const btn of detailEl.querySelectorAll(".player-link")) {
-    btn.addEventListener("click", () => loadPlayerPage(Number(btn.dataset.accountId)));
+    btn.addEventListener("click", () => navigate(`/player/${btn.dataset.accountId}`));
   }
 }
 
@@ -581,7 +756,7 @@ function renderLeaderboard(sortKey, sortDesc) {
   const arrow = (k) => (k === sortKey ? (sortDesc ? " ↓" : " ↑") : "");
   detailEl.innerHTML = `
     <h2>Игроки · ${data.tournament_label || "турнир"}</h2>
-    <p class="hint">Винрейт и герои — только за текущий турнир. Клик по заголовку — сортировка.</p>
+    <p class="hint">Винрейт и герои — только за этот турнир. Клик по заголовку — сортировка.</p>
     <table class="subs-table leaderboard-table">
       <thead><tr>
         <th></th>
@@ -604,20 +779,17 @@ function renderLeaderboard(sortKey, sortDesc) {
     });
   }
   for (const btn of detailEl.querySelectorAll(".player-link")) {
-    btn.addEventListener("click", () => loadPlayerPage(Number(btn.dataset.accountId)));
+    btn.addEventListener("click", () => navigate(`/player/${btn.dataset.accountId}`));
   }
   for (const link of detailEl.querySelectorAll(".opponent-link")) {
-    link.addEventListener("click", () => loadTeamDetail(Number(link.dataset.teamId)));
+    link.addEventListener("click", () =>
+      navigate(cupPath(data.tournament_id, `team/${link.dataset.teamId}`)));
   }
 }
 
-async function loadPlayersLeaderboard() {
-  activeTeamId = null;
-  for (const btn of teamsEl.querySelectorAll(".team-btn")) {
-    btn.classList.remove("active");
-  }
+async function loadPlayersLeaderboard(tournamentId) {
   detailEl.innerHTML = '<p class="hint">Загружаю игроков...</p>';
-  const res = await fetch("/api/players");
+  const res = await fetch(`/api/players${scopeQuery(tournamentId)}`);
   if (!res.ok) {
     detailEl.innerHTML = '<p class="hint">Не удалось получить список игроков.</p>';
     return;
@@ -626,7 +798,7 @@ async function loadPlayersLeaderboard() {
   renderLeaderboard("mmr", true);
 }
 
-playersBtn.addEventListener("click", loadPlayersLeaderboard);
+playersBtn.addEventListener("click", () => navigate(cupPath(currentCupId(), "players")));
 
 const tournamentStatsBtn = document.getElementById("tournament-stats-btn");
 
@@ -651,7 +823,7 @@ function renderTournamentHeroStats(data) {
     : '<span class="hint">нет данных</span>';
 
   detailEl.innerHTML = `
-    <h2>Статистика по героям турнира</h2>
+    <h2>Статистика по героям · ${data.tournament_label || "турнир"}</h2>
     <p class="hint">Учитываются герои минимум с ${data.min_games} играми.</p>
     <div class="analysis-grid">
       <div class="analysis-block">
@@ -670,32 +842,25 @@ function renderTournamentHeroStats(data) {
   `;
 }
 
-async function loadTournamentStats() {
-  activeTeamId = null;
-  for (const btn of teamsEl.querySelectorAll(".team-btn")) {
-    btn.classList.remove("active");
-  }
+async function loadTournamentStats(tournamentId) {
   detailEl.innerHTML = '<p class="hint">Считаю статистику...</p>';
-  const res = await fetch("/api/tournament/heroes");
+  const res = await fetch(`/api/tournament/heroes${scopeQuery(tournamentId)}`);
   const data = await res.json();
   renderTournamentHeroStats(data);
 }
 
-tournamentStatsBtn.addEventListener("click", loadTournamentStats);
+tournamentStatsBtn.addEventListener("click", () => navigate(cupPath(currentCupId(), "heroes")));
 
 const allSubsBtn = document.getElementById("all-subs-btn");
 
-async function loadAllSubstitutions() {
-  activeTeamId = null;
-  for (const btn of teamsEl.querySelectorAll(".team-btn")) {
-    btn.classList.remove("active");
-  }
+async function loadAllSubstitutions(tournamentId) {
   detailEl.innerHTML = '<p class="hint">Загружаю замены...</p>';
-  const res = await fetch("/api/substitutions");
+  const res = await fetch(`/api/substitutions${scopeQuery(tournamentId)}`);
   const data = await res.json();
+  const title = `Замены · ${data.tournament_label || "турнир"}`;
 
   if (!data.substitutions.length) {
-    detailEl.innerHTML = "<h2>Замены турнира</h2><p class=\"hint\">Замен пока не было.</p>";
+    detailEl.innerHTML = `<h2>${title}</h2><p class="hint">Замен в этом турнире не сохранилось.</p>`;
     return;
   }
 
@@ -728,7 +893,7 @@ async function loadAllSubstitutions() {
     .join("");
 
   detailEl.innerHTML = `
-    <h2>Замены турнира</h2>
+    <h2>${title}</h2>
     <table class="subs-table">
       <thead>
         <tr>
@@ -741,11 +906,12 @@ async function loadAllSubstitutions() {
   `;
 
   for (const link of detailEl.querySelectorAll(".opponent-link")) {
-    link.addEventListener("click", () => loadTeamDetail(Number(link.dataset.teamId)));
+    link.addEventListener("click", () =>
+      navigate(cupPath(data.tournament_id, `team/${link.dataset.teamId}`)));
   }
 }
 
-allSubsBtn.addEventListener("click", loadAllSubstitutions);
+allSubsBtn.addEventListener("click", () => navigate(cupPath(currentCupId(), "subs")));
 
 // Матчи обновляются сами (внутренний таймер на сервере + внешний пинг раз
 // в 10 минут) - здесь просто пассивно отражаем текущий статус и
@@ -771,10 +937,9 @@ async function pollCollectStatus() {
   // whole run to complete.
   const sidebarEmpty = teamsEl.querySelectorAll(".team-btn").length === 0;
   if ((wasRunning && !status.running) || (status.running && sidebarEmpty)) {
-    loadTeams();
-    if (activeTeamId != null) {
-      loadTeamDetail(activeTeamId, activeTab);
-    }
+    // Re-render whatever address is open, sidebar included.
+    sidebarTournamentId = undefined;
+    renderRoute();
   }
   wasRunning = status.running;
 }
@@ -798,4 +963,7 @@ if (logoutBtn) {
 
 setInterval(pollCollectStatus, 15000);
 pollCollectStatus();
-loadTeams();
+
+// The cup list has to be known before the first render: it turns the slug in
+// the address into a tournament id.
+loadTournaments().then(renderRoute);

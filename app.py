@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import sys
 import threading
 import time
@@ -11,7 +12,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, redirect, request, send_from_directory, session
-from sqlalchemy import case, func, select
+from werkzeug.routing import BaseConverter
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
@@ -22,7 +24,7 @@ from pari_mixer_scraper.models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, QueuedPlayer,
     TeamTournamentName,
     SubstitutionEvent, Team,
-    build_engine, configure_sqlite,
+    build_engine, configure_sqlite, ensure_schema,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -56,6 +58,9 @@ app = Flask(__name__, static_folder="static", static_url_path="")
 # Opening a fresh connection per request always sees the current file.
 engine = configure_sqlite(build_engine(DB_PATH, poolclass=NullPool))
 Base.metadata.create_all(engine)
+# A database file promoted by an older release can predate a column added
+# since; the app reads those columns on every page.
+ensure_schema(engine)
 
 # ---------------------------------------------------------------------------
 # Access control
@@ -484,13 +489,75 @@ def index():
     return send_from_directory(app.static_folder, "index.html")
 
 
+# Every in-app address is served by the same shell; the frontend router reads
+# location.pathname and renders from there (see static/app.js). A converter
+# rather than a bare <slug> so these rules can never swallow /app.js and
+# /style.css, which the static handler serves from the same root path.
+class _TournamentSlugConverter(BaseConverter):
+    regex = r"(?:mixercup|cup)\d+"
+
+
+app.url_map.converters["tslug"] = _TournamentSlugConverter
+
+
+@app.get("/<tslug:slug>")
+@app.get("/<tslug:slug>/players")
+@app.get("/<tslug:slug>/heroes")
+@app.get("/<tslug:slug>/subs")
+@app.get("/<tslug:slug>/team/<int:team_id>")
+@app.get("/<tslug:slug>/team/<int:team_id>/<any(composition, analysis, subs):section>")
+@app.get("/player/<int:account_id>")
+@app.get("/match/<int:match_id>")
+def spa_route(**_kwargs):
+    return send_from_directory(app.static_folder, "index.html")
+
+
+@app.get("/api/tournaments")
+def api_tournaments():
+    """The cup switcher's menu: every tournament with an address, newest
+    first, and which one is live."""
+    active = _resolve_mixer_tournament_id()
+    with Session(engine) as session:
+        ids = _known_tournament_ids(session)
+        played = {
+            t for (t,) in session.execute(
+                select(Match.mixer_tournament_id)
+                .where(Match.mixer_tournament_id.is_not(None)).distinct()
+            )
+        }
+    return jsonify({
+        "active_id": active,
+        "active_slug": _tournament_slug(active) if active is not None else None,
+        "tournaments": [
+            {
+                "id": tournament_id,
+                "slug": _tournament_slug(tournament_id),
+                "label": _tournament_label(tournament_id, None),
+                "is_active": tournament_id == active,
+                "has_matches": tournament_id in played,
+            }
+            for tournament_id in ids
+            # Only cups this site can actually show. mixer-cup's tournament
+            # list reaches back to their own test events from before we
+            # collected anything - those have an id and a name here and
+            # nothing else, and they are not this cup series.
+            if tournament_id in played or tournament_id == active
+        ],
+    })
+
+
 _mixer_client = MixerCupClient()
-_mixer_tournament_id_cache: int | None = None
-_mixer_tournament_name_cache: dict[int, str] = {}
 
 # mixer tournament id -> display name, for the tournament dividers on player
 # pages. Overridable via env MIXER_TOURNAMENT_LABELS="26:PARI Mixer Cup #1;27:...".
-MIXER_TOURNAMENT_LABELS: dict[int, str] = {26: "PARI Mixer Cup #1", 27: "PARI Mixer Cup #2"}
+# These WIN over the name mixer-cup reports: their numbering is their own
+# (cup 28 is "Mixer Cup #5" upstream) and would read as a different series
+# next to "PARI Mixer Cup #1/#2" in the same match history.
+MIXER_TOURNAMENT_LABELS: dict[int, str] = {
+    26: "PARI Mixer Cup #1",
+    27: "PARI Mixer Cup #2",
+    28: "PARI Mixer Cup #3",
+}
 for _pair in os.environ.get("MIXER_TOURNAMENT_LABELS", "").replace(",", ";").split(";"):
     if ":" in _pair:
         _tid, _label = _pair.split(":", 1)
@@ -500,23 +567,78 @@ for _pair in os.environ.get("MIXER_TOURNAMENT_LABELS", "").replace(",", ";").spl
             pass
 
 
-def _resolve_mixer_tournament_id() -> int | None:
-    global _mixer_tournament_id_cache
-    if _mixer_tournament_id_cache is not None:
-        return _mixer_tournament_id_cache
-    env_id = os.environ.get("MIXER_TOURNAMENT_ID")
-    if env_id:
-        _mixer_tournament_id_cache = int(env_id)
-        return _mixer_tournament_id_cache
+# The active tournament is re-resolved periodically rather than once per
+# process. mixer-cup flips it the moment one cup ends and the next opens,
+# while a gunicorn worker here can outlive that by days - the keep-alive ping
+# stops the instance from ever spinning down - and a stale value keeps the
+# finished cup's teams, leaderboard and hero stats on a site that should
+# already have moved on.
+_TOURNAMENT_TTL_SECONDS = int(os.environ.get("TOURNAMENT_CACHE_TTL_SECONDS", "600"))
+# Between cups mixer-cup reports NO active tournament (the next one sits in
+# REDUCTION until it starts). Re-asking on every request would mean a blocking
+# GraphQL call per request on a single-worker instance, so failures are cached
+# briefly too - and the last known id is kept rather than dropped, because a
+# None here silently widens every tournament-scoped endpoint to "all cups".
+_TOURNAMENT_RETRY_SECONDS = int(os.environ.get("TOURNAMENT_RETRY_SECONDS", "60"))
+
+_ENV_TOURNAMENT_ID: int | None = None
+if os.environ.get("MIXER_TOURNAMENT_ID"):
     try:
-        active = _mixer_client.get_active_tournament()
+        _ENV_TOURNAMENT_ID = int(os.environ["MIXER_TOURNAMENT_ID"])
+    except ValueError:
+        pass
+
+_tournament_lock = threading.Lock()
+_mixer_tournament_id_cache: int | None = None
+_mixer_tournament_names: dict[int, str] = {}
+_tournament_cache_expires_at = 0.0
+
+
+def _refresh_tournament_cache() -> None:
+    """One GraphQL call that answers both questions we have: which tournament
+    is active, and what every tournament is called (the list carries `status`,
+    so it doubles as activeTournament). Caller holds _tournament_lock."""
+    global _mixer_tournament_id_cache, _tournament_cache_expires_at
+
+    active_id = None
+    try:
+        for t in _mixer_client.list_tournaments():
+            if t.get("name"):
+                _mixer_tournament_names[t["id"]] = t["name"]
+            if active_id is None and t.get("status") == "ACTIVE":
+                active_id = t["id"]
     except Exception:
-        return None
-    if active:
-        _mixer_tournament_id_cache = active["id"]
-        if active.get("name"):
-            _mixer_tournament_name_cache[active["id"]] = active["name"]
-    return _mixer_tournament_id_cache
+        pass
+    if active_id is None:
+        # The list didn't say (API shape changed, or the call failed) - ask
+        # the dedicated endpoint before giving up on this refresh.
+        try:
+            active = _mixer_client.get_active_tournament()
+        except Exception:
+            active = None
+        if active:
+            active_id = active["id"]
+            if active.get("name"):
+                _mixer_tournament_names[active_id] = active["name"]
+
+    if active_id is not None:
+        _mixer_tournament_id_cache = active_id
+        _tournament_cache_expires_at = time.monotonic() + _TOURNAMENT_TTL_SECONDS
+    else:
+        # Nothing active (we're between cups) or mixer-cup is down: keep
+        # serving whatever cup we last knew about and retry soon.
+        _tournament_cache_expires_at = time.monotonic() + _TOURNAMENT_RETRY_SECONDS
+
+
+def _resolve_mixer_tournament_id() -> int | None:
+    with _tournament_lock:
+        if time.monotonic() >= _tournament_cache_expires_at:
+            _refresh_tournament_cache()
+        # The env pin still lets the refresh above run: it costs one call per
+        # TTL and keeps the tournament NAMES current for the history dividers.
+        if _ENV_TOURNAMENT_ID is not None:
+            return _ENV_TOURNAMENT_ID
+        return _mixer_tournament_id_cache
 
 
 # Valve's own hero icons. The slug is the hero's INTERNAL name minus the
@@ -535,18 +657,85 @@ def _hero_icon_url(hero_key: str | None) -> str | None:
 
 
 def _tournament_label(mixer_tournament_id: int | None, league_id: int | None) -> str:
-    """Best display name for the tournament a match belongs to: the live name
-    of the active tournament, then the configured mixer-id map, then the
-    league-id map, then a generic fallback."""
+    """Best display name for the tournament a match belongs to: our own label
+    map (which overrides mixer-cup's parallel numbering), then the live name
+    mixer-cup reports, then the league-id map, then a generic fallback."""
     if mixer_tournament_id is not None:
-        if mixer_tournament_id in _mixer_tournament_name_cache:
-            return _mixer_tournament_name_cache[mixer_tournament_id]
         if mixer_tournament_id in MIXER_TOURNAMENT_LABELS:
             return MIXER_TOURNAMENT_LABELS[mixer_tournament_id]
+        if mixer_tournament_id in _mixer_tournament_names:
+            return _mixer_tournament_names[mixer_tournament_id]
         return f"Турнир {mixer_tournament_id}"
     if league_id in LEAGUE_LABELS:
         return LEAGUE_LABELS[league_id]
     return "Прочие матчи"
+
+
+# --- Tournament URLs -------------------------------------------------------
+# Every tournament gets an address of its own (/mixercup2), so a cup, a roster
+# or a match can be linked to directly instead of existing only as in-page
+# state. The slug is derived from the cup's number in its label, which keeps
+# one source of truth: label a new cup "PARI Mixer Cup #4" and /mixercup4
+# starts working. Override with env MIXER_TOURNAMENT_SLUGS="29:kubok4".
+MIXER_TOURNAMENT_SLUGS: dict[int, str] = {}
+for _pair in os.environ.get("MIXER_TOURNAMENT_SLUGS", "").replace(",", ";").split(";"):
+    if ":" in _pair:
+        _tid, _slug = _pair.split(":", 1)
+        try:
+            MIXER_TOURNAMENT_SLUGS[int(_tid.strip())] = _slug.strip().lower()
+        except ValueError:
+            pass
+
+_LABEL_NUMBER_RE = re.compile(r"#\s*(\d+)")
+
+
+def _tournament_slug(tournament_id: int) -> str:
+    if tournament_id in MIXER_TOURNAMENT_SLUGS:
+        return MIXER_TOURNAMENT_SLUGS[tournament_id]
+    label = MIXER_TOURNAMENT_LABELS.get(tournament_id)
+    number = _LABEL_NUMBER_RE.search(label) if label else None
+    # A cup we have no label for still needs a stable address, hence the id.
+    return f"mixercup{number.group(1)}" if number else f"cup{tournament_id}"
+
+
+def _known_tournament_ids(session: Session | None = None) -> list[int]:
+    """Every tournament the site can show, newest first: the ones we have
+    labels or live names for, plus any our own matches mention."""
+    ids = set(MIXER_TOURNAMENT_LABELS) | set(MIXER_TOURNAMENT_SLUGS) | set(_mixer_tournament_names)
+    if session is not None:
+        ids.update(
+            t for (t,) in session.execute(
+                select(Match.mixer_tournament_id)
+                .where(Match.mixer_tournament_id.is_not(None)).distinct()
+            )
+        )
+    return sorted(ids, reverse=True)
+
+
+def _tournament_from_slug(slug: str) -> int | None:
+    slug = (slug or "").lower()
+    for tournament_id in _known_tournament_ids():
+        if _tournament_slug(tournament_id) == slug:
+            return tournament_id
+    # Not in the label map - it may only exist in our own match rows.
+    with Session(engine) as session:
+        for tournament_id in _known_tournament_ids(session):
+            if _tournament_slug(tournament_id) == slug:
+                return tournament_id
+    return None
+
+
+def _requested_scope() -> int | None:
+    """?tournament=<id> on a listing endpoint, defaulting to the active cup.
+    Lets the archive pages (/mixercup1 and friends) reuse the same endpoints
+    the live cup uses."""
+    raw = request.args.get("tournament")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return _resolve_mixer_tournament_id()
 
 
 def _get_next_opponent(mixer_uuid: str) -> dict | None:
@@ -575,14 +764,27 @@ def _team_total_mmr(session: Session, team_id: int) -> float | None:
     return total or None
 
 
-def _get_substitution_history(session: Session, team_id: int) -> list[dict]:
+def _get_substitution_history(session: Session, team_id: int,
+                              tournament_id: int | None = None) -> list[dict]:
     """Reads from our own SubstitutionEvent table (synced during collect(),
     see sync_substitution_history) rather than querying mixer-cup.gg live -
     their own substitution history has been observed to disappear
-    periodically, so this is the durable copy."""
+    periodically, so this is the durable copy.
+
+    tournament_id keeps a recycled team id from showing the PREVIOUS cup's
+    swaps in the moments between a new cup opening and the collector's next
+    pass clearing them out. Events not yet tagged with a tournament (legacy
+    rows, tagged on the collector's next run) are let through rather than
+    hidden."""
+    scope = [SubstitutionEvent.team_id == team_id]
+    if tournament_id is not None:
+        scope.append(or_(
+            SubstitutionEvent.tournament_id == tournament_id,
+            SubstitutionEvent.tournament_id.is_(None),
+        ))
     events = session.execute(
         select(SubstitutionEvent)
-        .where(SubstitutionEvent.team_id == team_id)
+        .where(*scope)
         .order_by(SubstitutionEvent.occurred_at)
     ).scalars().all()
     raw = [
@@ -613,6 +815,38 @@ def _get_substitution_history(session: Session, team_id: int) -> list[dict]:
     return swaps
 
 
+def _team_name_in_tournament(session: Session, team_id: int | None,
+                             tournament_id: int | None) -> str | None:
+    """What this Steam team_id was called in that tournament, falling back to
+    its current name. Steam ids are recycled between cups, so Teams.name is
+    the wrong label for anything shown against an older cup."""
+    if team_id is None:
+        return None
+    if tournament_id is not None:
+        row = session.get(TeamTournamentName, (team_id, tournament_id))
+        if row is not None:
+            return row.name
+    team = session.get(Team, team_id)
+    return team.name if team and team.name else None
+
+
+def _requested_tournament(team: Team) -> tuple[int | None, bool]:
+    """Which incarnation of this team the caller asked for: ?tournament=<id>
+    from a past cup's match, or the cup that currently owns the team.
+
+    Returns (tournament_id, is_historical). A Steam team_id is reused cup after
+    cup, so without this a link from a #2 match opens the CURRENT squad playing
+    under that id - different players, different games, different name."""
+    raw = request.args.get("tournament")
+    if not raw:
+        return team.tournament_id, False
+    try:
+        requested = int(raw)
+    except ValueError:
+        return team.tournament_id, False
+    return requested, requested != team.tournament_id
+
+
 def _roster_filter(session: Session, team_id: int):
     """MixerCup-confirmed roster for this team, if we have one; otherwise
     fall back to everyone who has ever played under this team_id (covers
@@ -625,15 +859,50 @@ def _roster_filter(session: Session, team_id: int):
     return MatchPlayer.team_id == team_id
 
 
+def _past_cup_teams(session: Session, tournament_id: int) -> list[dict]:
+    """Sidebar for a FINISHED cup: the teams that actually played in it, under
+    the names they carried then. Can't come from the Team rows - those are
+    owned by whichever cup last reused their Steam ids - so it's built from
+    that cup's own matches."""
+    counts = dict(session.execute(
+        select(MatchPlayer.team_id, func.count(func.distinct(MatchPlayer.account_id)))
+        .join(Match, Match.match_id == MatchPlayer.match_id)
+        .where(Match.mixer_tournament_id == tournament_id)
+        .group_by(MatchPlayer.team_id)
+    ).all())
+    names = dict(session.execute(
+        select(TeamTournamentName.team_id, TeamTournamentName.name)
+        .where(TeamTournamentName.tournament_id == tournament_id)
+    ).all())
+    teams = [
+        {
+            "team_id": team_id,
+            "name": names.get(team_id) or f"Team {team_id}",
+            "player_count": player_count,
+            # No total: a finished cup's list includes every substitute who
+            # passed through, and their ratings are today's (see api_team_detail).
+            "total_mmr": None,
+        }
+        for team_id, player_count in counts.items()
+        if team_id is not None and player_count > 1
+    ]
+    teams.sort(key=lambda t: t["name"].lower())
+    return teams
+
+
 @app.get("/api/teams")
 def api_teams():
     with Session(engine) as session:
-        # Sidebar shows only the ACTIVE mixer tournament's teams; earlier
-        # tournaments' teams stay in the DB (their pages remain reachable
-        # from player match history) but off the list. If the active
-        # tournament can't be resolved (mixer API down), show everything
-        # rather than an empty site.
+        # Sidebar shows one tournament's teams: the ACTIVE one by default, or
+        # whichever cup's page the visitor is on (?tournament=). Earlier
+        # tournaments' teams stay in the DB and are listed on their own page.
+        # If the active tournament can't be resolved (mixer API down), show
+        # everything rather than an empty site.
         active = _resolve_mixer_tournament_id()
+        scope = _requested_scope()
+        if scope is not None and scope != active:
+            return jsonify(_past_cup_teams(session, scope))
+
         team_query = select(Team.team_id, Team.name).order_by(Team.name)
         if active is not None:
             team_query = team_query.where(Team.tournament_id == active)
@@ -801,7 +1070,12 @@ def api_team_detail(team_id: int):
         if team is None:
             return jsonify({"error": "not found"}), 404
 
-        player_filter = _roster_filter(session, team_id)
+        tournament_id, historical = _requested_tournament(team)
+        # A past cup's page must be built from who actually PLAYED for the team
+        # then: the mixer-confirmed roster is the current one, which for a
+        # recycled team id belongs to an entirely different squad.
+        player_filter = (MatchPlayer.team_id == team_id) if historical \
+            else _roster_filter(session, team_id)
         # decided = games with a known result (radiant_win is not null);
         # win rate is wins/decided, not wins/games, so a still-unresolved
         # match doesn't silently drag the rate down.
@@ -818,20 +1092,22 @@ def api_team_detail(team_id: int):
             .join(Match, Match.match_id == MatchPlayer.match_id)
             .where(
                 MatchPlayer.team_id == team_id, player_filter,
-                _team_tournament_filter(team.tournament_id),
+                _team_tournament_filter(tournament_id),
             )
             .group_by(Player.account_id, Hero.hero_id)
         ).all()
 
-        recent_drafts = _recent_drafts(session, team_id, team.tournament_id)
-        last_match_lineup = _last_match_lineup(session, team_id, team.tournament_id)
+        recent_drafts = _recent_drafts(session, team_id, tournament_id)
+        last_match_lineup = _last_match_lineup(session, team_id, tournament_id)
         mixer_uuid = team.mixer_uuid
+        team_name = _team_name_in_tournament(session, team_id, tournament_id)
 
         # Confirmed roster members with no matches yet (fresh substitutes)
         # have no MatchPlayer rows, so the inner-join query above misses
         # them - fetch the confirmed roster separately so they still get a
         # card (with an empty hero list) as soon as the substitution lands.
-        confirmed_players = session.execute(
+        # Not for a past cup: that roster is today's squad, not that cup's.
+        confirmed_players = [] if historical else session.execute(
             select(Player.account_id, Player.name, Player.mmr, Player.preferred_roles)
             .where(Player.team_id == team_id, Player.roster_confirmed.is_(True))
         ).all()
@@ -868,14 +1144,31 @@ def api_team_detail(team_id: int):
     if len(players) <= 1:
         return jsonify({"error": "not found"}), 404
 
-    total_mmr = sum(p["mmr"] for p in players.values() if p["mmr"] is not None) or None
-    next_opponent = _get_next_opponent(mixer_uuid) if mixer_uuid else None
+    # A past cup's page lists everyone who played for the team over that whole
+    # cup - substitutes included - so summing their (current!) ratings would
+    # produce a "team MMR" no lineup ever had. Only the live squad gets one.
+    total_mmr = None if historical else (
+        sum(p["mmr"] for p in players.values() if p["mmr"] is not None) or None
+    )
+    # Same reason for the order: with a dozen cards, the five who actually
+    # played the cup should come first, not whoever is alphabetically first.
+    ordered_players = sorted(
+        players.values(),
+        key=(lambda p: (-sum(h["games"] for h in p["heroes"]), p["name"])) if historical
+        else (lambda p: p["name"]),
+    )
+    # A finished cup has no "next opponent" - that lookup is about the live
+    # bracket, which only the current squad is in.
+    next_opponent = _get_next_opponent(mixer_uuid) if mixer_uuid and not historical else None
 
     return jsonify({
         "team_id": team_id,
-        "name": team.name or f"Team {team_id}",
+        "name": team_name or f"Team {team_id}",
+        "tournament_id": tournament_id,
+        "tournament_label": _tournament_label(tournament_id, None) if tournament_id else None,
+        "is_historical": historical,
         "total_mmr": total_mmr,
-        "players": sorted(players.values(), key=lambda p: p["name"]),
+        "players": ordered_players,
         "recent_drafts": recent_drafts,
         "next_opponent": next_opponent,
         "last_match_lineup": last_match_lineup,
@@ -1021,12 +1314,7 @@ def api_match_detail(match_id: int):
             # recycled between cups), falling back to the current name.
             if team_id is None:
                 return "?"
-            if mixer_tid is not None:
-                row = session.get(TeamTournamentName, (team_id, mixer_tid))
-                if row is not None:
-                    return row.name
-            team = session.get(Team, team_id)
-            return team.name if team and team.name else f"Team {team_id}"
+            return _team_name_in_tournament(session, team_id, mixer_tid) or f"Team {team_id}"
 
         player_rows = session.execute(
             select(
@@ -1056,6 +1344,7 @@ def api_match_detail(match_id: int):
             "start_time": match.start_time,
             "duration": match.duration,
             "radiant_win": match.radiant_win,
+            "mixer_tournament_id": mixer_tid,
             "tournament_label": _tournament_label(mixer_tid, match.league_id),
         }
 
@@ -1110,7 +1399,9 @@ def api_players_leaderboard():
     cup's games would grade players on a team that no longer exists."""
     with Session(engine) as session:
         active = _resolve_mixer_tournament_id()
-        tour_filter = (Match.mixer_tournament_id == active) if active is not None else True
+        scope = _requested_scope()
+        historical = scope is not None and scope != active
+        tour_filter = (Match.mixer_tournament_id == scope) if scope is not None else True
 
         decided = case((Match.radiant_win.is_not(None), 1), else_=0)
         won = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
@@ -1135,12 +1426,30 @@ def api_players_leaderboard():
                 (count, hero_name, _hero_icon_slug(internal_name))
             )
 
+        # Current rosters only make sense for the live cup. On a finished
+        # cup's page, a player's team is the one they actually played most of
+        # that cup for - today's roster says nothing about it.
         roster_rows = session.execute(
             select(Player, Team)
             .join(Team, Team.team_id == Player.team_id)
             .where(Team.tournament_id == active, Player.roster_confirmed.is_(True))
-        ).all() if active is not None else []
+        ).all() if active is not None and not historical else []
         rostered = {p.account_id: (p, t) for p, t in roster_rows}
+
+        past_team_of: dict[int, tuple[int, str]] = {}
+        if historical:
+            names = dict(session.execute(
+                select(TeamTournamentName.team_id, TeamTournamentName.name)
+                .where(TeamTournamentName.tournament_id == scope)
+            ).all())
+            for account_id, team_id, _ in sorted(session.execute(
+                select(MatchPlayer.account_id, MatchPlayer.team_id, func.count())
+                .join(Match, Match.match_id == MatchPlayer.match_id)
+                .where(tour_filter, MatchPlayer.team_id.is_not(None))
+                .group_by(MatchPlayer.account_id, MatchPlayer.team_id)
+            ).all(), key=lambda r: r[2]):
+                # Ascending count, so the most-played team lands last and wins.
+                past_team_of[account_id] = (team_id, names.get(team_id) or f"Team {team_id}")
 
         # Players who appear in games but were since subbed out still belong
         # on the board - their games happened - just without a current team.
@@ -1157,13 +1466,14 @@ def api_players_leaderboard():
             player, team = rostered.get(account_id, (extras.get(account_id), None))
             games, dec, wins = stats.get(account_id, (0, 0, 0))
             top = sorted(heroes_by_player.get(account_id, []), reverse=True)[:3]
+            past_team_id, past_team_name = past_team_of.get(account_id, (None, None))
             players.append({
                 "account_id": account_id,
                 "name": (player.name if player and player.name else f"account {account_id}"),
                 "mmr": player.mmr if player else None,
                 "roles": player.preferred_roles if player else None,
-                "team_id": team.team_id if team else None,
-                "team_name": (team.name or f"Team {team.team_id}") if team else None,
+                "team_id": team.team_id if team else past_team_id,
+                "team_name": (team.name or f"Team {team.team_id}") if team else past_team_name,
                 "games": games,
                 "wins": wins,
                 "losses": dec - wins,
@@ -1176,8 +1486,9 @@ def api_players_leaderboard():
 
     players.sort(key=lambda p: (p["mmr"] is None, -(p["mmr"] or 0)))
     return jsonify({
-        "tournament_id": active,
-        "tournament_label": _tournament_label(active, None) if active is not None else None,
+        "tournament_id": scope,
+        "tournament_label": _tournament_label(scope, None) if scope is not None else None,
+        "is_historical": historical,
         "players": players,
     })
 
@@ -1240,8 +1551,9 @@ def api_team_analysis(team_id: int):
         if team is None:
             return jsonify({"error": "not found"}), 404
 
-        team_name = team.name or f"Team {team_id}"
-        stats = compute_team_stats(session, team_id, team.tournament_id)
+        tournament_id, _ = _requested_tournament(team)
+        team_name = _team_name_in_tournament(session, team_id, tournament_id) or f"Team {team_id}"
+        stats = compute_team_stats(session, team_id, tournament_id)
         text = generate_coach_text(team_name, stats)
 
     return jsonify({
@@ -1268,7 +1580,11 @@ def api_team_substitutions(team_id: int):
         team = session.get(Team, team_id)
         if team is None:
             return jsonify({"error": "not found"}), 404
-        swaps = _get_substitution_history(session, team_id)
+        # Only the active cup's substitutions are kept (see
+        # collect._purge_past_tournament_subs), so a past cup's page has
+        # nothing to show rather than the current squad's swaps.
+        tournament_id, historical = _requested_tournament(team)
+        swaps = [] if historical else _get_substitution_history(session, team_id, tournament_id)
 
     return jsonify({"team_id": team_id, "substitutions": swaps})
 
@@ -1278,6 +1594,7 @@ def api_all_substitutions():
     """Every substitution across the tournament, newest first, with the
     team it happened in - the per-team tab shows the same data scoped to
     one team; this powers the tournament-wide substitutions page."""
+    scope = _requested_scope()
     with Session(engine) as session:
         teams = session.execute(
             select(Team.team_id, Team.name)
@@ -1286,20 +1603,29 @@ def api_all_substitutions():
 
         all_swaps = []
         for team_id, team_name in teams:
-            for swap in _get_substitution_history(session, team_id):
+            for swap in _get_substitution_history(session, team_id, scope):
                 swap["team_id"] = team_id
-                swap["team_name"] = team_name or f"Team {team_id}"
+                swap["team_name"] = (
+                    _team_name_in_tournament(session, team_id, scope)
+                    or team_name or f"Team {team_id}"
+                )
                 all_swaps.append(swap)
 
     all_swaps.sort(key=lambda s: s["at"], reverse=True)
-    return jsonify({"substitutions": all_swaps})
+    return jsonify({
+        "tournament_id": scope,
+        "tournament_label": _tournament_label(scope, None) if scope is not None else None,
+        "substitutions": all_swaps,
+    })
 
 
 @app.get("/api/tournament/heroes")
 def api_tournament_heroes():
-    active = _resolve_mixer_tournament_id()
+    scope = _requested_scope()
     with Session(engine) as session:
-        stats = compute_tournament_hero_stats(session, mixer_tournament_id=active)
+        stats = compute_tournament_hero_stats(session, mixer_tournament_id=scope)
+    stats["tournament_id"] = scope
+    stats["tournament_label"] = _tournament_label(scope, None) if scope is not None else None
     return jsonify(stats)
 
 
@@ -1378,6 +1704,7 @@ def api_backup():
         "substitution_events": [
             {
                 "event_id": e.event_id, "team_id": e.team_id,
+                "tournament_id": e.tournament_id,
                 "event_type": e.event_type, "nickname": e.nickname,
                 "rating": e.rating, "queue_position": e.queue_position,
                 "occurred_at": e.occurred_at,

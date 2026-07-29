@@ -82,8 +82,23 @@ AUTH_SECRET = os.environ.get("AUTH_SECRET") or ("keyset:" + ",".join(sorted(_ACC
 MAX_DEVICES_PER_KEY = int(os.environ.get("MAX_DEVICES_PER_KEY", "2"))
 # Protects the operational endpoints (collect/backup/archive) called by the
 # GitHub Actions workflow. If empty, those stay open (so nothing breaks
-# before the owner sets it up).
+# before the owner sets it up) - EXCEPT in PUBLIC_ARCHIVE mode, see below.
 OPS_TOKEN = os.environ.get("OPS_TOKEN", "")
+
+# Sell access to the RUNNING cup only: finished cups are readable by anyone,
+# the active one needs a key. Off by default - turning this on mid-tournament
+# would hand out the very thing people paid for, so it has to be an explicit
+# decision (set PUBLIC_ARCHIVE=1 when the next cup starts).
+PUBLIC_ARCHIVE = os.environ.get("PUBLIC_ARCHIVE") == "1"
+
+# What a visitor without a key is told, in one place: the login page and the
+# in-app lock panel both show it.
+ACCESS_OFFER = {
+    "price": "5 USD",
+    "recipient": "zharok.pcash",
+    "discord": "nldw111",
+    "telegram": "@VaxpEe",
+}
 
 app.secret_key = hashlib.sha256(("session:" + AUTH_SECRET).encode()).digest()
 app.permanent_session_lifetime = timedelta(days=60)
@@ -132,6 +147,18 @@ def _restore_access_bindings() -> None:
 
 if AUTH_ENABLED:
     threading.Thread(target=_restore_access_bindings, daemon=True).start()
+
+if PUBLIC_ARCHIVE and not OPS_TOKEN:
+    # Loud on purpose: /api/collect and /api/backup are refused in this state,
+    # so the GitHub Actions workflow stops refreshing data and stops committing
+    # backups until OPS_TOKEN is set on both sides.
+    print(
+        "WARNING: PUBLIC_ARCHIVE is on but OPS_TOKEN is empty - operational "
+        "endpoints (/api/collect, /api/backup, /api/archive) are refused, so "
+        "scheduled collection and state backups will NOT run. Set OPS_TOKEN in "
+        "the service environment and as the OPS_TOKEN GitHub secret.",
+        flush=True,
+    )
 
 _collect_state = {"running": False, "log": [], "error": None, "new_matches": None,
                   "started_at": None, "pid": None}
@@ -367,10 +394,7 @@ _LOGIN_HTML = """<!doctype html>
   <input id="key" name="key" autocomplete="off" autofocus>
   <button id="btn" type="submit">Войти</button>
   <div class="err" id="err"></div>
-  <div class="access">
-    Для получения доступа к сайту отправьте <b>5 USD</b> пользователю <b>zharok.pcash</b>
-    и напишите в дискорде <b>nldw111</b> или в телеграмме <b>@VaxpEe</b>
-  </div>
+  <div class="access">__ACCESS_OFFER__</div>
 </form>
 <script>
   // A stable per-browser id so the same device reuses its key slot, while
@@ -395,6 +419,16 @@ _LOGIN_HTML = """<!doctype html>
 </body></html>"""
 
 
+# One wording for the offer, shared by the login page and the in-app lock
+# panel - the numbers and contacts live in ACCESS_OFFER only.
+_ACCESS_OFFER_HTML = (
+    f"Для получения доступа к сайту отправьте <b>{ACCESS_OFFER['price']}</b> пользователю "
+    f"<b>{ACCESS_OFFER['recipient']}</b> и напишите в дискорде <b>{ACCESS_OFFER['discord']}</b> "
+    f"или в телеграмме <b>{ACCESS_OFFER['telegram']}</b>"
+)
+_LOGIN_HTML = _LOGIN_HTML.replace("__ACCESS_OFFER__", _ACCESS_OFFER_HTML)
+
+
 def _session_ok() -> bool:
     kh = session.get("kh")
     device = session.get("device")
@@ -417,6 +451,43 @@ def _is_ops_path(p: str) -> bool:
     return p == "/api/collect" or p.startswith("/api/backup") or p.startswith("/api/archive")
 
 
+def _viewer_has_key() -> bool:
+    """True when this request may see everything - either the site is open to
+    all, or the visitor holds a valid session."""
+    return not AUTH_ENABLED or _session_ok()
+
+
+def _may_see_tournament(tournament_id: int | None) -> bool:
+    """Whether this visitor may see data from that cup.
+
+    In PUBLIC_ARCHIVE mode a visitor without a key gets the finished cups and
+    never the running one. Anything whose cup we can't establish counts as
+    off-limits: a match with no tournament linked yet, or - the case that
+    matters - an active tournament we failed to resolve because mixer-cup is
+    unreachable. Guessing "probably fine" there would give the current cup
+    away for free every time their API hiccups."""
+    if _viewer_has_key():
+        return True
+    if not PUBLIC_ARCHIVE:
+        return False
+    if tournament_id is None:
+        return False
+    active = _resolve_mixer_tournament_id()
+    if active is None:
+        return False
+    return tournament_id != active
+
+
+def _deny_tournament():
+    """Uniform refusal the frontend turns into the lock panel. 403, not 401:
+    401 means "your session expired, log in again" and the frontend bounces to
+    /login on it, which would be wrong for a visitor who never had a key."""
+    return jsonify({
+        "error": "locked",
+        "message": "Данные текущего турнира доступны по ключу.",
+    }), 403
+
+
 @app.before_request
 def _gate():
     if not AUTH_ENABLED:
@@ -425,13 +496,27 @@ def _gate():
     if p == "/login" or p.startswith("/api/auth/") or p == "/favicon.ico":
         return
     if _is_ops_path(p):
-        if not OPS_TOKEN:
-            return
-        tok = request.headers.get("X-Ops-Token") or request.args.get("ops_token")
-        if tok and hmac.compare_digest(tok, OPS_TOKEN):
-            return
-        abort(403)
+        # Deliberately NOT satisfied by a visitor's session: these are the
+        # owner's endpoints, and a paying customer is not an operator -
+        # /api/backup would hand them every team, player and draft in one file.
+        if OPS_TOKEN:
+            tok = request.headers.get("X-Ops-Token") or request.args.get("ops_token")
+            if tok and hmac.compare_digest(tok, OPS_TOKEN):
+                return
+            abort(403)
+        # No token configured: these stayed open so nothing broke before the
+        # owner set one up. That was only ever safe because the whole site
+        # needed a key - with a public archive it would publish the full dump
+        # (including the access-key hashes) to anyone, so refuse instead.
+        if PUBLIC_ARCHIVE:
+            abort(403)
+        return
     if _session_ok():
+        return
+    # Public-archive mode: let the request through and let the endpoint decide
+    # per tournament (see _may_see_tournament). Pages are always served - a
+    # shared link should show the lock panel, not a login redirect.
+    if PUBLIC_ARCHIVE:
         return
     if p.startswith("/api/"):
         return jsonify({"error": "unauthorized"}), 401
@@ -464,7 +549,13 @@ def api_auth_login():
 
 @app.get("/api/auth/status")
 def api_auth_status():
-    return jsonify({"enabled": AUTH_ENABLED})
+    return jsonify({
+        "enabled": AUTH_ENABLED,
+        "authenticated": _viewer_has_key(),
+        "public_archive": PUBLIC_ARCHIVE,
+        # Shown on the lock panel, so the offer lives in one place.
+        "offer": ACCESS_OFFER,
+    })
 
 
 @app.post("/api/auth/logout")
@@ -535,6 +626,8 @@ def api_tournaments():
                 "label": _tournament_label(tournament_id, None),
                 "is_active": tournament_id == active,
                 "has_matches": tournament_id in played,
+                # Lets the switcher mark what this visitor can't open yet.
+                "locked": not _may_see_tournament(tournament_id),
             }
             for tournament_id in ids
             # Only cups this site can actually show. mixer-cup's tournament
@@ -900,6 +993,8 @@ def api_teams():
         # everything rather than an empty site.
         active = _resolve_mixer_tournament_id()
         scope = _requested_scope()
+        if not _may_see_tournament(scope):
+            return _deny_tournament()
         if scope is not None and scope != active:
             return jsonify(_past_cup_teams(session, scope))
 
@@ -1071,6 +1166,8 @@ def api_team_detail(team_id: int):
             return jsonify({"error": "not found"}), 404
 
         tournament_id, historical = _requested_tournament(team)
+        if not _may_see_tournament(tournament_id):
+            return _deny_tournament()
         # A past cup's page must be built from who actually PLAYED for the team
         # then: the mixer-confirmed roster is the current one, which for a
         # recycled team id belongs to an entirely different squad.
@@ -1283,15 +1380,29 @@ def api_player_detail(account_id: int):
             "tournament_label": _tournament_label(mixer_tid, league_id),
         })
 
+    # A player's page spans every cup, so it can't simply be allowed or
+    # refused: without a key the archive stays and the running cup goes,
+    # including which team they are on RIGHT NOW - the current roster is the
+    # single most valuable thing here.
+    visible_pools = [p for p in hero_pools if _may_see_tournament(p["tournament_id"])]
+    visible_matches = [m for m in matches if _may_see_tournament(m["mixer_tournament_id"])]
+    show_current_team = _may_see_tournament(active)
+
     return jsonify({
         "account_id": account_id,
         "name": name or f"account {account_id}",
         "mmr": mmr,
         "roles": roles,
-        "current_team_id": current_team.team_id if current_team else None,
-        "current_team_name": (current_team.name or f"Team {current_team.team_id}") if current_team else None,
-        "hero_pools": hero_pools,
-        "matches": matches,
+        "current_team_id": current_team.team_id if current_team and show_current_team else None,
+        "current_team_name": (current_team.name or f"Team {current_team.team_id}")
+                             if current_team and show_current_team else None,
+        "hero_pools": visible_pools,
+        "matches": visible_matches,
+        # So the page can say why it looks short rather than just looking wrong -
+        # and in particular not claim the player is on no team when the truth is
+        # that we are withholding which one.
+        "locked_tournaments": len(hero_pools) - len(visible_pools),
+        "current_team_locked": bool(current_team) and not show_current_team,
     })
 
 
@@ -1308,6 +1419,8 @@ def api_match_detail(match_id: int):
             return jsonify({"error": "not found"}), 404
 
         mixer_tid = match.mixer_tournament_id
+        if not _may_see_tournament(mixer_tid):
+            return _deny_tournament()
 
         def side_name(team_id):
             # The name this team used in THIS match's tournament (ids are
@@ -1397,6 +1510,8 @@ def api_players_leaderboard():
     subs who haven't played yet) plus anyone who has actually played a game in
     it. Winrate and hero pool are scoped to the active cup - mixing in last
     cup's games would grade players on a team that no longer exists."""
+    if not _may_see_tournament(_requested_scope()):
+        return _deny_tournament()
     with Session(engine) as session:
         active = _resolve_mixer_tournament_id()
         scope = _requested_scope()
@@ -1552,6 +1667,8 @@ def api_team_analysis(team_id: int):
             return jsonify({"error": "not found"}), 404
 
         tournament_id, _ = _requested_tournament(team)
+        if not _may_see_tournament(tournament_id):
+            return _deny_tournament()
         team_name = _team_name_in_tournament(session, team_id, tournament_id) or f"Team {team_id}"
         stats = compute_team_stats(session, team_id, tournament_id)
         text = generate_coach_text(team_name, stats)
@@ -1584,6 +1701,8 @@ def api_team_substitutions(team_id: int):
         # collect._purge_past_tournament_subs), so a past cup's page has
         # nothing to show rather than the current squad's swaps.
         tournament_id, historical = _requested_tournament(team)
+        if not _may_see_tournament(tournament_id):
+            return _deny_tournament()
         swaps = [] if historical else _get_substitution_history(session, team_id, tournament_id)
 
     return jsonify({"team_id": team_id, "substitutions": swaps})
@@ -1595,6 +1714,10 @@ def api_all_substitutions():
     team it happened in - the per-team tab shows the same data scoped to
     one team; this powers the tournament-wide substitutions page."""
     scope = _requested_scope()
+    # Only the active cup's substitutions are kept at all, so this page is
+    # entirely current-tournament data.
+    if not _may_see_tournament(scope):
+        return _deny_tournament()
     with Session(engine) as session:
         teams = session.execute(
             select(Team.team_id, Team.name)
@@ -1622,6 +1745,8 @@ def api_all_substitutions():
 @app.get("/api/tournament/heroes")
 def api_tournament_heroes():
     scope = _requested_scope()
+    if not _may_see_tournament(scope):
+        return _deny_tournament()
     with Session(engine) as session:
         stats = compute_tournament_hero_stats(session, mixer_tournament_id=scope)
     stats["tournament_id"] = scope

@@ -1,5 +1,9 @@
 // If the session expires or is missing (private mode), any API call returns
 // 401 - bounce to the login page instead of showing a broken site.
+// 401 means a session that used to be valid no longer is - bounce to the
+// login page instead of showing a broken site. A 403 is different: it is a
+// visitor without a key reaching for the running cup, which is a normal state
+// with its own panel (see renderLockPanel), so it must NOT redirect.
 (function () {
   const origFetch = window.fetch;
   window.fetch = async function (...args) {
@@ -27,6 +31,34 @@ let activeTab = "composition";
 let route = { view: "cup" };
 let cups = { activeId: null, activeSlug: null, list: [], bySlug: new Map(), byId: new Map() };
 let sidebarTournamentId; // undefined until the sidebar has been filled once
+// Whether the running cup is paid-only for this visitor, and what to offer
+// them if so. Filled from /api/auth/status before the first render.
+let access = { enabled: false, authenticated: true, publicArchive: false, offer: null };
+
+function cupIsLocked(tournamentId) {
+  const cup = cups.byId.get(tournamentId);
+  return !!(cup && cup.locked);
+}
+
+// Shown in place of the content when a visitor without a key opens the
+// running cup. Deliberately not a redirect: a link shared into a chat should
+// land where it points and explain itself.
+function renderLockPanel(container) {
+  const o = access.offer || {};
+  container.innerHTML = `
+    <div class="lock-panel">
+      <h2>Текущий турнир — по ключу</h2>
+      <p>Статистика идущего турнира: составы, пулы героев, драфты, замены и аналитика
+         соперников. Прошедшие турниры открыты полностью — выберите их в шапке.</p>
+      <p class="lock-offer">Для получения доступа отправьте <b>${o.price || "—"}</b>
+         пользователю <b>${o.recipient || "—"}</b> и напишите в дискорде
+         <b>${o.discord || "—"}</b> или в телеграмме <b>${o.telegram || "—"}</b>.</p>
+      <button id="lock-login">У меня есть ключ</button>
+    </div>
+  `;
+  const btn = container.querySelector("#lock-login");
+  if (btn) btn.addEventListener("click", () => { location.href = "/login"; });
+}
 
 async function loadTournaments() {
   const res = await fetch("/api/tournaments");
@@ -49,7 +81,10 @@ function renderCupSwitcher() {
   const shown = cups.list.filter((t) => t.has_matches || t.is_active);
   if (shown.length < 2) return;
   sel.innerHTML = shown
-    .map((t) => `<option value="${t.slug}">${t.label}${t.is_active ? " · сейчас" : ""}</option>`)
+    .map((t) => {
+      const mark = t.locked ? " 🔒" : t.is_active ? " · сейчас" : "";
+      return `<option value="${t.slug}">${t.label}${mark}</option>`;
+    })
     .join("");
   sel.onchange = () => navigate(`/${sel.value}`);
   sel.style.display = "";
@@ -128,8 +163,22 @@ async function renderRoute() {
   const cupId = currentCupId();
   syncCupSwitcher();
   if (route.view !== "team") activeTeamId = null;
-  if (sidebarTournamentId !== cupId) await loadTeams(cupId);
-  else highlightSidebar();
+
+  // The team list belongs to its cup, so a locked cup means a locked sidebar.
+  // Player and match pages still get rendered: the player page keeps its
+  // archive sections (the server strips the running cup's), and the match page
+  // shows the offer only if that particular match is locked.
+  if (cupIsLocked(cupId)) {
+    teamsEl.innerHTML = '<p class="hint">Список команд — по ключу.</p>';
+    sidebarTournamentId = undefined;
+    if (route.view !== "player" && route.view !== "match") {
+      return renderLockPanel(detailEl);
+    }
+  } else if (sidebarTournamentId !== cupId) {
+    await loadTeams(cupId);
+  } else {
+    highlightSidebar();
+  }
 
   switch (route.view) {
     case "team":
@@ -216,6 +265,12 @@ async function loadTeams(tournamentId) {
   sidebarTournamentId = tournamentId;
 
   teamsEl.innerHTML = "";
+  if (!Array.isArray(teams)) {
+    // Locked cup (403) - the panel in the main area explains it.
+    teamsEl.innerHTML = '<p class="hint">Список команд — по ключу.</p>';
+    sidebarTournamentId = undefined;
+    return;
+  }
   if (teams.length === 0) {
     teamsEl.innerHTML = '<p class="hint">Нет данных. Обновляется автоматически, зайдите чуть позже.</p>';
     return;
@@ -522,7 +577,10 @@ async function loadPlayerPage(accountId) {
   const rolesLine = p.roles ? ` · ${formatRoles(p.roles)}` : "";
   const teamLine = p.current_team_id != null
     ? `Команда: <button class="opponent-link" data-team-id="${p.current_team_id}">${p.current_team_name}</button>`
-    : "Сейчас не в составе команды";
+    // Don't claim they are on no team when we are simply not showing which.
+    : p.current_team_locked
+      ? "Команда текущего турнира — по ключу"
+      : "Сейчас не в составе команды";
 
   const heroTagsFor = (heroes) =>
     heroes.length
@@ -661,6 +719,7 @@ function lineupTable(side, winnerSide, side_key) {
 async function loadMatchPage(matchId) {
   detailEl.innerHTML = '<p class="hint">Загружаю матч...</p>';
   const res = await fetch(`/api/matches/${matchId}`);
+  if (res.status === 403) return renderLockPanel(detailEl);
   if (!res.ok) {
     detailEl.innerHTML = '<p class="hint">Матч не найден.</p>';
     return;
@@ -944,26 +1003,47 @@ async function pollCollectStatus() {
   wasRunning = status.running;
 }
 
-// Show the logout control only in private mode.
-const logoutBtn = document.getElementById("logout-btn");
-if (logoutBtn) {
-  fetch("/api/auth/status")
-    .then((r) => r.json())
-    .then((s) => {
-      if (s.enabled) {
-        logoutBtn.style.display = "";
-        logoutBtn.addEventListener("click", async () => {
-          try { await fetch("/api/auth/logout", { method: "POST" }); } catch (_) {}
-          location.href = "/login";
-        });
-      }
-    })
-    .catch(() => {});
+async function loadAccessStatus() {
+  try {
+    const s = await (await fetch("/api/auth/status")).json();
+    access = {
+      enabled: !!s.enabled,
+      authenticated: !!s.authenticated,
+      publicArchive: !!s.public_archive,
+      offer: s.offer || null,
+    };
+  } catch (_) { /* keep the permissive default; the API is the real gate */ }
+
+  // "Выйти" only makes sense for someone who is actually logged in.
+  const logoutBtn = document.getElementById("logout-btn");
+  if (logoutBtn && access.enabled && access.authenticated) {
+    logoutBtn.style.display = "";
+    logoutBtn.addEventListener("click", async () => {
+      try { await fetch("/api/auth/logout", { method: "POST" }); } catch (_) {}
+      location.href = "/login";
+    });
+  }
+  // A visitor without a key gets a "У меня есть ключ" entry point instead.
+  const loginBtn = document.getElementById("login-btn");
+  if (loginBtn && access.enabled && !access.authenticated) {
+    loginBtn.style.display = "";
+    loginBtn.addEventListener("click", () => { location.href = "/login"; });
+  }
 }
 
 setInterval(pollCollectStatus, 15000);
 pollCollectStatus();
 
-// The cup list has to be known before the first render: it turns the slug in
-// the address into a tournament id.
-loadTournaments().then(renderRoute);
+// Access state and the cup list both have to be known before the first
+// render: one decides what may be shown, the other turns the slug in the
+// address into a tournament id.
+Promise.all([loadAccessStatus(), loadTournaments()]).then(() => {
+  // Land a visitor without a key on the newest cup they CAN read, rather than
+  // on a lock panel. Only for the bare root - a shared deep link keeps its
+  // address and explains itself there.
+  if (location.pathname === "/" && cupIsLocked(cups.activeId)) {
+    const open = cups.list.find((t) => !t.locked && t.has_matches);
+    if (open) history.replaceState({}, "", `/${open.slug}`);
+  }
+  renderRoute();
+});

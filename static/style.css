@@ -56,6 +56,36 @@ header h1 {
   max-width: 480px;
 }
 
+/* The offer shown where the running cup's data would be, for a visitor
+   without a key. Sized to read as a page of its own, not as an error. */
+.lock-panel {
+  max-width: 560px;
+  margin: 40px auto;
+  padding: 28px 32px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+}
+
+.lock-panel h2 {
+  margin: 0 0 12px;
+}
+
+.lock-panel p {
+  color: var(--muted);
+  line-height: 1.55;
+  margin: 0 0 14px;
+}
+
+.lock-panel .lock-offer {
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.lock-panel .lock-offer b {
+  color: var(--text);
+}
+
 /* Cup switcher: deliberately quieter than the action buttons next to it -
    it picks which tournament you are looking at, it isn't an action. */
 #cup-switcher {

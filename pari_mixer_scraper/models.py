@@ -28,6 +28,33 @@ def build_engine(db_path: str, poolclass=None) -> Engine:
     return create_engine(f"sqlite:///{db_path}", **kwargs)
 
 
+def ensure_schema(engine: Engine) -> None:
+    """Adds columns introduced after a database file was first created.
+
+    `Base.metadata.create_all` only creates missing TABLES - it never touches
+    an existing one. That was harmless while every database was disposable
+    (Render wipes the disk), but the collector seeds each build by COPYING the
+    live file, so a column added in a release is missing from that copy and
+    the first write against it fails. SQLite adds a nullable column in place,
+    which is all this project has ever needed; NOT NULL columns are skipped
+    (they'd need a table rebuild - do that by hand if it ever comes up)."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue  # create_all just built it, with every column
+        have = {c["name"] for c in inspector.get_columns(table.name)}
+        missing = [c for c in table.columns if c.name not in have and c.nullable]
+        for column in missing:
+            type_sql = column.type.compile(engine.dialect)
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {type_sql}'
+                ))
+
+
 def configure_sqlite(engine: Engine) -> Engine:
     """Tunes SQLite for this app's usage on Render's free tier.
 
@@ -189,6 +216,13 @@ class SubstitutionEvent(Base):
 
     event_id: Mapped[str] = mapped_column(primary_key=True)
     team_id: Mapped[int] = mapped_column(ForeignKey("teams.team_id"))
+    # Which mixer tournament this swap happened in. team_id alone cannot say:
+    # mixer-cup recycles the same Steam team registrations every cup, so a
+    # team reclaimed by the new cup still carries the previous cup's events -
+    # and they would show up as the new cup's substitutions (with
+    # pair_substitution_events chaining an old PLAYER_OFF to a new PLAYER_IN).
+    # Null on events synced before this column existed.
+    tournament_id: Mapped[int | None] = mapped_column(nullable=True)
     event_type: Mapped[str]
     nickname: Mapped[str | None]
     # MixerCup's rating for this player as of when we synced the event (not

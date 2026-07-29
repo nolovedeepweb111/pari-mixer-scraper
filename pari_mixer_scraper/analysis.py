@@ -221,6 +221,13 @@ def generate_coach_text(team_name: str, stats: TeamStats) -> str:
         sentences.append(f"{team_name} играет ровно: {wins} побед из {decided} ({win_rate}%).")
     elif win_rate >= 25:
         sentences.append(f"{team_name} испытывает трудности: только {wins} победа(ы) из {decided} ({win_rate}%).")
+    elif wins:
+        # Below 25% but not winless - the branch under this one claims a clean
+        # sheet, which for anything from 1% up is simply false.
+        sentences.append(
+            f"{team_name} проводит турнир тяжело: {wins} победа(ы) из {decided} ({win_rate}%) — "
+            "стоит пересмотреть подход к драфту."
+        )
     else:
         sentences.append(
             f"{team_name} пока не одержали ни одной победы в {decided} матчах — стоит пересмотреть подход к драфту."

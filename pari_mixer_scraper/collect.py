@@ -17,7 +17,7 @@ from .mixercup_client import MixerCupClient
 from .models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, QueuedPlayer,
     SubstitutionEvent, Team, TeamTournamentName,
-    build_engine, configure_sqlite,
+    build_engine, configure_sqlite, ensure_schema,
 )
 from .opendota_client import OpenDotaClient
 from .roster_overrides import MANUAL_ROSTER_OVERRIDES
@@ -968,6 +968,7 @@ def restore_state_backup(session: Session, progress: ProgressFn) -> dict | None:
             session.add(SubstitutionEvent(
                 event_id=ev["event_id"],
                 team_id=ev["team_id"],
+                tournament_id=ev.get("tournament_id"),
                 event_type=ev.get("event_type") or "",
                 nickname=ev.get("nickname"),
                 rating=ev.get("rating"),
@@ -975,9 +976,12 @@ def restore_state_backup(session: Session, progress: ProgressFn) -> dict | None:
                 occurred_at=ev.get("occurred_at") or "",
             ))
             added_events += 1
-        elif row.queue_position is None and ev.get("queue_position") is not None:
-            row.queue_position = ev["queue_position"]
-            filled_positions += 1
+        else:
+            if row.queue_position is None and ev.get("queue_position") is not None:
+                row.queue_position = ev["queue_position"]
+                filled_positions += 1
+            if row.tournament_id is None and ev.get("tournament_id") is not None:
+                row.tournament_id = ev["tournament_id"]
 
     existing_queue = {row[0] for row in session.execute(select(QueuedPlayer.player_uuid))}
     for qp in data.get("queued_players", []):
@@ -1085,6 +1089,7 @@ def sync_substitution_history(
                 session.add(SubstitutionEvent(
                     event_id=e["event_id"],
                     team_id=team.team_id,
+                    tournament_id=tournament_id,
                     event_type=e["type"],
                     nickname=e["nickname"],
                     rating=e["rating"],
@@ -1101,10 +1106,48 @@ def sync_substitution_history(
         progress(f"Substitution history: {new_count} new event(s) saved")
 
 
+def _backfill_substitution_tournaments(session: Session, progress: ProgressFn) -> None:
+    """Stamps the tournament onto substitution events saved (or restored from
+    a backup) before SubstitutionEvent.tournament_id existed, taking it from
+    the team the event belongs to.
+
+    Ordering matters: this must run BEFORE link_mixercup_data, because the
+    active tournament reclaims every Steam team id it reuses - after that the
+    team no longer says which cup its older events came from."""
+    stale = session.execute(
+        select(SubstitutionEvent).where(SubstitutionEvent.tournament_id.is_(None))
+    ).scalars().all()
+    if not stale:
+        return
+    team_tournaments = dict(session.execute(select(Team.team_id, Team.tournament_id)).all())
+    filled = 0
+    for event in stale:
+        tournament_id = team_tournaments.get(event.team_id)
+        if tournament_id is not None:
+            event.tournament_id = tournament_id
+            filled += 1
+    if filled:
+        session.commit()
+        progress(f"Tagged {filled} legacy substitution event(s) with their tournament")
+
+
 def _purge_past_tournament_subs(session: Session, active_tournament_id: int, progress: ProgressFn) -> None:
-    """Deletes substitution events tied to teams from any tournament other
-    than the active one - the site only shows the current tournament's
-    substitution history."""
+    """Deletes substitution events from any tournament other than the active
+    one - the site only shows the current tournament's substitution history.
+
+    Scoped by the event's OWN tournament rather than by whichever tournament
+    currently owns its team: a Steam team id reused by the new cup gets
+    reclaimed by it, so the team-based rule left exactly those events behind -
+    last cup's swaps, displayed as the new cup's. Events still carrying no
+    tournament (their team is gone, so the backfill couldn't tag them) keep
+    the old team-based rule."""
+    deleted = session.execute(
+        delete(SubstitutionEvent).where(
+            SubstitutionEvent.tournament_id.is_not(None),
+            SubstitutionEvent.tournament_id != active_tournament_id,
+        )
+    ).rowcount
+
     past_team_ids = [
         t for (t,) in session.execute(
             select(Team.team_id).where(
@@ -1113,11 +1156,14 @@ def _purge_past_tournament_subs(session: Session, active_tournament_id: int, pro
             )
         )
     ]
-    if not past_team_ids:
-        return
-    deleted = session.execute(
-        delete(SubstitutionEvent).where(SubstitutionEvent.team_id.in_(past_team_ids))
-    ).rowcount
+    if past_team_ids:
+        deleted += session.execute(
+            delete(SubstitutionEvent).where(
+                SubstitutionEvent.tournament_id.is_(None),
+                SubstitutionEvent.team_id.in_(past_team_ids),
+            )
+        ).rowcount
+
     if deleted:
         session.commit()
         progress(f"Removed {deleted} substitution event(s) from past tournaments")
@@ -1332,6 +1378,9 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
     with Session(engine) as session:
         progress("Session open. Restoring state backup if available...")
         backup = restore_state_backup(session, progress)
+        # Before any linking reclaims teams for the active cup (see the
+        # function's docstring for why the order is load-bearing).
+        _backfill_substitution_tournaments(session, progress)
 
         progress("Syncing hero list...")
         sync_heroes(session, od_client, progress)
@@ -1521,6 +1570,9 @@ def collect(
     progress("Building a new database engine...")
     own_engine = configure_sqlite(build_engine(db_path))
     Base.metadata.create_all(own_engine)
+    # The build was seeded by copying the live file, which may predate a
+    # column added since it was written.
+    ensure_schema(own_engine)
 
     def publish_core() -> None:
         if promote_to:

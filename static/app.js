@@ -323,7 +323,7 @@ function renderComposition(team) {
       <h3><button class="player-link" data-account-id="${player.account_id}">${player.name}</button><span class="profile-links">${profileLinks(player.account_id)}</span></h3>
       <p class="mmr">${formatMmr(player.mmr)} MMR</p>
       ${rolesLine}
-      <ul>${heroItems || '<li><span class="hint">ещё не играл(а) за команду</span></li>'}</ul>
+      <ul>${heroItems || `<li><span class="hint">${team.hero_pools_locked ? "пул героев — по ключу" : "ещё не играл(а) за команду"}</span></li>`}</ul>
     `;
     card.querySelector(".player-link").addEventListener("click", () => navigate(`/player/${player.account_id}`));
     grid.appendChild(card);
@@ -598,20 +598,24 @@ async function loadPlayerPage(accountId) {
           .join("")
       : '<span class="hint">нет сыгранных матчей</span>';
 
-  // One hero pool per tournament (the two mixer cups run concurrently).
-  const heroPoolsHtml = (p.hero_pools && p.hero_pools.length)
-    ? p.hero_pools
-        .map((pool) => `
-          <div class="analysis-block player-heroes-block">
-            <h4>Пул героев · ${pool.label}</h4>
-            <div class="tag-list">${heroTagsFor(pool.heroes)}</div>
-          </div>
-        `)
-        .join("")
-    : `<div class="analysis-block player-heroes-block">
-         <h4>Пул героев</h4>
-         <div class="tag-list"><span class="hint">нет сыгранных матчей</span></div>
-       </div>`;
+  // One hero pool per tournament (the cups can run concurrently).
+  const emptyPools = (note) => `
+    <div class="analysis-block player-heroes-block">
+      <h4>Пул героев</h4>
+      <div class="tag-list"><span class="hint">${note}</span></div>
+    </div>`;
+  const heroPoolsHtml = p.hero_pools_locked
+    ? emptyPools("по ключу — здесь видно, на кого игрок играет и с каким винрейтом")
+    : (p.hero_pools && p.hero_pools.length)
+      ? p.hero_pools
+          .map((pool) => `
+            <div class="analysis-block player-heroes-block">
+              <h4>Пул героев · ${pool.label}</h4>
+              <div class="tag-list">${heroTagsFor(pool.heroes)}</div>
+            </div>
+          `)
+          .join("")
+      : emptyPools("нет сыгранных матчей");
 
   let lastLabel = null;
   const matchRows = p.matches
@@ -815,7 +819,8 @@ function renderLeaderboard(sortKey, sortDesc) {
   const arrow = (k) => (k === sortKey ? (sortDesc ? " ↓" : " ↑") : "");
   detailEl.innerHTML = `
     <h2>Игроки · ${data.tournament_label || "турнир"}</h2>
-    <p class="hint">Винрейт и герои — только за этот турнир. Клик по заголовку — сортировка.</p>
+    <p class="hint">Винрейт${data.hero_pools_locked ? "" : " и герои"} — только за этот турнир. Клик по заголовку — сортировка.${
+      data.hero_pools_locked ? " Топ героев — по ключу." : ""}</p>
     <table class="subs-table leaderboard-table">
       <thead><tr>
         <th></th>
@@ -872,14 +877,16 @@ function renderTournamentHeroStats(data) {
     ? data.most_banned.map((h) => `<span class="tag tag-ban">${h.hero} ×${h.bans}</span>`).join("")
     : '<span class="hint">нет данных</span>';
 
-  const monopolyHtml = data.signature_by_player.length
-    ? data.signature_by_player
-        .map((h) => {
-          const players = h.top_players.map((p) => `${p.name} (${p.games})`).join(", ");
-          return `<span class="tag tag-neutral">${h.hero} — ${h.concentration}%: ${players}</span>`;
-        })
-        .join("")
-    : '<span class="hint">нет данных</span>';
+  const monopolyHtml = data.hero_pools_locked
+    ? '<span class="hint">по ключу — здесь видно, за кем закреплены герои турнира</span>'
+    : data.signature_by_player.length
+      ? data.signature_by_player
+          .map((h) => {
+            const players = h.top_players.map((p) => `${p.name} (${p.games})`).join(", ");
+            return `<span class="tag tag-neutral">${h.hero} — ${h.concentration}%: ${players}</span>`;
+          })
+          .join("")
+      : '<span class="hint">нет данных</span>';
 
   detailEl.innerHTML = `
     <h2>Статистика по героям · ${data.tournament_label || "турнир"}</h2>

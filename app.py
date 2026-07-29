@@ -478,6 +478,18 @@ def _may_see_tournament(tournament_id: int | None) -> bool:
     return tournament_id != active
 
 
+def _may_see_hero_pools() -> bool:
+    """Whether this visitor gets per-player hero pools - the hero, how many
+    games on it, the win rate - anywhere on the site.
+
+    Gated even on FINISHED cups, unlike everything else in the archive. The
+    individual matches stay public on purpose: every one of them is on
+    Dotabuff, which our own match page links to, so hiding who played what in
+    one game would be theatre. Counting those games up per player is the work
+    this site actually does, and that is what's being sold."""
+    return _viewer_has_key()
+
+
 def _deny_tournament():
     """Uniform refusal the frontend turns into the lock panel. 403, not 401:
     401 means "your session expired, log in again" and the frontend bounces to
@@ -1254,6 +1266,11 @@ def api_team_detail(team_id: int):
         key=(lambda p: (-sum(h["games"] for h in p["heroes"]), p["name"])) if historical
         else (lambda p: p["name"]),
     )
+    # After the ordering, which needs the game counts.
+    pools_locked = not _may_see_hero_pools()
+    if pools_locked:
+        for entry in ordered_players:
+            entry["heroes"] = []
     # A finished cup has no "next opponent" - that lookup is about the live
     # bracket, which only the current squad is in.
     next_opponent = _get_next_opponent(mixer_uuid) if mixer_uuid and not historical else None
@@ -1264,6 +1281,7 @@ def api_team_detail(team_id: int):
         "tournament_id": tournament_id,
         "tournament_label": _tournament_label(tournament_id, None) if tournament_id else None,
         "is_historical": historical,
+        "hero_pools_locked": pools_locked,
         "total_mmr": total_mmr,
         "players": ordered_players,
         "recent_drafts": recent_drafts,
@@ -1387,6 +1405,11 @@ def api_player_detail(account_id: int):
     visible_pools = [p for p in hero_pools if _may_see_tournament(p["tournament_id"])]
     visible_matches = [m for m in matches if _may_see_tournament(m["mixer_tournament_id"])]
     show_current_team = _may_see_tournament(active)
+    pools_locked = not _may_see_hero_pools()
+    if pools_locked:
+        # The match list stays (each game is public on Dotabuff anyway); the
+        # counted-up pool is what's held back.
+        visible_pools = []
 
     return jsonify({
         "account_id": account_id,
@@ -1401,8 +1424,9 @@ def api_player_detail(account_id: int):
         # So the page can say why it looks short rather than just looking wrong -
         # and in particular not claim the player is on no team when the truth is
         # that we are withholding which one.
-        "locked_tournaments": len(hero_pools) - len(visible_pools),
+        "locked_tournaments": len(hero_pools) - len(visible_pools) if not pools_locked else 0,
         "current_team_locked": bool(current_team) and not show_current_team,
+        "hero_pools_locked": pools_locked,
     })
 
 
@@ -1596,7 +1620,7 @@ def api_players_leaderboard():
                 "top_heroes": [
                     {"name": name, "icon": slug, "games": count}
                     for count, name, slug in top
-                ],
+                ] if _may_see_hero_pools() else [],
             })
 
     players.sort(key=lambda p: (p["mmr"] is None, -(p["mmr"] or 0)))
@@ -1604,6 +1628,7 @@ def api_players_leaderboard():
         "tournament_id": scope,
         "tournament_label": _tournament_label(scope, None) if scope is not None else None,
         "is_historical": historical,
+        "hero_pools_locked": not _may_see_hero_pools(),
         "players": players,
     })
 
@@ -1751,6 +1776,12 @@ def api_tournament_heroes():
         stats = compute_tournament_hero_stats(session, mixer_tournament_id=scope)
     stats["tournament_id"] = scope
     stats["tournament_label"] = _tournament_label(scope, None) if scope is not None else None
+    # Hero win rates and ban counts say nothing about a particular player, so
+    # they stay. "signature_by_player" names who monopolises a hero, which is a
+    # hero pool read from the other end.
+    stats["hero_pools_locked"] = not _may_see_hero_pools()
+    if stats["hero_pools_locked"]:
+        stats["signature_by_player"] = []
     return jsonify(stats)
 
 

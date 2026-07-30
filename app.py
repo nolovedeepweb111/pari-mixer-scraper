@@ -3,26 +3,29 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import sys
 import threading
 import time
-from datetime import timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, redirect, request, send_from_directory, session
-from sqlalchemy import case, func, select
+from werkzeug.routing import BaseConverter
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
-from pari_mixer_scraper.analysis import compute_team_stats, compute_tournament_hero_stats, generate_coach_text
+from pari_mixer_scraper.analysis import compute_team_stats, generate_coach_text
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID
 from pari_mixer_scraper.mixercup_client import MixerCupClient, pair_substitution_events
 from pari_mixer_scraper.models import (
-    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, QueuedPlayer,
+    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, PlayerNote, QueuedPlayer,
     TeamTournamentName,
     SubstitutionEvent, Team,
-    build_engine, configure_sqlite,
+    build_engine, configure_sqlite, ensure_schema,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -56,6 +59,9 @@ app = Flask(__name__, static_folder="static", static_url_path="")
 # Opening a fresh connection per request always sees the current file.
 engine = configure_sqlite(build_engine(DB_PATH, poolclass=NullPool))
 Base.metadata.create_all(engine)
+# A database file promoted by an older release can predate a column added
+# since; the app reads those columns on every page.
+ensure_schema(engine)
 
 # ---------------------------------------------------------------------------
 # Access control
@@ -77,8 +83,23 @@ AUTH_SECRET = os.environ.get("AUTH_SECRET") or ("keyset:" + ",".join(sorted(_ACC
 MAX_DEVICES_PER_KEY = int(os.environ.get("MAX_DEVICES_PER_KEY", "2"))
 # Protects the operational endpoints (collect/backup/archive) called by the
 # GitHub Actions workflow. If empty, those stay open (so nothing breaks
-# before the owner sets it up).
+# before the owner sets it up) - EXCEPT in PUBLIC_ARCHIVE mode, see below.
 OPS_TOKEN = os.environ.get("OPS_TOKEN", "")
+
+# Sell access to the RUNNING cup only: finished cups are readable by anyone,
+# the active one needs a key. Off by default - turning this on mid-tournament
+# would hand out the very thing people paid for, so it has to be an explicit
+# decision (set PUBLIC_ARCHIVE=1 when the next cup starts).
+PUBLIC_ARCHIVE = os.environ.get("PUBLIC_ARCHIVE") == "1"
+
+# What a visitor without a key is told, in one place: the login page and the
+# in-app lock panel both show it.
+ACCESS_OFFER = {
+    "price": "5 USD",
+    "recipient": "zharok.pcash",
+    "discord": "nldw111",
+    "telegram": "@VaxpEe",
+}
 
 app.secret_key = hashlib.sha256(("session:" + AUTH_SECRET).encode()).digest()
 app.permanent_session_lifetime = timedelta(days=60)
@@ -127,6 +148,18 @@ def _restore_access_bindings() -> None:
 
 if AUTH_ENABLED:
     threading.Thread(target=_restore_access_bindings, daemon=True).start()
+
+if PUBLIC_ARCHIVE and not OPS_TOKEN:
+    # Loud on purpose: /api/collect and /api/backup are refused in this state,
+    # so the GitHub Actions workflow stops refreshing data and stops committing
+    # backups until OPS_TOKEN is set on both sides.
+    print(
+        "WARNING: PUBLIC_ARCHIVE is on but OPS_TOKEN is empty - operational "
+        "endpoints (/api/collect, /api/backup, /api/archive) are refused, so "
+        "scheduled collection and state backups will NOT run. Set OPS_TOKEN in "
+        "the service environment and as the OPS_TOKEN GitHub secret.",
+        flush=True,
+    )
 
 _collect_state = {"running": False, "log": [], "error": None, "new_matches": None,
                   "started_at": None, "pid": None}
@@ -362,10 +395,7 @@ _LOGIN_HTML = """<!doctype html>
   <input id="key" name="key" autocomplete="off" autofocus>
   <button id="btn" type="submit">Войти</button>
   <div class="err" id="err"></div>
-  <div class="access">
-    Для получения доступа к сайту отправьте <b>5 USD</b> пользователю <b>zharok.pcash</b>
-    и напишите в дискорде <b>nldw111</b> или в телеграмме <b>@VaxpEe</b>
-  </div>
+  <div class="access">__ACCESS_OFFER__</div>
 </form>
 <script>
   // A stable per-browser id so the same device reuses its key slot, while
@@ -390,6 +420,16 @@ _LOGIN_HTML = """<!doctype html>
 </body></html>"""
 
 
+# One wording for the offer, shared by the login page and the in-app lock
+# panel - the numbers and contacts live in ACCESS_OFFER only.
+_ACCESS_OFFER_HTML = (
+    f"Для получения доступа к сайту отправьте <b>{ACCESS_OFFER['price']}</b> пользователю "
+    f"<b>{ACCESS_OFFER['recipient']}</b> и напишите в дискорде <b>{ACCESS_OFFER['discord']}</b> "
+    f"или в телеграмме <b>{ACCESS_OFFER['telegram']}</b>"
+)
+_LOGIN_HTML = _LOGIN_HTML.replace("__ACCESS_OFFER__", _ACCESS_OFFER_HTML)
+
+
 def _session_ok() -> bool:
     kh = session.get("kh")
     device = session.get("device")
@@ -412,6 +452,55 @@ def _is_ops_path(p: str) -> bool:
     return p == "/api/collect" or p.startswith("/api/backup") or p.startswith("/api/archive")
 
 
+def _viewer_has_key() -> bool:
+    """True when this request may see everything - either the site is open to
+    all, or the visitor holds a valid session."""
+    return not AUTH_ENABLED or _session_ok()
+
+
+def _may_see_tournament(tournament_id: int | None) -> bool:
+    """Whether this visitor may see data from that cup.
+
+    In PUBLIC_ARCHIVE mode a visitor without a key gets the finished cups and
+    never the running one. Anything whose cup we can't establish counts as
+    off-limits: a match with no tournament linked yet, or - the case that
+    matters - an active tournament we failed to resolve because mixer-cup is
+    unreachable. Guessing "probably fine" there would give the current cup
+    away for free every time their API hiccups."""
+    if _viewer_has_key():
+        return True
+    if not PUBLIC_ARCHIVE:
+        return False
+    if tournament_id is None:
+        return False
+    active = _resolve_mixer_tournament_id()
+    if active is None:
+        return False
+    return tournament_id != active
+
+
+def _may_see_hero_pools() -> bool:
+    """Whether this visitor gets per-player hero pools - the hero, how many
+    games on it, the win rate - anywhere on the site.
+
+    Gated even on FINISHED cups, unlike everything else in the archive. The
+    individual matches stay public on purpose: every one of them is on
+    Dotabuff, which our own match page links to, so hiding who played what in
+    one game would be theatre. Counting those games up per player is the work
+    this site actually does, and that is what's being sold."""
+    return _viewer_has_key()
+
+
+def _deny_tournament():
+    """Uniform refusal the frontend turns into the lock panel. 403, not 401:
+    401 means "your session expired, log in again" and the frontend bounces to
+    /login on it, which would be wrong for a visitor who never had a key."""
+    return jsonify({
+        "error": "locked",
+        "message": "Данные текущего турнира доступны по ключу.",
+    }), 403
+
+
 @app.before_request
 def _gate():
     if not AUTH_ENABLED:
@@ -420,13 +509,27 @@ def _gate():
     if p == "/login" or p.startswith("/api/auth/") or p == "/favicon.ico":
         return
     if _is_ops_path(p):
-        if not OPS_TOKEN:
-            return
-        tok = request.headers.get("X-Ops-Token") or request.args.get("ops_token")
-        if tok and hmac.compare_digest(tok, OPS_TOKEN):
-            return
-        abort(403)
+        # Deliberately NOT satisfied by a visitor's session: these are the
+        # owner's endpoints, and a paying customer is not an operator -
+        # /api/backup would hand them every team, player and draft in one file.
+        if OPS_TOKEN:
+            tok = request.headers.get("X-Ops-Token") or request.args.get("ops_token")
+            if tok and hmac.compare_digest(tok, OPS_TOKEN):
+                return
+            abort(403)
+        # No token configured: these stayed open so nothing broke before the
+        # owner set one up. That was only ever safe because the whole site
+        # needed a key - with a public archive it would publish the full dump
+        # (including the access-key hashes) to anyone, so refuse instead.
+        if PUBLIC_ARCHIVE:
+            abort(403)
+        return
     if _session_ok():
+        return
+    # Public-archive mode: let the request through and let the endpoint decide
+    # per tournament (see _may_see_tournament). Pages are always served - a
+    # shared link should show the lock panel, not a login redirect.
+    if PUBLIC_ARCHIVE:
         return
     if p.startswith("/api/"):
         return jsonify({"error": "unauthorized"}), 401
@@ -459,7 +562,13 @@ def api_auth_login():
 
 @app.get("/api/auth/status")
 def api_auth_status():
-    return jsonify({"enabled": AUTH_ENABLED})
+    return jsonify({
+        "enabled": AUTH_ENABLED,
+        "authenticated": _viewer_has_key(),
+        "public_archive": PUBLIC_ARCHIVE,
+        # Shown on the lock panel, so the offer lives in one place.
+        "offer": ACCESS_OFFER,
+    })
 
 
 @app.post("/api/auth/logout")
@@ -484,13 +593,76 @@ def index():
     return send_from_directory(app.static_folder, "index.html")
 
 
+# Every in-app address is served by the same shell; the frontend router reads
+# location.pathname and renders from there (see static/app.js). A converter
+# rather than a bare <slug> so these rules can never swallow /app.js and
+# /style.css, which the static handler serves from the same root path.
+class _TournamentSlugConverter(BaseConverter):
+    regex = r"(?:mixercup|cup)\d+"
+
+
+app.url_map.converters["tslug"] = _TournamentSlugConverter
+
+
+@app.get("/<tslug:slug>")
+@app.get("/<tslug:slug>/players")
+@app.get("/<tslug:slug>/subs")
+@app.get("/<tslug:slug>/team/<int:team_id>")
+@app.get("/<tslug:slug>/team/<int:team_id>/<any(composition, analysis, subs):section>")
+@app.get("/player/<int:account_id>")
+@app.get("/match/<int:match_id>")
+def spa_route(**_kwargs):
+    return send_from_directory(app.static_folder, "index.html")
+
+
+@app.get("/api/tournaments")
+def api_tournaments():
+    """The cup switcher's menu: every tournament with an address, newest
+    first, and which one is live."""
+    active = _resolve_mixer_tournament_id()
+    with Session(engine) as session:
+        ids = _known_tournament_ids(session)
+        played = {
+            t for (t,) in session.execute(
+                select(Match.mixer_tournament_id)
+                .where(Match.mixer_tournament_id.is_not(None)).distinct()
+            )
+        }
+    return jsonify({
+        "active_id": active,
+        "active_slug": _tournament_slug(active) if active is not None else None,
+        "tournaments": [
+            {
+                "id": tournament_id,
+                "slug": _tournament_slug(tournament_id),
+                "label": _tournament_label(tournament_id, None),
+                "is_active": tournament_id == active,
+                "has_matches": tournament_id in played,
+                # Lets the switcher mark what this visitor can't open yet.
+                "locked": not _may_see_tournament(tournament_id),
+            }
+            for tournament_id in ids
+            # Only cups this site can actually show. mixer-cup's tournament
+            # list reaches back to their own test events from before we
+            # collected anything - those have an id and a name here and
+            # nothing else, and they are not this cup series.
+            if tournament_id in played or tournament_id == active
+        ],
+    })
+
+
 _mixer_client = MixerCupClient()
-_mixer_tournament_id_cache: int | None = None
-_mixer_tournament_name_cache: dict[int, str] = {}
 
 # mixer tournament id -> display name, for the tournament dividers on player
 # pages. Overridable via env MIXER_TOURNAMENT_LABELS="26:PARI Mixer Cup #1;27:...".
-MIXER_TOURNAMENT_LABELS: dict[int, str] = {26: "PARI Mixer Cup #1", 27: "PARI Mixer Cup #2"}
+# These WIN over the name mixer-cup reports: their numbering is their own
+# (cup 28 is "Mixer Cup #5" upstream) and would read as a different series
+# next to "PARI Mixer Cup #1/#2" in the same match history.
+MIXER_TOURNAMENT_LABELS: dict[int, str] = {
+    26: "PARI Mixer Cup #1",
+    27: "PARI Mixer Cup #2",
+    28: "PARI Mixer Cup #3",
+}
 for _pair in os.environ.get("MIXER_TOURNAMENT_LABELS", "").replace(",", ";").split(";"):
     if ":" in _pair:
         _tid, _label = _pair.split(":", 1)
@@ -500,23 +672,78 @@ for _pair in os.environ.get("MIXER_TOURNAMENT_LABELS", "").replace(",", ";").spl
             pass
 
 
-def _resolve_mixer_tournament_id() -> int | None:
-    global _mixer_tournament_id_cache
-    if _mixer_tournament_id_cache is not None:
-        return _mixer_tournament_id_cache
-    env_id = os.environ.get("MIXER_TOURNAMENT_ID")
-    if env_id:
-        _mixer_tournament_id_cache = int(env_id)
-        return _mixer_tournament_id_cache
+# The active tournament is re-resolved periodically rather than once per
+# process. mixer-cup flips it the moment one cup ends and the next opens,
+# while a gunicorn worker here can outlive that by days - the keep-alive ping
+# stops the instance from ever spinning down - and a stale value keeps the
+# finished cup's teams, leaderboard and hero stats on a site that should
+# already have moved on.
+_TOURNAMENT_TTL_SECONDS = int(os.environ.get("TOURNAMENT_CACHE_TTL_SECONDS", "600"))
+# Between cups mixer-cup reports NO active tournament (the next one sits in
+# REDUCTION until it starts). Re-asking on every request would mean a blocking
+# GraphQL call per request on a single-worker instance, so failures are cached
+# briefly too - and the last known id is kept rather than dropped, because a
+# None here silently widens every tournament-scoped endpoint to "all cups".
+_TOURNAMENT_RETRY_SECONDS = int(os.environ.get("TOURNAMENT_RETRY_SECONDS", "60"))
+
+_ENV_TOURNAMENT_ID: int | None = None
+if os.environ.get("MIXER_TOURNAMENT_ID"):
     try:
-        active = _mixer_client.get_active_tournament()
+        _ENV_TOURNAMENT_ID = int(os.environ["MIXER_TOURNAMENT_ID"])
+    except ValueError:
+        pass
+
+_tournament_lock = threading.Lock()
+_mixer_tournament_id_cache: int | None = None
+_mixer_tournament_names: dict[int, str] = {}
+_tournament_cache_expires_at = 0.0
+
+
+def _refresh_tournament_cache() -> None:
+    """One GraphQL call that answers both questions we have: which tournament
+    is active, and what every tournament is called (the list carries `status`,
+    so it doubles as activeTournament). Caller holds _tournament_lock."""
+    global _mixer_tournament_id_cache, _tournament_cache_expires_at
+
+    active_id = None
+    try:
+        for t in _mixer_client.list_tournaments():
+            if t.get("name"):
+                _mixer_tournament_names[t["id"]] = t["name"]
+            if active_id is None and t.get("status") == "ACTIVE":
+                active_id = t["id"]
     except Exception:
-        return None
-    if active:
-        _mixer_tournament_id_cache = active["id"]
-        if active.get("name"):
-            _mixer_tournament_name_cache[active["id"]] = active["name"]
-    return _mixer_tournament_id_cache
+        pass
+    if active_id is None:
+        # The list didn't say (API shape changed, or the call failed) - ask
+        # the dedicated endpoint before giving up on this refresh.
+        try:
+            active = _mixer_client.get_active_tournament()
+        except Exception:
+            active = None
+        if active:
+            active_id = active["id"]
+            if active.get("name"):
+                _mixer_tournament_names[active_id] = active["name"]
+
+    if active_id is not None:
+        _mixer_tournament_id_cache = active_id
+        _tournament_cache_expires_at = time.monotonic() + _TOURNAMENT_TTL_SECONDS
+    else:
+        # Nothing active (we're between cups) or mixer-cup is down: keep
+        # serving whatever cup we last knew about and retry soon.
+        _tournament_cache_expires_at = time.monotonic() + _TOURNAMENT_RETRY_SECONDS
+
+
+def _resolve_mixer_tournament_id() -> int | None:
+    with _tournament_lock:
+        if time.monotonic() >= _tournament_cache_expires_at:
+            _refresh_tournament_cache()
+        # The env pin still lets the refresh above run: it costs one call per
+        # TTL and keeps the tournament NAMES current for the history dividers.
+        if _ENV_TOURNAMENT_ID is not None:
+            return _ENV_TOURNAMENT_ID
+        return _mixer_tournament_id_cache
 
 
 # Valve's own hero icons. The slug is the hero's INTERNAL name minus the
@@ -535,18 +762,85 @@ def _hero_icon_url(hero_key: str | None) -> str | None:
 
 
 def _tournament_label(mixer_tournament_id: int | None, league_id: int | None) -> str:
-    """Best display name for the tournament a match belongs to: the live name
-    of the active tournament, then the configured mixer-id map, then the
-    league-id map, then a generic fallback."""
+    """Best display name for the tournament a match belongs to: our own label
+    map (which overrides mixer-cup's parallel numbering), then the live name
+    mixer-cup reports, then the league-id map, then a generic fallback."""
     if mixer_tournament_id is not None:
-        if mixer_tournament_id in _mixer_tournament_name_cache:
-            return _mixer_tournament_name_cache[mixer_tournament_id]
         if mixer_tournament_id in MIXER_TOURNAMENT_LABELS:
             return MIXER_TOURNAMENT_LABELS[mixer_tournament_id]
+        if mixer_tournament_id in _mixer_tournament_names:
+            return _mixer_tournament_names[mixer_tournament_id]
         return f"Турнир {mixer_tournament_id}"
     if league_id in LEAGUE_LABELS:
         return LEAGUE_LABELS[league_id]
     return "Прочие матчи"
+
+
+# --- Tournament URLs -------------------------------------------------------
+# Every tournament gets an address of its own (/mixercup2), so a cup, a roster
+# or a match can be linked to directly instead of existing only as in-page
+# state. The slug is derived from the cup's number in its label, which keeps
+# one source of truth: label a new cup "PARI Mixer Cup #4" and /mixercup4
+# starts working. Override with env MIXER_TOURNAMENT_SLUGS="29:kubok4".
+MIXER_TOURNAMENT_SLUGS: dict[int, str] = {}
+for _pair in os.environ.get("MIXER_TOURNAMENT_SLUGS", "").replace(",", ";").split(";"):
+    if ":" in _pair:
+        _tid, _slug = _pair.split(":", 1)
+        try:
+            MIXER_TOURNAMENT_SLUGS[int(_tid.strip())] = _slug.strip().lower()
+        except ValueError:
+            pass
+
+_LABEL_NUMBER_RE = re.compile(r"#\s*(\d+)")
+
+
+def _tournament_slug(tournament_id: int) -> str:
+    if tournament_id in MIXER_TOURNAMENT_SLUGS:
+        return MIXER_TOURNAMENT_SLUGS[tournament_id]
+    label = MIXER_TOURNAMENT_LABELS.get(tournament_id)
+    number = _LABEL_NUMBER_RE.search(label) if label else None
+    # A cup we have no label for still needs a stable address, hence the id.
+    return f"mixercup{number.group(1)}" if number else f"cup{tournament_id}"
+
+
+def _known_tournament_ids(session: Session | None = None) -> list[int]:
+    """Every tournament the site can show, newest first: the ones we have
+    labels or live names for, plus any our own matches mention."""
+    ids = set(MIXER_TOURNAMENT_LABELS) | set(MIXER_TOURNAMENT_SLUGS) | set(_mixer_tournament_names)
+    if session is not None:
+        ids.update(
+            t for (t,) in session.execute(
+                select(Match.mixer_tournament_id)
+                .where(Match.mixer_tournament_id.is_not(None)).distinct()
+            )
+        )
+    return sorted(ids, reverse=True)
+
+
+def _tournament_from_slug(slug: str) -> int | None:
+    slug = (slug or "").lower()
+    for tournament_id in _known_tournament_ids():
+        if _tournament_slug(tournament_id) == slug:
+            return tournament_id
+    # Not in the label map - it may only exist in our own match rows.
+    with Session(engine) as session:
+        for tournament_id in _known_tournament_ids(session):
+            if _tournament_slug(tournament_id) == slug:
+                return tournament_id
+    return None
+
+
+def _requested_scope() -> int | None:
+    """?tournament=<id> on a listing endpoint, defaulting to the active cup.
+    Lets the archive pages (/mixercup1 and friends) reuse the same endpoints
+    the live cup uses."""
+    raw = request.args.get("tournament")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return _resolve_mixer_tournament_id()
 
 
 def _get_next_opponent(mixer_uuid: str) -> dict | None:
@@ -575,14 +869,27 @@ def _team_total_mmr(session: Session, team_id: int) -> float | None:
     return total or None
 
 
-def _get_substitution_history(session: Session, team_id: int) -> list[dict]:
+def _get_substitution_history(session: Session, team_id: int,
+                              tournament_id: int | None = None) -> list[dict]:
     """Reads from our own SubstitutionEvent table (synced during collect(),
     see sync_substitution_history) rather than querying mixer-cup.gg live -
     their own substitution history has been observed to disappear
-    periodically, so this is the durable copy."""
+    periodically, so this is the durable copy.
+
+    tournament_id keeps a recycled team id from showing the PREVIOUS cup's
+    swaps in the moments between a new cup opening and the collector's next
+    pass clearing them out. Events not yet tagged with a tournament (legacy
+    rows, tagged on the collector's next run) are let through rather than
+    hidden."""
+    scope = [SubstitutionEvent.team_id == team_id]
+    if tournament_id is not None:
+        scope.append(or_(
+            SubstitutionEvent.tournament_id == tournament_id,
+            SubstitutionEvent.tournament_id.is_(None),
+        ))
     events = session.execute(
         select(SubstitutionEvent)
-        .where(SubstitutionEvent.team_id == team_id)
+        .where(*scope)
         .order_by(SubstitutionEvent.occurred_at)
     ).scalars().all()
     raw = [
@@ -613,6 +920,38 @@ def _get_substitution_history(session: Session, team_id: int) -> list[dict]:
     return swaps
 
 
+def _team_name_in_tournament(session: Session, team_id: int | None,
+                             tournament_id: int | None) -> str | None:
+    """What this Steam team_id was called in that tournament, falling back to
+    its current name. Steam ids are recycled between cups, so Teams.name is
+    the wrong label for anything shown against an older cup."""
+    if team_id is None:
+        return None
+    if tournament_id is not None:
+        row = session.get(TeamTournamentName, (team_id, tournament_id))
+        if row is not None:
+            return row.name
+    team = session.get(Team, team_id)
+    return team.name if team and team.name else None
+
+
+def _requested_tournament(team: Team) -> tuple[int | None, bool]:
+    """Which incarnation of this team the caller asked for: ?tournament=<id>
+    from a past cup's match, or the cup that currently owns the team.
+
+    Returns (tournament_id, is_historical). A Steam team_id is reused cup after
+    cup, so without this a link from a #2 match opens the CURRENT squad playing
+    under that id - different players, different games, different name."""
+    raw = request.args.get("tournament")
+    if not raw:
+        return team.tournament_id, False
+    try:
+        requested = int(raw)
+    except ValueError:
+        return team.tournament_id, False
+    return requested, requested != team.tournament_id
+
+
 def _roster_filter(session: Session, team_id: int):
     """MixerCup-confirmed roster for this team, if we have one; otherwise
     fall back to everyone who has ever played under this team_id (covers
@@ -625,15 +964,52 @@ def _roster_filter(session: Session, team_id: int):
     return MatchPlayer.team_id == team_id
 
 
+def _past_cup_teams(session: Session, tournament_id: int) -> list[dict]:
+    """Sidebar for a FINISHED cup: the teams that actually played in it, under
+    the names they carried then. Can't come from the Team rows - those are
+    owned by whichever cup last reused their Steam ids - so it's built from
+    that cup's own matches."""
+    counts = dict(session.execute(
+        select(MatchPlayer.team_id, func.count(func.distinct(MatchPlayer.account_id)))
+        .join(Match, Match.match_id == MatchPlayer.match_id)
+        .where(Match.mixer_tournament_id == tournament_id)
+        .group_by(MatchPlayer.team_id)
+    ).all())
+    names = dict(session.execute(
+        select(TeamTournamentName.team_id, TeamTournamentName.name)
+        .where(TeamTournamentName.tournament_id == tournament_id)
+    ).all())
+    teams = [
+        {
+            "team_id": team_id,
+            "name": names.get(team_id) or f"Team {team_id}",
+            "player_count": player_count,
+            # No total: a finished cup's list includes every substitute who
+            # passed through, and their ratings are today's (see api_team_detail).
+            "total_mmr": None,
+        }
+        for team_id, player_count in counts.items()
+        if team_id is not None and player_count > 1
+    ]
+    teams.sort(key=lambda t: t["name"].lower())
+    return teams
+
+
 @app.get("/api/teams")
 def api_teams():
     with Session(engine) as session:
-        # Sidebar shows only the ACTIVE mixer tournament's teams; earlier
-        # tournaments' teams stay in the DB (their pages remain reachable
-        # from player match history) but off the list. If the active
-        # tournament can't be resolved (mixer API down), show everything
-        # rather than an empty site.
+        # Sidebar shows one tournament's teams: the ACTIVE one by default, or
+        # whichever cup's page the visitor is on (?tournament=). Earlier
+        # tournaments' teams stay in the DB and are listed on their own page.
+        # If the active tournament can't be resolved (mixer API down), show
+        # everything rather than an empty site.
         active = _resolve_mixer_tournament_id()
+        scope = _requested_scope()
+        if not _may_see_tournament(scope):
+            return _deny_tournament()
+        if scope is not None and scope != active:
+            return jsonify(_past_cup_teams(session, scope))
+
         team_query = select(Team.team_id, Team.name).order_by(Team.name)
         if active is not None:
             team_query = team_query.where(Team.tournament_id == active)
@@ -801,7 +1177,14 @@ def api_team_detail(team_id: int):
         if team is None:
             return jsonify({"error": "not found"}), 404
 
-        player_filter = _roster_filter(session, team_id)
+        tournament_id, historical = _requested_tournament(team)
+        if not _may_see_tournament(tournament_id):
+            return _deny_tournament()
+        # A past cup's page must be built from who actually PLAYED for the team
+        # then: the mixer-confirmed roster is the current one, which for a
+        # recycled team id belongs to an entirely different squad.
+        player_filter = (MatchPlayer.team_id == team_id) if historical \
+            else _roster_filter(session, team_id)
         # decided = games with a known result (radiant_win is not null);
         # win rate is wins/decided, not wins/games, so a still-unresolved
         # match doesn't silently drag the rate down.
@@ -818,20 +1201,22 @@ def api_team_detail(team_id: int):
             .join(Match, Match.match_id == MatchPlayer.match_id)
             .where(
                 MatchPlayer.team_id == team_id, player_filter,
-                _team_tournament_filter(team.tournament_id),
+                _team_tournament_filter(tournament_id),
             )
             .group_by(Player.account_id, Hero.hero_id)
         ).all()
 
-        recent_drafts = _recent_drafts(session, team_id, team.tournament_id)
-        last_match_lineup = _last_match_lineup(session, team_id, team.tournament_id)
+        recent_drafts = _recent_drafts(session, team_id, tournament_id)
+        last_match_lineup = _last_match_lineup(session, team_id, tournament_id)
         mixer_uuid = team.mixer_uuid
+        team_name = _team_name_in_tournament(session, team_id, tournament_id)
 
         # Confirmed roster members with no matches yet (fresh substitutes)
         # have no MatchPlayer rows, so the inner-join query above misses
         # them - fetch the confirmed roster separately so they still get a
         # card (with an empty hero list) as soon as the substitution lands.
-        confirmed_players = session.execute(
+        # Not for a past cup: that roster is today's squad, not that cup's.
+        confirmed_players = [] if historical else session.execute(
             select(Player.account_id, Player.name, Player.mmr, Player.preferred_roles)
             .where(Player.team_id == team_id, Player.roster_confirmed.is_(True))
         ).all()
@@ -868,14 +1253,37 @@ def api_team_detail(team_id: int):
     if len(players) <= 1:
         return jsonify({"error": "not found"}), 404
 
-    total_mmr = sum(p["mmr"] for p in players.values() if p["mmr"] is not None) or None
-    next_opponent = _get_next_opponent(mixer_uuid) if mixer_uuid else None
+    # A past cup's page lists everyone who played for the team over that whole
+    # cup - substitutes included - so summing their (current!) ratings would
+    # produce a "team MMR" no lineup ever had. Only the live squad gets one.
+    total_mmr = None if historical else (
+        sum(p["mmr"] for p in players.values() if p["mmr"] is not None) or None
+    )
+    # Same reason for the order: with a dozen cards, the five who actually
+    # played the cup should come first, not whoever is alphabetically first.
+    ordered_players = sorted(
+        players.values(),
+        key=(lambda p: (-sum(h["games"] for h in p["heroes"]), p["name"])) if historical
+        else (lambda p: p["name"]),
+    )
+    # After the ordering, which needs the game counts.
+    pools_locked = not _may_see_hero_pools()
+    if pools_locked:
+        for entry in ordered_players:
+            entry["heroes"] = []
+    # A finished cup has no "next opponent" - that lookup is about the live
+    # bracket, which only the current squad is in.
+    next_opponent = _get_next_opponent(mixer_uuid) if mixer_uuid and not historical else None
 
     return jsonify({
         "team_id": team_id,
-        "name": team.name or f"Team {team_id}",
+        "name": team_name or f"Team {team_id}",
+        "tournament_id": tournament_id,
+        "tournament_label": _tournament_label(tournament_id, None) if tournament_id else None,
+        "is_historical": historical,
+        "hero_pools_locked": pools_locked,
         "total_mmr": total_mmr,
-        "players": sorted(players.values(), key=lambda p: p["name"]),
+        "players": ordered_players,
         "recent_drafts": recent_drafts,
         "next_opponent": next_opponent,
         "last_match_lineup": last_match_lineup,
@@ -990,16 +1398,130 @@ def api_player_detail(account_id: int):
             "tournament_label": _tournament_label(mixer_tid, league_id),
         })
 
+    # A player's page spans every cup, so it can't simply be allowed or
+    # refused: without a key the archive stays and the running cup goes,
+    # including which team they are on RIGHT NOW - the current roster is the
+    # single most valuable thing here.
+    visible_pools = [p for p in hero_pools if _may_see_tournament(p["tournament_id"])]
+    visible_matches = [m for m in matches if _may_see_tournament(m["mixer_tournament_id"])]
+    show_current_team = _may_see_tournament(active)
+    pools_locked = not _may_see_hero_pools()
+    if pools_locked:
+        # The match list stays (each game is public on Dotabuff anyway); the
+        # counted-up pool is what's held back.
+        visible_pools = []
+
     return jsonify({
         "account_id": account_id,
         "name": name or f"account {account_id}",
         "mmr": mmr,
         "roles": roles,
-        "current_team_id": current_team.team_id if current_team else None,
-        "current_team_name": (current_team.name or f"Team {current_team.team_id}") if current_team else None,
-        "hero_pools": hero_pools,
-        "matches": matches,
+        "current_team_id": current_team.team_id if current_team and show_current_team else None,
+        "current_team_name": (current_team.name or f"Team {current_team.team_id}")
+                             if current_team and show_current_team else None,
+        "hero_pools": visible_pools,
+        "matches": visible_matches,
+        # So the page can say why it looks short rather than just looking wrong -
+        # and in particular not claim the player is on no team when the truth is
+        # that we are withholding which one.
+        "locked_tournaments": len(hero_pools) - len(visible_pools) if not pools_locked else 0,
+        "current_team_locked": bool(current_team) and not show_current_team,
+        "hero_pools_locked": pools_locked,
     })
+
+
+# --- Player notes ----------------------------------------------------------
+# Scouting notes anybody with a key can leave on a player, visible to everyone
+# else who has one - hence the author field: there are no accounts here, only
+# shared keys, so a note says who wrote it by hand. Reading and writing both
+# need a key even in PUBLIC_ARCHIVE mode.
+NOTE_TEXT_LIMIT = 2000
+NOTE_AUTHOR_LIMIT = 40
+NOTES_PER_PLAYER_LIMIT = 200
+
+
+def _viewer_key_hash() -> str | None:
+    """Hash of the access key this request came with. None when no keys are
+    configured at all (a fully open site), which is also why deleting is only
+    offered when we can tell notes apart by author."""
+    return session.get("kh")
+
+
+def _notes_for(db: Session, account_id: int) -> list[dict]:
+    mine = _viewer_key_hash()
+    notes = db.execute(
+        select(PlayerNote)
+        .where(PlayerNote.account_id == account_id)
+        .order_by(PlayerNote.created_at.desc())
+    ).scalars().all()
+    return [
+        {
+            "note_id": n.note_id,
+            "author": n.author,
+            "text": n.text,
+            "created_at": n.created_at,
+            # Only the key that wrote a note may remove it.
+            "can_delete": bool(mine) and n.author_key_hash == mine,
+        }
+        for n in notes
+    ]
+
+
+@app.get("/api/players/<int:account_id>/notes")
+def api_player_notes(account_id: int):
+    if not _viewer_has_key():
+        return _deny_tournament()
+    with Session(engine) as db:
+        return jsonify({"notes": _notes_for(db, account_id)})
+
+
+@app.post("/api/players/<int:account_id>/notes")
+def api_player_note_create(account_id: int):
+    if not _viewer_has_key():
+        return _deny_tournament()
+    data = request.get_json(silent=True) or {}
+    author = (data.get("author") or "").strip()[:NOTE_AUTHOR_LIMIT]
+    text = (data.get("text") or "").strip()[:NOTE_TEXT_LIMIT]
+    if not author or not text:
+        return jsonify({"error": "Заполните ник и текст."}), 400
+
+    with Session(engine) as db:
+        if db.get(Player, account_id) is None:
+            return jsonify({"error": "not found"}), 404
+        count = db.execute(
+            select(func.count()).select_from(PlayerNote)
+            .where(PlayerNote.account_id == account_id)
+        ).scalar() or 0
+        if count >= NOTES_PER_PLAYER_LIMIT:
+            return jsonify({"error": "Слишком много заметок об этом игроке."}), 409
+        db.add(PlayerNote(
+            note_id=uuid.uuid4().hex,
+            account_id=account_id,
+            author=author,
+            text=text,
+            author_key_hash=_viewer_key_hash(),
+            created_at=datetime.now(timezone.utc).isoformat(),
+        ))
+        db.commit()
+        return jsonify({"notes": _notes_for(db, account_id)}), 201
+
+
+@app.delete("/api/players/<int:account_id>/notes/<note_id>")
+def api_player_note_delete(account_id: int, note_id: str):
+    if not _viewer_has_key():
+        return _deny_tournament()
+    with Session(engine) as db:
+        note = db.get(PlayerNote, note_id)
+        if note is None or note.account_id != account_id:
+            return jsonify({"error": "not found"}), 404
+        mine = _viewer_key_hash()
+        # A note restored from a backup written before author_key_hash existed
+        # belongs to nobody, so nobody can delete it.
+        if not mine or note.author_key_hash != mine:
+            return jsonify({"error": "Удалять можно только свои заметки."}), 403
+        db.delete(note)
+        db.commit()
+        return jsonify({"notes": _notes_for(db, account_id)})
 
 
 @app.get("/api/matches/<int:match_id>")
@@ -1015,18 +1537,15 @@ def api_match_detail(match_id: int):
             return jsonify({"error": "not found"}), 404
 
         mixer_tid = match.mixer_tournament_id
+        if not _may_see_tournament(mixer_tid):
+            return _deny_tournament()
 
         def side_name(team_id):
             # The name this team used in THIS match's tournament (ids are
             # recycled between cups), falling back to the current name.
             if team_id is None:
                 return "?"
-            if mixer_tid is not None:
-                row = session.get(TeamTournamentName, (team_id, mixer_tid))
-                if row is not None:
-                    return row.name
-            team = session.get(Team, team_id)
-            return team.name if team and team.name else f"Team {team_id}"
+            return _team_name_in_tournament(session, team_id, mixer_tid) or f"Team {team_id}"
 
         player_rows = session.execute(
             select(
@@ -1056,6 +1575,7 @@ def api_match_detail(match_id: int):
             "start_time": match.start_time,
             "duration": match.duration,
             "radiant_win": match.radiant_win,
+            "mixer_tournament_id": mixer_tid,
             "tournament_label": _tournament_label(mixer_tid, match.league_id),
         }
 
@@ -1108,9 +1628,13 @@ def api_players_leaderboard():
     subs who haven't played yet) plus anyone who has actually played a game in
     it. Winrate and hero pool are scoped to the active cup - mixing in last
     cup's games would grade players on a team that no longer exists."""
+    if not _may_see_tournament(_requested_scope()):
+        return _deny_tournament()
     with Session(engine) as session:
         active = _resolve_mixer_tournament_id()
-        tour_filter = (Match.mixer_tournament_id == active) if active is not None else True
+        scope = _requested_scope()
+        historical = scope is not None and scope != active
+        tour_filter = (Match.mixer_tournament_id == scope) if scope is not None else True
 
         decided = case((Match.radiant_win.is_not(None), 1), else_=0)
         won = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
@@ -1135,12 +1659,30 @@ def api_players_leaderboard():
                 (count, hero_name, _hero_icon_slug(internal_name))
             )
 
+        # Current rosters only make sense for the live cup. On a finished
+        # cup's page, a player's team is the one they actually played most of
+        # that cup for - today's roster says nothing about it.
         roster_rows = session.execute(
             select(Player, Team)
             .join(Team, Team.team_id == Player.team_id)
             .where(Team.tournament_id == active, Player.roster_confirmed.is_(True))
-        ).all() if active is not None else []
+        ).all() if active is not None and not historical else []
         rostered = {p.account_id: (p, t) for p, t in roster_rows}
+
+        past_team_of: dict[int, tuple[int, str]] = {}
+        if historical:
+            names = dict(session.execute(
+                select(TeamTournamentName.team_id, TeamTournamentName.name)
+                .where(TeamTournamentName.tournament_id == scope)
+            ).all())
+            for account_id, team_id, _ in sorted(session.execute(
+                select(MatchPlayer.account_id, MatchPlayer.team_id, func.count())
+                .join(Match, Match.match_id == MatchPlayer.match_id)
+                .where(tour_filter, MatchPlayer.team_id.is_not(None))
+                .group_by(MatchPlayer.account_id, MatchPlayer.team_id)
+            ).all(), key=lambda r: r[2]):
+                # Ascending count, so the most-played team lands last and wins.
+                past_team_of[account_id] = (team_id, names.get(team_id) or f"Team {team_id}")
 
         # Players who appear in games but were since subbed out still belong
         # on the board - their games happened - just without a current team.
@@ -1157,13 +1699,14 @@ def api_players_leaderboard():
             player, team = rostered.get(account_id, (extras.get(account_id), None))
             games, dec, wins = stats.get(account_id, (0, 0, 0))
             top = sorted(heroes_by_player.get(account_id, []), reverse=True)[:3]
+            past_team_id, past_team_name = past_team_of.get(account_id, (None, None))
             players.append({
                 "account_id": account_id,
                 "name": (player.name if player and player.name else f"account {account_id}"),
                 "mmr": player.mmr if player else None,
                 "roles": player.preferred_roles if player else None,
-                "team_id": team.team_id if team else None,
-                "team_name": (team.name or f"Team {team.team_id}") if team else None,
+                "team_id": team.team_id if team else past_team_id,
+                "team_name": (team.name or f"Team {team.team_id}") if team else past_team_name,
                 "games": games,
                 "wins": wins,
                 "losses": dec - wins,
@@ -1171,13 +1714,15 @@ def api_players_leaderboard():
                 "top_heroes": [
                     {"name": name, "icon": slug, "games": count}
                     for count, name, slug in top
-                ],
+                ] if _may_see_hero_pools() else [],
             })
 
     players.sort(key=lambda p: (p["mmr"] is None, -(p["mmr"] or 0)))
     return jsonify({
-        "tournament_id": active,
-        "tournament_label": _tournament_label(active, None) if active is not None else None,
+        "tournament_id": scope,
+        "tournament_label": _tournament_label(scope, None) if scope is not None else None,
+        "is_historical": historical,
+        "hero_pools_locked": not _may_see_hero_pools(),
         "players": players,
     })
 
@@ -1190,8 +1735,6 @@ def api_archive_player_heroes():
     id, new file), the previous tournament's file survives there as reference
     data. Scoped by mixer_tournament_id, not league_id: consecutive mixer
     tournaments reuse the same dotabuff league."""
-    from datetime import datetime, timezone
-
     active = _resolve_mixer_tournament_id()
     with Session(engine) as session:
         decided = case((Match.radiant_win.is_not(None), 1), else_=0)
@@ -1240,8 +1783,11 @@ def api_team_analysis(team_id: int):
         if team is None:
             return jsonify({"error": "not found"}), 404
 
-        team_name = team.name or f"Team {team_id}"
-        stats = compute_team_stats(session, team_id, team.tournament_id)
+        tournament_id, _ = _requested_tournament(team)
+        if not _may_see_tournament(tournament_id):
+            return _deny_tournament()
+        team_name = _team_name_in_tournament(session, team_id, tournament_id) or f"Team {team_id}"
+        stats = compute_team_stats(session, team_id, tournament_id)
         text = generate_coach_text(team_name, stats)
 
     return jsonify({
@@ -1268,7 +1814,13 @@ def api_team_substitutions(team_id: int):
         team = session.get(Team, team_id)
         if team is None:
             return jsonify({"error": "not found"}), 404
-        swaps = _get_substitution_history(session, team_id)
+        # Only the active cup's substitutions are kept (see
+        # collect._purge_past_tournament_subs), so a past cup's page has
+        # nothing to show rather than the current squad's swaps.
+        tournament_id, historical = _requested_tournament(team)
+        if not _may_see_tournament(tournament_id):
+            return _deny_tournament()
+        swaps = [] if historical else _get_substitution_history(session, team_id, tournament_id)
 
     return jsonify({"team_id": team_id, "substitutions": swaps})
 
@@ -1278,6 +1830,11 @@ def api_all_substitutions():
     """Every substitution across the tournament, newest first, with the
     team it happened in - the per-team tab shows the same data scoped to
     one team; this powers the tournament-wide substitutions page."""
+    scope = _requested_scope()
+    # Only the active cup's substitutions are kept at all, so this page is
+    # entirely current-tournament data.
+    if not _may_see_tournament(scope):
+        return _deny_tournament()
     with Session(engine) as session:
         teams = session.execute(
             select(Team.team_id, Team.name)
@@ -1286,21 +1843,26 @@ def api_all_substitutions():
 
         all_swaps = []
         for team_id, team_name in teams:
-            for swap in _get_substitution_history(session, team_id):
+            for swap in _get_substitution_history(session, team_id, scope):
                 swap["team_id"] = team_id
-                swap["team_name"] = team_name or f"Team {team_id}"
+                swap["team_name"] = (
+                    _team_name_in_tournament(session, team_id, scope)
+                    or team_name or f"Team {team_id}"
+                )
                 all_swaps.append(swap)
 
     all_swaps.sort(key=lambda s: s["at"], reverse=True)
-    return jsonify({"substitutions": all_swaps})
+    return jsonify({
+        "tournament_id": scope,
+        "tournament_label": _tournament_label(scope, None) if scope is not None else None,
+        "substitutions": all_swaps,
+    })
 
 
-@app.get("/api/tournament/heroes")
-def api_tournament_heroes():
-    active = _resolve_mixer_tournament_id()
-    with Session(engine) as session:
-        stats = compute_tournament_hero_stats(session, mixer_tournament_id=active)
-    return jsonify(stats)
+# The tournament-wide hero stats page (win rates, ban counts, which heroes one
+# player had to themselves) lived here. Removed at the owner's call: it read as
+# trivia rather than something you act on, unlike the per-team and per-player
+# views. compute_tournament_hero_stats() went with it.
 
 
 @app.get("/api/backup")
@@ -1326,6 +1888,9 @@ def api_backup():
         ).scalars().all()
         queued = session.execute(
             select(QueuedPlayer).order_by(QueuedPlayer.player_uuid)
+        ).scalars().all()
+        notes = session.execute(
+            select(PlayerNote).order_by(PlayerNote.created_at)
         ).scalars().all()
         teams = session.execute(select(Team).order_by(Team.team_id)).scalars().all()
         all_players = session.execute(select(Player).order_by(Player.account_id)).scalars().all()
@@ -1378,6 +1943,7 @@ def api_backup():
         "substitution_events": [
             {
                 "event_id": e.event_id, "team_id": e.team_id,
+                "tournament_id": e.tournament_id,
                 "event_type": e.event_type, "nickname": e.nickname,
                 "rating": e.rating, "queue_position": e.queue_position,
                 "occurred_at": e.occurred_at,
@@ -1391,6 +1957,16 @@ def api_backup():
                 "updated_at": q.updated_at,
             }
             for q in queued
+        ],
+        # The only authored data here - nothing else in this file would be lost
+        # for good if it went missing (see models.PlayerNote).
+        "player_notes": [
+            {
+                "note_id": n.note_id, "account_id": n.account_id,
+                "author": n.author, "text": n.text,
+                "author_key_hash": n.author_key_hash, "created_at": n.created_at,
+            }
+            for n in notes
         ],
         # match_id -> [[order, hero_id, team_id, is_pick], ...]
         "match_drafts": drafts,

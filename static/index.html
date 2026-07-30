@@ -8,13 +8,16 @@
 </head>
 <body>
 <header>
-  <h1>PARI Mixer Cup</h1>
+  <h1 id="home-link" title="К списку команд турнира">PARI Mixer Cup</h1>
   <div class="header-actions">
-    <button id="tournament-stats-btn">Статистика по героям</button>
+    <!-- Filled in from /api/tournaments; hidden until there is more than one
+         cup to switch between. -->
+    <select id="cup-switcher" style="display:none" title="Турнир"></select>
     <button id="players-btn">Игроки</button>
     <button id="all-subs-btn">Замены</button>
     <a class="header-link-btn" href="https://battlepass.ru/service/steam" target="_blank" rel="noopener noreferrer">Пополнить Steam</a>
     <span id="collect-status"></span>
+    <button id="login-btn" title="Ввести ключ доступа" style="display:none">У меня есть ключ</button>
     <button id="logout-btn" title="Выйти" style="display:none">Выйти</button>
   </div>
 </header>

@@ -15,9 +15,9 @@ from sqlalchemy.orm import Session
 
 from .mixercup_client import MixerCupClient
 from .models import (
-    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, QueuedPlayer,
+    Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, PlayerNote, QueuedPlayer,
     SubstitutionEvent, Team, TeamTournamentName,
-    build_engine, configure_sqlite,
+    build_engine, configure_sqlite, ensure_schema,
 )
 from .opendota_client import OpenDotaClient
 from .roster_overrides import MANUAL_ROSTER_OVERRIDES
@@ -968,6 +968,7 @@ def restore_state_backup(session: Session, progress: ProgressFn) -> dict | None:
             session.add(SubstitutionEvent(
                 event_id=ev["event_id"],
                 team_id=ev["team_id"],
+                tournament_id=ev.get("tournament_id"),
                 event_type=ev.get("event_type") or "",
                 nickname=ev.get("nickname"),
                 rating=ev.get("rating"),
@@ -975,9 +976,32 @@ def restore_state_backup(session: Session, progress: ProgressFn) -> dict | None:
                 occurred_at=ev.get("occurred_at") or "",
             ))
             added_events += 1
-        elif row.queue_position is None and ev.get("queue_position") is not None:
-            row.queue_position = ev["queue_position"]
-            filled_positions += 1
+        else:
+            if row.queue_position is None and ev.get("queue_position") is not None:
+                row.queue_position = ev["queue_position"]
+                filled_positions += 1
+            if row.tournament_id is None and ev.get("tournament_id") is not None:
+                row.tournament_id = ev["tournament_id"]
+
+    existing_notes = {row[0] for row in session.execute(select(PlayerNote.note_id))}
+    known_accounts = {row[0] for row in session.execute(select(Player.account_id))}
+    added_notes = 0
+    for bn in data.get("player_notes", []):
+        if not bn.get("note_id") or bn["note_id"] in existing_notes:
+            continue
+        # The note references a player row; if that player isn't stored yet,
+        # a later run picks the note up.
+        if bn.get("account_id") not in known_accounts:
+            continue
+        session.add(PlayerNote(
+            note_id=bn["note_id"],
+            account_id=bn["account_id"],
+            author=bn.get("author") or "",
+            text=bn.get("text") or "",
+            author_key_hash=bn.get("author_key_hash"),
+            created_at=bn.get("created_at") or "",
+        ))
+        added_notes += 1
 
     existing_queue = {row[0] for row in session.execute(select(QueuedPlayer.player_uuid))}
     for qp in data.get("queued_players", []):
@@ -992,12 +1016,12 @@ def restore_state_backup(session: Session, progress: ProgressFn) -> dict | None:
         ))
         added_queue += 1
 
-    if added_events or filled_positions or added_queue or added_teams or added_players:
+    if added_events or filled_positions or added_queue or added_teams or added_players or added_notes:
         session.commit()
         progress(
             f"State backup restored: +{added_teams} team(s), +{added_players} player(s), "
             f"+{added_events} substitution event(s), {filled_positions} queue position(s) "
-            f"filled, +{added_queue} queued player(s)"
+            f"filled, +{added_queue} queued player(s), +{added_notes} note(s)"
         )
     # Handed back so the caller can restore drafts later - those reference
     # match_id, which doesn't exist yet at this point in the run.
@@ -1085,6 +1109,7 @@ def sync_substitution_history(
                 session.add(SubstitutionEvent(
                     event_id=e["event_id"],
                     team_id=team.team_id,
+                    tournament_id=tournament_id,
                     event_type=e["type"],
                     nickname=e["nickname"],
                     rating=e["rating"],
@@ -1101,10 +1126,66 @@ def sync_substitution_history(
         progress(f"Substitution history: {new_count} new event(s) saved")
 
 
+# Which cup the events saved before SubstitutionEvent.tournament_id existed came
+# from. Normally the team they hang on answers that - but only until the next cup
+# rolls over and reclaims that Steam team id, after which the team says "the new
+# cup" about events from the old one. Set this for the first collection after
+# upgrading past a rollover (LEGACY_SUBS_TOURNAMENT_ID=27), then remove it.
+_LEGACY_SUBS_TOURNAMENT_ID = os.environ.get("LEGACY_SUBS_TOURNAMENT_ID", "")
+
+
+def _backfill_substitution_tournaments(session: Session, progress: ProgressFn) -> None:
+    """Stamps the tournament onto substitution events saved (or restored from
+    a backup) before SubstitutionEvent.tournament_id existed.
+
+    Takes it from LEGACY_SUBS_TOURNAMENT_ID when that is set, otherwise from
+    the team the event belongs to. Ordering matters for the second case: it
+    must run BEFORE link_mixercup_data, because the active tournament reclaims
+    every Steam team id it reuses - after that the team no longer says which
+    cup its older events came from."""
+    stale = session.execute(
+        select(SubstitutionEvent).where(SubstitutionEvent.tournament_id.is_(None))
+    ).scalars().all()
+    if not stale:
+        return
+
+    forced = None
+    if _LEGACY_SUBS_TOURNAMENT_ID.strip():
+        try:
+            forced = int(_LEGACY_SUBS_TOURNAMENT_ID.strip())
+        except ValueError:
+            progress(f"LEGACY_SUBS_TOURNAMENT_ID={_LEGACY_SUBS_TOURNAMENT_ID!r} is not a number; ignoring it.")
+
+    team_tournaments = dict(session.execute(select(Team.team_id, Team.tournament_id)).all())
+    filled = 0
+    for event in stale:
+        tournament_id = forced if forced is not None else team_tournaments.get(event.team_id)
+        if tournament_id is not None:
+            event.tournament_id = tournament_id
+            filled += 1
+    if filled:
+        session.commit()
+        source = f"tournament {forced} (forced)" if forced is not None else "their team's tournament"
+        progress(f"Tagged {filled} legacy substitution event(s) with {source}")
+
+
 def _purge_past_tournament_subs(session: Session, active_tournament_id: int, progress: ProgressFn) -> None:
-    """Deletes substitution events tied to teams from any tournament other
-    than the active one - the site only shows the current tournament's
-    substitution history."""
+    """Deletes substitution events from any tournament other than the active
+    one - the site only shows the current tournament's substitution history.
+
+    Scoped by the event's OWN tournament rather than by whichever tournament
+    currently owns its team: a Steam team id reused by the new cup gets
+    reclaimed by it, so the team-based rule left exactly those events behind -
+    last cup's swaps, displayed as the new cup's. Events still carrying no
+    tournament (their team is gone, so the backfill couldn't tag them) keep
+    the old team-based rule."""
+    deleted = session.execute(
+        delete(SubstitutionEvent).where(
+            SubstitutionEvent.tournament_id.is_not(None),
+            SubstitutionEvent.tournament_id != active_tournament_id,
+        )
+    ).rowcount
+
     past_team_ids = [
         t for (t,) in session.execute(
             select(Team.team_id).where(
@@ -1113,11 +1194,14 @@ def _purge_past_tournament_subs(session: Session, active_tournament_id: int, pro
             )
         )
     ]
-    if not past_team_ids:
-        return
-    deleted = session.execute(
-        delete(SubstitutionEvent).where(SubstitutionEvent.team_id.in_(past_team_ids))
-    ).rowcount
+    if past_team_ids:
+        deleted += session.execute(
+            delete(SubstitutionEvent).where(
+                SubstitutionEvent.tournament_id.is_(None),
+                SubstitutionEvent.team_id.in_(past_team_ids),
+            )
+        ).rowcount
+
     if deleted:
         session.commit()
         progress(f"Removed {deleted} substitution event(s) from past tournaments")
@@ -1332,6 +1416,9 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
     with Session(engine) as session:
         progress("Session open. Restoring state backup if available...")
         backup = restore_state_backup(session, progress)
+        # Before any linking reclaims teams for the active cup (see the
+        # function's docstring for why the order is load-bearing).
+        _backfill_substitution_tournaments(session, progress)
 
         progress("Syncing hero list...")
         sync_heroes(session, od_client, progress)
@@ -1459,6 +1546,47 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
     return new_count
 
 
+def _carry_over_notes(build_path: str, live_path: str, progress: ProgressFn) -> None:
+    """Copies player notes that appeared in the LIVE database after this build
+    was seeded from it.
+
+    Every build starts as a copy of the live file and is swapped over it at the
+    end, so whatever was written to the live database in between is destroyed by
+    the swap. For collected data that is harmless - the next run re-fetches it -
+    but a note is authored here and exists nowhere else, and a run takes
+    minutes. So live notes are merged forward right before each publish."""
+    import sqlite3
+
+    if not os.path.exists(live_path):
+        return
+    conn = sqlite3.connect(build_path)
+    try:
+        conn.execute("ATTACH DATABASE ? AS live", (live_path,))
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM live.sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "player_notes" not in tables:
+            return  # live file predates notes
+        cur = conn.execute(
+            'INSERT OR IGNORE INTO "player_notes"'
+            ' ("note_id", "account_id", "author", "text", "author_key_hash", "created_at")'
+            ' SELECT "note_id", "account_id", "author", "text", "author_key_hash", "created_at"'
+            ' FROM live."player_notes"'
+            # A note whose player somehow isn't in the rebuild would break the
+            # foreign key; skip it rather than fail the publish.
+            ' WHERE "account_id" IN (SELECT "account_id" FROM "players")'
+        )
+        conn.commit()
+        if cur.rowcount > 0:
+            progress(f"Carried {cur.rowcount} note(s) written during this run into the new database")
+    except Exception as e:
+        progress(f"Could not carry notes forward ({e}); publishing anyway.")
+    finally:
+        conn.close()
+
+
 def _atomic_publish(src: str, dst: str) -> None:
     """Copy src onto dst atomically: copy to a temp beside dst, then
     os.replace it in. A plain copyfile truncates dst in place, which a
@@ -1521,9 +1649,13 @@ def collect(
     progress("Building a new database engine...")
     own_engine = configure_sqlite(build_engine(db_path))
     Base.metadata.create_all(own_engine)
+    # The build was seeded by copying the live file, which may predate a
+    # column added since it was written.
+    ensure_schema(own_engine)
 
     def publish_core() -> None:
         if promote_to:
+            _carry_over_notes(db_path, promote_to, progress)
             _atomic_publish(db_path, promote_to)
             progress("Core data published to the live site (teams visible now).")
 
@@ -1548,6 +1680,8 @@ def collect(
         # empty build (fresh deploy + total upstream outage) must never
         # replace a live DB that has data.
         if total_matches > 0 or total_teams > 0:
+            # Anything written to the live site while the slow phases ran.
+            _carry_over_notes(db_path, promote_to, progress)
             os.replace(db_path, promote_to)
             progress(f"Full data published ({total_matches} matches, {new_count} new).")
         else:

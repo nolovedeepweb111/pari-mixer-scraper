@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import TypedDict
 
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
-from .models import Hero, Match, MatchDraftEntry, MatchPlayer, Player
+from .models import Hero, Match, MatchDraftEntry, MatchPlayer
 
 
 class TeamStats(TypedDict):
@@ -128,82 +128,6 @@ def compute_team_stats(session: Session, team_id: int,
     }
 
 
-def compute_tournament_hero_stats(session: Session, min_games: int = 3,
-                                  mixer_tournament_id: int | None = None) -> dict:
-    """Hero stats across the whole tournament (not per-team): win rate,
-    ban count, and how concentrated a hero's playtime is among just one or
-    two players (a real "signature" pick vs. one every team dips into).
-    min_games filters out heroes with too few appearances to say anything
-    meaningful. mixer_tournament_id scopes everything to one tournament -
-    needed because consecutive mixer tournaments reuse the same dotabuff
-    league, so league_id can't separate them."""
-    league_filter = (
-        (Match.mixer_tournament_id == mixer_tournament_id)
-        if mixer_tournament_id is not None else True
-    )
-
-    decided_case = case((Match.radiant_win.is_not(None), 1), else_=0)
-    won_case = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
-    hero_wl = session.execute(
-        select(Hero.localized_name, func.count(), func.sum(decided_case), func.sum(won_case))
-        .join(MatchPlayer, MatchPlayer.hero_id == Hero.hero_id)
-        .join(Match, Match.match_id == MatchPlayer.match_id)
-        .where(league_filter)
-        .group_by(Hero.hero_id)
-    ).all()
-    win_rates = [
-        {"hero": hero, "games": games, "wins": wins, "win_rate": round(100 * wins / decided)}
-        for hero, games, decided, wins in hero_wl
-        if decided and decided >= min_games
-    ]
-    win_rates.sort(key=lambda h: (-h["win_rate"], -h["games"]))
-
-    ban_rows = session.execute(
-        select(Hero.localized_name, func.count())
-        .join(MatchDraftEntry, MatchDraftEntry.hero_id == Hero.hero_id)
-        .join(Match, Match.match_id == MatchDraftEntry.match_id)
-        .where(MatchDraftEntry.is_pick.is_(False), league_filter)
-        .group_by(Hero.hero_id)
-        .order_by(func.count().desc())
-    ).all()
-    most_banned = [{"hero": hero, "bans": count} for hero, count in ban_rows]
-
-    player_rows = session.execute(
-        select(Hero.localized_name, Player.name, MatchPlayer.account_id, func.count())
-        .join(MatchPlayer, MatchPlayer.hero_id == Hero.hero_id)
-        .join(Player, Player.account_id == MatchPlayer.account_id)
-        .join(Match, Match.match_id == MatchPlayer.match_id)
-        .where(league_filter)
-        .group_by(Hero.hero_id, MatchPlayer.account_id)
-    ).all()
-    hero_players: dict[str, list[tuple[str, int]]] = defaultdict(list)
-    for hero, player_name, account_id, count in player_rows:
-        hero_players[hero].append((player_name or f"account {account_id}", count))
-
-    monopolized = []
-    for hero, players in hero_players.items():
-        total_games = sum(c for _, c in players)
-        if total_games < min_games:
-            continue
-        players.sort(key=lambda p: -p[1])
-        top_players = players[:2]
-        concentration = round(100 * sum(c for _, c in top_players) / total_games)
-        monopolized.append({
-            "hero": hero,
-            "games": total_games,
-            "top_players": [{"name": name, "games": c} for name, c in top_players],
-            "concentration": concentration,
-        })
-    monopolized.sort(key=lambda h: (-h["concentration"], -h["games"]))
-
-    return {
-        "min_games": min_games,
-        "top_win_rate": win_rates[:10],
-        "most_banned": most_banned[:10],
-        "signature_by_player": monopolized[:10],
-    }
-
-
 def generate_coach_text(team_name: str, stats: TeamStats) -> str:
     if stats["decided"] == 0:
         return "Недостаточно завершённых матчей для анализа."
@@ -221,6 +145,13 @@ def generate_coach_text(team_name: str, stats: TeamStats) -> str:
         sentences.append(f"{team_name} играет ровно: {wins} побед из {decided} ({win_rate}%).")
     elif win_rate >= 25:
         sentences.append(f"{team_name} испытывает трудности: только {wins} победа(ы) из {decided} ({win_rate}%).")
+    elif wins:
+        # Below 25% but not winless - the branch under this one claims a clean
+        # sheet, which for anything from 1% up is simply false.
+        sentences.append(
+            f"{team_name} проводит турнир тяжело: {wins} победа(ы) из {decided} ({win_rate}%) — "
+            "стоит пересмотреть подход к драфту."
+        )
     else:
         sentences.append(
             f"{team_name} пока не одержали ни одной победы в {decided} матчах — стоит пересмотреть подход к драфту."

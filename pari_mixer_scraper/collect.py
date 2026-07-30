@@ -1126,29 +1126,47 @@ def sync_substitution_history(
         progress(f"Substitution history: {new_count} new event(s) saved")
 
 
+# Which cup the events saved before SubstitutionEvent.tournament_id existed came
+# from. Normally the team they hang on answers that - but only until the next cup
+# rolls over and reclaims that Steam team id, after which the team says "the new
+# cup" about events from the old one. Set this for the first collection after
+# upgrading past a rollover (LEGACY_SUBS_TOURNAMENT_ID=27), then remove it.
+_LEGACY_SUBS_TOURNAMENT_ID = os.environ.get("LEGACY_SUBS_TOURNAMENT_ID", "")
+
+
 def _backfill_substitution_tournaments(session: Session, progress: ProgressFn) -> None:
     """Stamps the tournament onto substitution events saved (or restored from
-    a backup) before SubstitutionEvent.tournament_id existed, taking it from
-    the team the event belongs to.
+    a backup) before SubstitutionEvent.tournament_id existed.
 
-    Ordering matters: this must run BEFORE link_mixercup_data, because the
-    active tournament reclaims every Steam team id it reuses - after that the
-    team no longer says which cup its older events came from."""
+    Takes it from LEGACY_SUBS_TOURNAMENT_ID when that is set, otherwise from
+    the team the event belongs to. Ordering matters for the second case: it
+    must run BEFORE link_mixercup_data, because the active tournament reclaims
+    every Steam team id it reuses - after that the team no longer says which
+    cup its older events came from."""
     stale = session.execute(
         select(SubstitutionEvent).where(SubstitutionEvent.tournament_id.is_(None))
     ).scalars().all()
     if not stale:
         return
+
+    forced = None
+    if _LEGACY_SUBS_TOURNAMENT_ID.strip():
+        try:
+            forced = int(_LEGACY_SUBS_TOURNAMENT_ID.strip())
+        except ValueError:
+            progress(f"LEGACY_SUBS_TOURNAMENT_ID={_LEGACY_SUBS_TOURNAMENT_ID!r} is not a number; ignoring it.")
+
     team_tournaments = dict(session.execute(select(Team.team_id, Team.tournament_id)).all())
     filled = 0
     for event in stale:
-        tournament_id = team_tournaments.get(event.team_id)
+        tournament_id = forced if forced is not None else team_tournaments.get(event.team_id)
         if tournament_id is not None:
             event.tournament_id = tournament_id
             filled += 1
     if filled:
         session.commit()
-        progress(f"Tagged {filled} legacy substitution event(s) with their tournament")
+        source = f"tournament {forced} (forced)" if forced is not None else "their team's tournament"
+        progress(f"Tagged {filled} legacy substitution event(s) with {source}")
 
 
 def _purge_past_tournament_subs(session: Session, active_tournament_id: int, progress: ProgressFn) -> None:

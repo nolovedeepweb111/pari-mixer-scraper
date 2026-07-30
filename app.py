@@ -941,15 +941,27 @@ def _requested_tournament(team: Team) -> tuple[int | None, bool]:
 
     Returns (tournament_id, is_historical). A Steam team_id is reused cup after
     cup, so without this a link from a #2 match opens the CURRENT squad playing
-    under that id - different players, different games, different name."""
+    under that id - different players, different games, different name.
+
+    "Historical" is decided against the ACTIVE cup, not against the cup that
+    owns the Team row. Those differ for a team the new cup did NOT reuse: its
+    row still says the old cup, so asking for the old cup looked like asking
+    for the current one, and the page was built from the confirmed roster -
+    which by then is one leftover player who never moved to the new cup, or
+    none. That returned 404 for every archived team the new cup didn't reuse,
+    while the sidebar (built from matches) listed them all."""
     raw = request.args.get("tournament")
-    if not raw:
-        return team.tournament_id, False
-    try:
-        requested = int(raw)
-    except ValueError:
-        return team.tournament_id, False
-    return requested, requested != team.tournament_id
+    requested = team.tournament_id
+    if raw:
+        try:
+            requested = int(raw)
+        except ValueError:
+            pass
+    active = _resolve_mixer_tournament_id()
+    # requested None means an unlinked team asked for with no scope: leave it
+    # unscoped and on the roster path, exactly as before.
+    historical = active is not None and requested is not None and requested != active
+    return requested, historical
 
 
 def _roster_filter(session: Session, team_id: int):

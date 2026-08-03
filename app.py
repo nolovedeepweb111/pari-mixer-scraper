@@ -103,6 +103,14 @@ ACCESS_OFFER = {
 
 app.secret_key = hashlib.sha256(("session:" + AUTH_SECRET).encode()).digest()
 app.permanent_session_lifetime = timedelta(days=60)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    # This cookie IS the paid access, so on a site served over TLS it must not
+    # be sent in the clear. Off by default so local development over plain
+    # http still logs in; the deploy sets it (see deploy/env.example).
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE") == "1",
+)
 
 
 def _key_hash(key: str) -> str:

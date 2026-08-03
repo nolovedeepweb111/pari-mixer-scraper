@@ -1,0 +1,37 @@
+[Unit]
+Description=PARI Mixer Cup statistics
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pari
+Group=pari
+WorkingDirectory=/opt/pari-mixer-scraper
+EnvironmentFile=/etc/pari-mixer/env
+
+# ОДИН воркер - это не тюнинг, а требование. Привязки ключей к устройствам,
+# статус сбора и кэш активного турнира живут в памяти процесса: со вторым
+# воркером у половины запросов была бы другая картина, и анти-шаринг ключей
+# перестал бы работать. Параллелизм даётся потоками, которые эту память делят.
+ExecStart=/opt/pari-mixer-scraper/.venv/bin/gunicorn \
+    --workers 1 --threads 4 \
+    --bind 127.0.0.1:8000 \
+    --timeout 120 \
+    --access-logfile - --error-logfile - \
+    app:app
+
+Restart=always
+RestartSec=5
+# Сборщик запускается отдельным процессом (posix_spawn) и живёт своей жизнью;
+# systemd не должен убивать его вместе с перезапуском веб-сервера.
+KillMode=mixed
+
+# База и временные файлы сборки - единственное, что нужно писать.
+ReadWritePaths=/var/lib/pari-mixer
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

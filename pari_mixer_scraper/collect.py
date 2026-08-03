@@ -838,12 +838,73 @@ def restore_draft_backup(session: Session, data: dict | None, progress: Progress
         progress(f"Draft backup restored: +{restored} match(es) worth of picks/bans (no OpenDota calls needed)")
 
 
+def restore_match_backup(session: Session, data: dict | None, progress: ProgressFn) -> None:
+    """Re-import matches and their lineups (heroes, sides, KDA, economy).
+
+    Steam's league history is a sliding window - measured at 500 matches for
+    this league - and the cups together have outgrown it. Once a cup's oldest
+    games fall out of that window they never come back from Steam, so after a
+    disk wipe the archive quietly shrank: cup #1 was rebuilt with 135 of its
+    270 games. mixer-cup still knows those match ids, but re-fetching them
+    costs one rate-limited OpenDota call each, and every wipe restarts the job.
+
+    Must run BEFORE the league fetch, for two reasons: matches restored here
+    then count as already stored, so Steam only adds what is new; and their
+    KDA survives, instead of being overwritten by Steam's numberless copy."""
+    rows = (data or {}).get("matches") or []
+    if not rows:
+        return
+    known_matches = {m for (m,) in session.execute(select(Match.match_id))}
+    known_players = {p for (p,) in session.execute(select(Player.account_id))}
+    lineups = (data or {}).get("match_players") or {}
+
+    added = added_rows = 0
+    for row in rows:
+        if len(row) != 8:
+            continue
+        match_id, league_id, start_time, duration, radiant, dire, radiant_win, mixer_tid = row
+        if match_id is None or match_id in known_matches:
+            continue
+        session.add(Match(
+            match_id=match_id,
+            league_id=league_id if league_id is not None else DEFAULT_LEAGUE_ID,
+            start_time=start_time,
+            duration=duration,
+            radiant_team_id=radiant,
+            dire_team_id=dire,
+            radiant_win=radiant_win,
+            mixer_tournament_id=mixer_tid,
+        ))
+        known_matches.add(match_id)
+        added += 1
+        for entry in lineups.get(str(match_id)) or []:
+            if len(entry) != 10:
+                continue
+            account_id, hero_id, team_id, is_radiant, k, d, a, gpm, xpm, nw = entry
+            # A lineup row whose player never made it into the backup would
+            # leave a dangling reference; skip it rather than carry it in.
+            if account_id not in known_players:
+                continue
+            session.add(MatchPlayer(
+                match_id=match_id, account_id=account_id, hero_id=hero_id,
+                team_id=team_id, is_radiant=bool(is_radiant),
+                kills=k, deaths=d, assists=a,
+                gold_per_min=gpm, xp_per_min=xpm, net_worth=nw,
+            ))
+            added_rows += 1
+
+    if added:
+        session.commit()
+        progress(f"Match backup restored: +{added} match(es), {added_rows} lineup row(s) "
+                 f"(no Steam or OpenDota calls needed)")
+
+
 def restore_match_stats_backup(session: Session, data: dict | None, progress: ProgressFn) -> None:
-    """Re-import per-player KDA + economy saved by the state backup. Same
-    rationale as the drafts (one expensive OpenDota fetch, immutable once
-    known); fills only null columns so it never overwrites live data. Must
-    run AFTER matches/players are stored - it updates existing MatchPlayer
-    rows rather than creating them."""
+    """Re-import per-player KDA + economy from a backup written before the
+    lineups themselves were saved (match_players carries these columns now).
+    Kept for those older files: fills only null columns, so it never
+    overwrites live data. Must run AFTER matches/players are stored - it
+    updates existing MatchPlayer rows rather than creating them."""
     entries = (data or {}).get("match_player_stats") or {}
     if not entries:
         return
@@ -1422,6 +1483,10 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
 
         progress("Syncing hero list...")
         sync_heroes(session, od_client, progress)
+
+        # Before the league fetch: what comes back here is what Steam no longer
+        # has to (and for the older cups, no longer can) supply.
+        restore_match_backup(session, backup, progress)
 
         new_count = 0
         existing_match_ids = {row[0] for row in session.execute(select(Match.match_id))}

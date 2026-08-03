@@ -1949,11 +1949,17 @@ def api_backup():
                    MatchDraftEntry.is_pick)
             .order_by(MatchDraftEntry.match_id, MatchDraftEntry.order_num)
         ).all()
-        stat_rows = session.execute(
-            select(MatchPlayer.match_id, MatchPlayer.account_id,
+        match_rows = session.execute(
+            select(Match.match_id, Match.league_id, Match.start_time, Match.duration,
+                   Match.radiant_team_id, Match.dire_team_id, Match.radiant_win,
+                   Match.mixer_tournament_id)
+            .order_by(Match.match_id)
+        ).all()
+        lineup_rows = session.execute(
+            select(MatchPlayer.match_id, MatchPlayer.account_id, MatchPlayer.hero_id,
+                   MatchPlayer.team_id, MatchPlayer.is_radiant,
                    MatchPlayer.kills, MatchPlayer.deaths, MatchPlayer.assists,
                    MatchPlayer.gold_per_min, MatchPlayer.xp_per_min, MatchPlayer.net_worth)
-            .where(MatchPlayer.gold_per_min.is_not(None))
             .order_by(MatchPlayer.match_id, MatchPlayer.account_id)
         ).all()
 
@@ -1966,12 +1972,15 @@ def api_backup():
             [order_num, hero_id, team_id, 1 if is_pick else 0]
         )
 
-    # Same reasoning for per-player stats: they come from the same expensive
-    # OpenDota fetch as drafts and are equally worth keeping across a wipe.
-    # [account_id, k, d, a, gpm, xpm, net_worth]
-    match_stats: dict[str, list] = {}
-    for match_id, account_id, k, d, a, gpm, xpm, nw in stat_rows:
-        match_stats.setdefault(str(match_id), []).append([account_id, k, d, a, gpm, xpm, nw])
+    # Lineups, KDA and economy together - they are columns of the same row, so
+    # there is no reason to carry the numbers separately from who played.
+    # [account_id, hero_id, team_id, is_radiant, k, d, a, gpm, xpm, net_worth]
+    lineups: dict[str, list] = {}
+    for (match_id, account_id, hero_id, team_id, is_radiant,
+         k, d, a, gpm, xpm, nw) in lineup_rows:
+        lineups.setdefault(str(match_id), []).append(
+            [account_id, hero_id, team_id, 1 if is_radiant else 0, k, d, a, gpm, xpm, nw]
+        )
 
     return jsonify({
         "teams": [
@@ -2017,10 +2026,19 @@ def api_backup():
             }
             for n in notes
         ],
+        # Steam's league history is a sliding window (measured at 500 matches
+        # for this league), and the cups have outgrown it: a cup's oldest games
+        # stop coming back after the host wipes the disk, which is how cup #1
+        # lost half of its matches. Keeping them here is what makes the archive
+        # durable - Steam then only has to supply what is new.
+        # [match_id, league_id, start_time, duration, radiant_team_id,
+        #  dire_team_id, radiant_win, mixer_tournament_id]
+        "matches": [list(row) for row in match_rows],
+        # match_id -> [[account_id, hero_id, team_id, is_radiant, k, d, a,
+        #               gpm, xpm, net_worth], ...]
+        "match_players": lineups,
         # match_id -> [[order, hero_id, team_id, is_pick], ...]
         "match_drafts": drafts,
-        # match_id -> [[account_id, k, d, a, gpm, xpm, net_worth], ...]
-        "match_player_stats": match_stats,
         # Access-key -> device bindings, keyed by HMAC(key) so the public
         # backup branch never exposes the keys themselves. Lets device
         # bindings (the anti-sharing state) survive restarts and deploys.

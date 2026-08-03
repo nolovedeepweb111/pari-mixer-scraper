@@ -189,6 +189,7 @@ GitHub Actions — поправить `cron` в `.github/workflows/keep-alive.ym
 | `/mixercup2/team/10186631/analysis` | сразу вкладка аналитики (ещё есть `/subs`) |
 | `/mixercup2/players` | лидерборд турнира |
 | `/mixercup2/subs` | замены турнира |
+| `/players` | лидерборд за **все** турниры сразу, а не за один |
 | `/player/1840524315` | игрок: сквозная история по всем турнирам |
 | `/match/8919550204` | матч: составы, KDA и драфт |
 
@@ -290,8 +291,11 @@ python -m pari_mixer_scraper.report --db tournament.db
 - `GET /api/tournaments` — турниры с адресами и пометкой активного.
 - `GET /api/teams` — список команд с числом игроков. `?tournament=<id>` —
   команды прошедшего кубка (под их тогдашними названиями); без него активный.
-  Тот же параметр понимают `/api/players`, `/api/tournament/heroes` и
-  `/api/substitutions`.
+  Тот же параметр понимают `/api/players` и `/api/substitutions`.
+- `GET /api/players?tournament=all` — сводный зачёт по всем турнирам сразу
+  (страница `/players`). Считаются только те кубки, которые посетителю видны:
+  без ключа текущий кубок в сумму не попадает, и ответ перечисляет в
+  `tournaments_counted`, что именно посчитано.
 - `GET /api/teams/<team_id>` — игроки команды и герои, на которых каждый играл.
   Необязательный `?tournament=<mixer_tournament_id>` открывает то воплощение
   команды, которое играло в указанном кубке: свой состав, свои игры и своё

@@ -609,6 +609,7 @@ app.url_map.converters["tslug"] = _TournamentSlugConverter
 @app.get("/<tslug:slug>/subs")
 @app.get("/<tslug:slug>/team/<int:team_id>")
 @app.get("/<tslug:slug>/team/<int:team_id>/<any(composition, analysis, subs):section>")
+@app.get("/players")
 @app.get("/player/<int:account_id>")
 @app.get("/match/<int:match_id>")
 def spa_route(**_kwargs):
@@ -1636,17 +1637,43 @@ def api_match_detail(match_id: int):
 
 @app.get("/api/players")
 def api_players_leaderboard():
-    """Every participant of the ACTIVE tournament: current rosters (including
-    subs who haven't played yet) plus anyone who has actually played a game in
-    it. Winrate and hero pool are scoped to the active cup - mixing in last
-    cup's games would grade players on a team that no longer exists."""
-    if not _may_see_tournament(_requested_scope()):
-        return _deny_tournament()
+    """Every participant of one tournament: current rosters (including subs who
+    haven't played yet) plus anyone who actually played a game in it. Scoped to
+    one cup by default - mixing cups would grade players on a team that no
+    longer exists.
+
+    ?tournament=all instead totals every cup at once, for the career view at
+    /players. It counts only the cups this visitor may see, so a visitor
+    without a key gets the archive's totals rather than a number the running
+    cup silently contributes to."""
+    active = _resolve_mixer_tournament_id()
+    all_mode = (request.args.get("tournament") or "").strip().lower() == "all"
+
     with Session(engine) as session:
-        active = _resolve_mixer_tournament_id()
-        scope = _requested_scope()
-        historical = scope is not None and scope != active
-        tour_filter = (Match.mixer_tournament_id == scope) if scope is not None else True
+        if all_mode:
+            known = [
+                t for (t,) in session.execute(
+                    select(Match.mixer_tournament_id)
+                    .where(Match.mixer_tournament_id.is_not(None)).distinct()
+                )
+            ]
+            counted = sorted((t for t in known if _may_see_tournament(t)), reverse=True)
+            if not counted:
+                return _deny_tournament()
+            scope = None
+            tour_filter = Match.mixer_tournament_id.in_(counted)
+            # Today's roster is only meaningful when the running cup is part of
+            # the picture; otherwise there is no "current team" to show.
+            show_rosters = active in counted
+            historical = False
+        else:
+            scope = _requested_scope()
+            if not _may_see_tournament(scope):
+                return _deny_tournament()
+            counted = [scope] if scope is not None else []
+            historical = scope is not None and scope != active
+            tour_filter = (Match.mixer_tournament_id == scope) if scope is not None else True
+            show_rosters = not historical
 
         decided = case((Match.radiant_win.is_not(None), 1), else_=0)
         won = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
@@ -1678,7 +1705,7 @@ def api_players_leaderboard():
             select(Player, Team)
             .join(Team, Team.team_id == Player.team_id)
             .where(Team.tournament_id == active, Player.roster_confirmed.is_(True))
-        ).all() if active is not None and not historical else []
+        ).all() if active is not None and show_rosters else []
         rostered = {p.account_id: (p, t) for p, t in roster_rows}
 
         past_team_of: dict[int, tuple[int, str]] = {}
@@ -1730,10 +1757,20 @@ def api_players_leaderboard():
             })
 
     players.sort(key=lambda p: (p["mmr"] is None, -(p["mmr"] or 0)))
+    if all_mode:
+        label = "все турниры" if active in counted else "прошедшие турниры"
+    else:
+        label = _tournament_label(scope, None) if scope is not None else None
     return jsonify({
         "tournament_id": scope,
-        "tournament_label": _tournament_label(scope, None) if scope is not None else None,
+        "tournament_label": label,
         "is_historical": historical,
+        "all_tournaments": all_mode,
+        # Which cups the numbers actually cover - the running one drops out for
+        # a visitor without a key, and the page should be able to say so.
+        "tournaments_counted": [
+            {"id": t, "label": _tournament_label(t, None)} for t in counted
+        ] if all_mode else None,
         "hero_pools_locked": not _may_see_hero_pools(),
         "players": players,
     })

@@ -121,6 +121,8 @@ function parsePath(pathname) {
   if (parts.length === 0) {
     return { view: "cup", slug: cups.activeSlug, tournamentId: cups.activeId };
   }
+  // Careers across every cup, as opposed to /<cup>/players for one of them.
+  if (parts[0] === "players") return { view: "allPlayers" };
   if (parts[0] === "player") return { view: "player", accountId: Number(parts[1]) };
   if (parts[0] === "match") return { view: "match", matchId: Number(parts[1]) };
 
@@ -166,7 +168,13 @@ async function renderRoute() {
     detailEl.innerHTML = '<p class="hint">Такого турнира нет. Выберите турнир в шапке.</p>';
     return;
   }
-  const cupId = currentCupId();
+  let cupId = currentCupId();
+  // The career page belongs to no single cup, so it borrows the sidebar of one
+  // the visitor can actually open rather than showing a locked one.
+  if (route.view === "allPlayers" && cupIsLocked(cupId)) {
+    const open = cups.list.find((t) => !t.locked && t.has_matches);
+    if (open) cupId = open.id;
+  }
   syncCupSwitcher();
   if (route.view !== "team") activeTeamId = null;
 
@@ -177,7 +185,7 @@ async function renderRoute() {
   if (cupIsLocked(cupId)) {
     teamsEl.innerHTML = '<p class="hint">Список команд — по ключу.</p>';
     sidebarTournamentId = undefined;
-    if (route.view !== "player" && route.view !== "match") {
+    if (!["player", "match", "allPlayers"].includes(route.view)) {
       return renderLockPanel(detailEl);
     }
   } else if (sidebarTournamentId !== cupId) {
@@ -191,6 +199,8 @@ async function renderRoute() {
       return loadTeamDetail(route.teamId, route.tab, route.tournamentId);
     case "players":
       return loadPlayersLeaderboard(cupId);
+    case "allPlayers":
+      return loadPlayersLeaderboard("all");
     case "subs":
       return loadAllSubstitutions(cupId);
     case "player":
@@ -890,6 +900,19 @@ async function loadMatchPage(matchId) {
 const playersBtn = document.getElementById("players-btn");
 let leaderboardCache = null;
 
+// Which single cup the career page offers to drill into. Not simply the
+// active one: for a visitor without a key that cup is locked, and sending
+// them there would land them on the offer panel with no way back. The sidebar
+// already borrows an open cup - go to the same one.
+function oneCupId() {
+  return sidebarTournamentId != null ? sidebarTournamentId : currentCupId();
+}
+
+function oneCupLabel() {
+  const cup = cups.byId.get(oneCupId());
+  return cup ? cup.label : "турнир";
+}
+
 function renderLeaderboard(sortKey, sortDesc) {
   const data = leaderboardCache;
   const players = [...data.players];
@@ -937,8 +960,13 @@ function renderLeaderboard(sortKey, sortDesc) {
   const arrow = (k) => (k === sortKey ? (sortDesc ? " ↓" : " ↑") : "");
   detailEl.innerHTML = `
     <h2>Игроки · ${escapeHtml(data.tournament_label || "турнир")}</h2>
-    <p class="hint">Винрейт${data.hero_pools_locked ? "" : " и герои"} — только за этот турнир. Клик по заголовку — сортировка.${
-      data.hero_pools_locked ? " Топ героев — по ключу." : ""}</p>
+    <p class="hint">${
+      data.all_tournaments
+        ? `Счёт по всем турнирам сразу: ${escapeHtml((data.tournaments_counted || []).map((t) => t.label).join(", "))}.`
+        : `Винрейт${data.hero_pools_locked ? "" : " и герои"} — только за этот турнир.`
+    } Клик по заголовку — сортировка.${data.hero_pools_locked ? " Топ героев — по ключу." : ""}
+      <button class="scope-toggle" id="lb-scope">${escapeHtml(
+        data.all_tournaments ? `только ${oneCupLabel()}` : "показать за все турниры")}</button></p>
     <table class="subs-table leaderboard-table">
       <thead><tr>
         <th></th>
@@ -953,6 +981,11 @@ function renderLeaderboard(sortKey, sortDesc) {
     </table>
   `;
 
+  const scopeToggle = detailEl.querySelector("#lb-scope");
+  if (scopeToggle) {
+    scopeToggle.addEventListener("click", () =>
+      navigate(data.all_tournaments ? cupPath(oneCupId(), "players") : "/players"));
+  }
   for (const th of detailEl.querySelectorAll("th.sortable")) {
     th.addEventListener("click", () => {
       const key = th.dataset.sort;
@@ -971,7 +1004,8 @@ function renderLeaderboard(sortKey, sortDesc) {
 
 async function loadPlayersLeaderboard(tournamentId) {
   detailEl.innerHTML = '<p class="hint">Загружаю игроков...</p>';
-  const res = await fetch(`/api/players${scopeQuery(tournamentId)}`);
+  const scope = tournamentId === "all" ? "?tournament=all" : scopeQuery(tournamentId);
+  const res = await fetch(`/api/players${scope}`);
   if (!res.ok) {
     detailEl.innerHTML = '<p class="hint">Не удалось получить список игроков.</p>';
     return;

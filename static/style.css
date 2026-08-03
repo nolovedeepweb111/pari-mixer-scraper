@@ -56,6 +56,23 @@ header h1 {
   max-width: 480px;
 }
 
+/* Sits inside a hint line, so it reads as a link rather than an action. */
+.scope-toggle {
+  background: transparent;
+  color: var(--accent);
+  border: none;
+  padding: 0;
+  margin-left: 6px;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.scope-toggle:hover {
+  background: transparent;
+  color: var(--text);
+}
+
 /* Player notes: a shared scouting board, so it has to look like something you
    write in rather than another statistics block. */
 .note-list {

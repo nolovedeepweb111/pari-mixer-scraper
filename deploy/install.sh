@@ -25,6 +25,11 @@ echo "==> Пользователь $APP_USER"
 id -u "$APP_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin "$APP_USER"
 
 echo "==> Код в $APP_DIR"
+# Каталог с кодом принадлежит root, а сервис его только читает: так пользователь
+# pari не может подменить собственный код. Заодно git при повторном запуске не
+# спотыкается о "dubious ownership" - первая версия скрипта отдавала каталог
+# пользователю pari, и эта строка чинит владельца обратно.
+[ -d "$APP_DIR" ] && chown -R root:root "$APP_DIR"
 if [ -d "$APP_DIR/.git" ]; then
     git -C "$APP_DIR" fetch --quiet origin
     git -C "$APP_DIR" reset --hard --quiet origin/master
@@ -41,7 +46,7 @@ echo "==> Каталог данных $DATA_DIR"
 # База лежит ВНЕ каталога с кодом: git pull её не тронет, а сборщик пишет
 # рядом с ней временные файлы сборки, поэтому нужна запись в сам каталог.
 mkdir -p "$DATA_DIR"
-chown -R "$APP_USER:$APP_USER" "$DATA_DIR" "$APP_DIR"
+chown -R "$APP_USER:$APP_USER" "$DATA_DIR"
 
 echo "==> Переменные окружения $ENV_FILE"
 mkdir -p "$(dirname "$ENV_FILE")"

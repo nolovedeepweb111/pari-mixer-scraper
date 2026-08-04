@@ -708,6 +708,30 @@ _mixer_tournament_names: dict[int, str] = {}
 _tournament_cache_expires_at = 0.0
 
 
+def _newest_known_tournament() -> int | None:
+    """Best local guess at which cup is the running one, used only when
+    mixer-cup can't tell us: the highest tournament id our own data mentions.
+    Teams count as well as matches, because a cup has rosters before it has
+    games. None only when the database is empty."""
+    try:
+        with Session(engine) as session:
+            ids = [
+                t for (t,) in session.execute(
+                    select(Match.mixer_tournament_id)
+                    .where(Match.mixer_tournament_id.is_not(None)).distinct()
+                )
+            ]
+            ids += [
+                t for (t,) in session.execute(
+                    select(Team.tournament_id)
+                    .where(Team.tournament_id.is_not(None)).distinct()
+                )
+            ]
+    except Exception:
+        return None
+    return max(ids) if ids else None
+
+
 def _refresh_tournament_cache() -> None:
     """One GraphQL call that answers both questions we have: which tournament
     is active, and what every tournament is called (the list carries `status`,
@@ -739,8 +763,16 @@ def _refresh_tournament_cache() -> None:
         _mixer_tournament_id_cache = active_id
         _tournament_cache_expires_at = time.monotonic() + _TOURNAMENT_TTL_SECONDS
     else:
-        # Nothing active (we're between cups) or mixer-cup is down: keep
-        # serving whatever cup we last knew about and retry soon.
+        # Nothing active (we're between cups) or mixer-cup is unreachable.
+        # Normally we keep serving whatever cup we last knew about, but after a
+        # restart there is no such thing - and with no active cup at all every
+        # tournament counted as "can't tell", which locked the public archive
+        # along with the running cup and took the site down for everyone
+        # without a key. Losing contact with mixer-cup must not make a finished
+        # cup secret, so fall back to the newest cup our own data knows about:
+        # that one stays closed, the rest of the archive stays open.
+        if _mixer_tournament_id_cache is None:
+            _mixer_tournament_id_cache = _newest_known_tournament()
         _tournament_cache_expires_at = time.monotonic() + _TOURNAMENT_RETRY_SECONDS
 
 

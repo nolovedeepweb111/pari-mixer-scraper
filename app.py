@@ -670,7 +670,12 @@ _mixer_client = MixerCupClient()
 MIXER_TOURNAMENT_LABELS: dict[int, str] = {
     26: "PARI Mixer Cup #1",
     27: "PARI Mixer Cup #2",
-    28: "PARI Mixer Cup #3",
+    # Cup 28 was labelled "PARI Mixer Cup #3" here for a while, which turned
+    # out to be our invention: mixer-cup calls it "Mixer Cup #5" and gave the
+    # PARI-#3 name to the NEXT cup instead. Two cups then showed the same name
+    # on the site. Their branding wins - it is what players see on mixer-cup.
+    28: "Mixer Cup #5",
+    29: "PARI Mixer Cup #3",
 }
 for _pair in os.environ.get("MIXER_TOURNAMENT_LABELS", "").replace(",", ";").split(";"):
     if ":" in _pair:

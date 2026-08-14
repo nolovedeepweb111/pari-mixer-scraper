@@ -61,7 +61,11 @@ chmod 640 "$ENV_FILE"
 echo "==> systemd"
 cp "$HERE/pari-mixer.service" /etc/systemd/system/pari-mixer.service
 systemctl daemon-reload
-systemctl enable --now pari-mixer
+systemctl enable pari-mixer
+# Именно restart, а не "enable --now": вторая запускает сервис только если он
+# лежит, а работающий оставляет как есть - и после обновления кода gunicorn
+# продолжал крутить в памяти прежнюю версию. Файлы новые, сайт старый.
+systemctl restart pari-mixer
 
 echo "==> nginx"
 DOMAIN=$(grep -E '^\s*APP_DOMAIN=' "$ENV_FILE" | cut -d= -f2- | tr -d '"' | xargs || true)
@@ -83,7 +87,8 @@ else
 fi
 
 echo
-echo "Готово. Дальше:"
+echo "Готово. Сервис перезапущен, код обновлён."
+echo "При первой установке осталось:"
 echo "  1) впишите секреты:      nano $ENV_FILE"
 echo "  2) перезапустите:        systemctl restart pari-mixer"
 echo "  3) выпустите сертификат: certbot --nginx -d ${DOMAIN:-ваш.домен}"

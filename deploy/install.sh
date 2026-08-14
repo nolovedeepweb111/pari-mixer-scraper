@@ -65,11 +65,18 @@ systemctl enable --now pari-mixer
 
 echo "==> nginx"
 DOMAIN=$(grep -E '^\s*APP_DOMAIN=' "$ENV_FILE" | cut -d= -f2- | tr -d '"' | xargs || true)
+NGINX_SITE=/etc/nginx/sites-available/pari-mixer
 if [ -z "${DOMAIN:-}" ]; then
     echo "    APP_DOMAIN в $ENV_FILE не задан - конфиг nginx пока пропущен."
+elif [ -f "$NGINX_SITE" ]; then
+    # НЕ перезаписываем: certbot дописывает в этот файл блок с 443 портом и
+    # путями к сертификату, и шаблон отсюда его затирал - сайт оставался
+    # только на HTTP, то есть снаружи выглядел лежащим. Меняете домен -
+    # удалите файл вручную и запустите скрипт снова, потом certbot.
+    echo "    конфиг уже есть, не трогаю (в нём может быть настройка certbot)"
 else
-    sed "s/__DOMAIN__/$DOMAIN/g" "$HERE/nginx.conf" > /etc/nginx/sites-available/pari-mixer
-    ln -sf /etc/nginx/sites-available/pari-mixer /etc/nginx/sites-enabled/pari-mixer
+    sed "s/__DOMAIN__/$DOMAIN/g" "$HERE/nginx.conf" > "$NGINX_SITE"
+    ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/pari-mixer
     rm -f /etc/nginx/sites-enabled/default
     nginx -t && systemctl reload nginx
     echo "    настроен на $DOMAIN"

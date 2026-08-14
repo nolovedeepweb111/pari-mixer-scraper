@@ -128,6 +128,64 @@ def compute_team_stats(session: Session, team_id: int,
     }
 
 
+def compute_player_signature_heroes(
+    session: Session,
+    account_ids: list[int],
+    min_games: int = 4,
+    min_win_rate: int = 60,
+    mixer_tournament_id: int | None = None,
+) -> list[dict]:
+    """Heroes these players are actually dangerous on: enough games to mean
+    something, and a win rate above the bar.
+
+    Counted over EVERY cup by default rather than the one the team is playing.
+    A cup that has just started has no games at all, so a per-cup version would
+    be an empty block for weeks - and what you want when scouting an opponent
+    is what that person is good at, which doesn't reset between cups. Pass
+    mixer_tournament_id to narrow it to one.
+
+    "Games" here means games with a known result, since that is what the win
+    rate is computed from - a match still missing its result would otherwise
+    count towards the threshold while contributing nothing to the rate."""
+    if not account_ids:
+        return []
+
+    decided_case = case((Match.radiant_win.is_not(None), 1), else_=0)
+    won_case = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
+    query = (
+        select(
+            MatchPlayer.account_id, Hero.localized_name, Hero.name,
+            func.sum(decided_case), func.sum(won_case),
+        )
+        .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
+        .join(Match, Match.match_id == MatchPlayer.match_id)
+        .where(MatchPlayer.account_id.in_(account_ids))
+        .group_by(MatchPlayer.account_id, MatchPlayer.hero_id)
+    )
+    if mixer_tournament_id is not None:
+        query = query.where(Match.mixer_tournament_id == mixer_tournament_id)
+
+    out: list[dict] = []
+    for account_id, hero_name, internal_name, decided, wins in session.execute(query):
+        decided, wins = decided or 0, wins or 0
+        if decided < min_games:
+            continue
+        win_rate = round(100 * wins / decided)
+        if win_rate <= min_win_rate:
+            continue
+        out.append({
+            "account_id": account_id,
+            "hero": hero_name,
+            "hero_icon": internal_name,
+            "games": decided,
+            "wins": wins,
+            "win_rate": win_rate,
+        })
+    # Best first, and a longer sample breaks ties: 5/5 says more than 3/4.
+    out.sort(key=lambda h: (-h["win_rate"], -h["games"]))
+    return out
+
+
 def generate_coach_text(team_name: str, stats: TeamStats) -> str:
     if stats["decided"] == 0:
         return "Недостаточно завершённых матчей для анализа."

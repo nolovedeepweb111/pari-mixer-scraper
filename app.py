@@ -18,7 +18,9 @@ from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
-from pari_mixer_scraper.analysis import compute_team_stats, generate_coach_text
+from pari_mixer_scraper.analysis import (
+    compute_player_signature_heroes, compute_team_stats, generate_coach_text,
+)
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID
 from pari_mixer_scraper.mixercup_client import MixerCupClient, pair_substitution_events
 from pari_mixer_scraper.models import (
@@ -1010,6 +1012,35 @@ def _requested_tournament(team: Team) -> tuple[int | None, bool]:
     return requested, historical
 
 
+# Пороги для блока «Лучшие герои игроков» на вкладке аналитики.
+PLAYER_HERO_MIN_GAMES = int(os.environ.get("PLAYER_HERO_MIN_GAMES", "4"))
+PLAYER_HERO_MIN_WIN_RATE = int(os.environ.get("PLAYER_HERO_MIN_WIN_RATE", "60"))
+
+
+def _team_player_names(session: Session, team_id: int, tournament_id: int | None,
+                       historical: bool) -> dict[int, str]:
+    """Кто считается составом этой команды: подтверждённый ростер для текущего
+    кубка (включая только что заведённых замен) и все, кто реально играл, — для
+    прошедшего или когда ростера нет. То же правило, что на странице состава."""
+    names: dict[int, str] = {}
+    if not historical:
+        for account_id, name in session.execute(
+            select(Player.account_id, Player.name)
+            .where(Player.team_id == team_id, Player.roster_confirmed.is_(True))
+        ):
+            names[account_id] = name or f"account {account_id}"
+    if not names:
+        for account_id, name in session.execute(
+            select(Player.account_id, Player.name)
+            .join(MatchPlayer, MatchPlayer.account_id == Player.account_id)
+            .join(Match, Match.match_id == MatchPlayer.match_id)
+            .where(MatchPlayer.team_id == team_id, _team_tournament_filter(tournament_id))
+            .distinct()
+        ):
+            names[account_id] = name or f"account {account_id}"
+    return names
+
+
 def _roster_filter(session: Session, team_id: int):
     """MixerCup-confirmed roster for this team, if we have one; otherwise
     fall back to everyone who has ever played under this team_id (covers
@@ -1877,14 +1908,43 @@ def api_team_analysis(team_id: int):
         if team is None:
             return jsonify({"error": "not found"}), 404
 
-        tournament_id, _ = _requested_tournament(team)
+        tournament_id, historical = _requested_tournament(team)
         if not _may_see_tournament(tournament_id):
             return _deny_tournament()
         team_name = _team_name_in_tournament(session, team_id, tournament_id) or f"Team {team_id}"
         stats = compute_team_stats(session, team_id, tournament_id)
         text = generate_coach_text(team_name, stats)
 
+        # Which heroes this squad's players are dangerous on. It is a hero pool
+        # by another name, so it lives behind the key like every other one.
+        roster = _team_player_names(session, team_id, tournament_id, historical)
+        pools_locked = not _may_see_hero_pools()
+        signature = [] if pools_locked else compute_player_signature_heroes(
+            session, list(roster),
+            min_games=PLAYER_HERO_MIN_GAMES, min_win_rate=PLAYER_HERO_MIN_WIN_RATE,
+        )
+
+    by_player: dict[int, list] = {}
+    for hero in signature:
+        by_player.setdefault(hero["account_id"], []).append({
+            "hero": hero["hero"],
+            "hero_icon": _hero_icon_slug(hero["hero_icon"]),
+            "games": hero["games"],
+            "wins": hero["wins"],
+            "win_rate": hero["win_rate"],
+        })
+    player_heroes = [
+        {"account_id": account_id, "name": roster[account_id], "heroes": heroes}
+        for account_id, heroes in sorted(
+            by_player.items(), key=lambda kv: roster[kv[0]].lower()
+        )
+    ]
+
     return jsonify({
+        "player_heroes": player_heroes,
+        "player_heroes_locked": pools_locked,
+        "player_heroes_min_games": PLAYER_HERO_MIN_GAMES,
+        "player_heroes_min_win_rate": PLAYER_HERO_MIN_WIN_RATE,
         "team_id": team_id,
         "name": team_name,
         "text": text,

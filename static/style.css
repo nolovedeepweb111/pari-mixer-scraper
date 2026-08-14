@@ -56,6 +56,44 @@ header h1 {
   max-width: 480px;
 }
 
+/* Одна строка на игрока: имя слева, его герои справа. Блок занимает всю
+   ширину сетки - список героев здесь длиннее, чем в соседних карточках. */
+.analysis-block-wide {
+  grid-column: 1 / -1;
+}
+
+.player-heroes-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+
+.player-heroes-row:first-of-type {
+  border-top: none;
+}
+
+.player-heroes-row > .player-link {
+  flex: 0 0 160px;
+  text-align: left;
+  font-weight: 600;
+}
+
+.player-heroes-row .tag-list {
+  flex: 1;
+}
+
+@media (max-width: 700px) {
+  .player-heroes-row {
+    flex-direction: column;
+    gap: 6px;
+  }
+  .player-heroes-row > .player-link {
+    flex: none;
+  }
+}
+
 /* Sits inside a hint line, so it reads as a link rather than an action. */
 .scope-toggle {
   background: transparent;

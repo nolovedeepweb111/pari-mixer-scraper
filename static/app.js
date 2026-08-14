@@ -459,6 +459,25 @@ async function renderAnalysisTab(teamId, container, scope) {
         .join("")
     : '<span class="hint">нет данных</span>';
 
+  // Считается по всем кубкам сразу: у только что начавшегося турнира игр ещё
+  // нет, а знать, на ком силён соперник, нужно с первого дня.
+  const playerHeroesHtml = a.player_heroes_locked
+    ? '<span class="hint">по ключу — здесь видно, на каких героях силён каждый игрок</span>'
+    : a.player_heroes && a.player_heroes.length
+      ? a.player_heroes
+          .map((p) => {
+            const tags = p.heroes
+              .map((h) => `<span class="tag tag-pick"><img class="hero-icon" src="${escapeHtml(heroIconUrl(h.hero_icon))}" alt="" loading="lazy" onerror="this.remove()">${escapeHtml(h.hero)} — ${h.win_rate}% (${h.wins}/${h.games})</span>`)
+              .join("");
+            return `
+              <div class="player-heroes-row">
+                <button class="player-link" data-account-id="${p.account_id}">${escapeHtml(p.name)}</button>
+                <div class="tag-list">${tags}</div>
+              </div>`;
+          })
+          .join("")
+      : `<span class="hint">ни у кого нет героя с ${a.player_heroes_min_games}+ играми и винрейтом выше ${a.player_heroes_min_win_rate}%</span>`;
+
   container.innerHTML = `
     <!-- Assembled on the server, but out of the team's name - so it carries
          whatever the captain called their team. -->
@@ -484,8 +503,17 @@ async function renderAnalysisTab(teamId, container, scope) {
         <h4>Что банит команда сама</h4>
         <div class="tag-list">${heroTagList(a.own_bans, "tag-ban")}</div>
       </div>
+      <div class="analysis-block analysis-block-wide">
+        <h4>Лучшие герои игроков</h4>
+        <p class="hint">От ${a.player_heroes_min_games} игр и винрейта выше ${a.player_heroes_min_win_rate}%, по всем турнирам.</p>
+        ${playerHeroesHtml}
+      </div>
     </div>
   `;
+
+  for (const btn of container.querySelectorAll(".player-heroes-row .player-link")) {
+    btn.addEventListener("click", () => navigate(`/player/${btn.dataset.accountId}`));
+  }
 }
 
 async function renderSubstitutionsTab(teamId, container) {

@@ -42,6 +42,15 @@ _HEROES_BUNDLE = Path(__file__).resolve().parent / "data" / "heroes.json"
 # Extra ids can be forced via env MIXER_TOURNAMENT_IDS="26,27".
 
 
+def _is_not_found(exc: Exception) -> bool:
+    """404 от OpenDota - это «такого у меня нет», свойство самого матча или
+    аккаунта, а не признак того, что нас перестали пускать. Отличать важно:
+    счётчики «сдаёмся после N подряд» рассчитаны на лимиты и блокировки, и
+    навсегда отсутствующие записи не должны их накручивать."""
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 404
+
+
 def sync_heroes(session: Session, client: OpenDotaClient | None = None, progress: ProgressFn | None = None) -> None:
     """Populates the hero list from a bundled snapshot shipped in the repo,
     not from OpenDota. The hero roster changes only a handful of times a
@@ -372,6 +381,11 @@ def sync_draft_data(
             detail = fetch_detail(match_id)
             consecutive_failures = 0
         except Exception as e:
+            # Same distinction as in the match seed: a match OpenDota doesn't
+            # have is skipped without counting towards "they are refusing us".
+            if _is_not_found(e):
+                no_draft += 1
+                continue
             progress(f"Could not fetch detail for match {match_id}: {e}")
             consecutive_failures += 1
             if consecutive_failures >= 5:
@@ -419,7 +433,11 @@ def enrich_missing_player_names(session: Session, client: OpenDotaClient, progre
             name = (info.get("profile") or {}).get("personaname")
             if name:
                 player.name = name
-        except Exception:
+        except Exception as e:
+            # An account OpenDota has never seen is a 404 and stays one; it
+            # must not count towards the rate-limit guard.
+            if _is_not_found(e):
+                continue
             consecutive_failures += 1
             if consecutive_failures >= 5:
                 # Same rationale as sync_draft_data: a run of failures means
@@ -1417,6 +1435,7 @@ def seed_matches_from_mixer(
     deadline = None if time_budget is None else time.monotonic() + time_budget
     added = 0
     consecutive_errors = 0
+    not_found = 0
     for i, match_id in enumerate(missing, start=1):
         if deadline is not None and time.monotonic() > deadline:
             progress(f"MixerCup match seed: time budget spent; {total_missing - i + 1} match(es) left for the next run")
@@ -1425,10 +1444,18 @@ def seed_matches_from_mixer(
             detail = od_client.get_match(match_id)
             consecutive_errors = 0
         except Exception as e:
-            # A single 404 (unparsed/unknown match) is fine - skip it. But a
-            # run of failures means OpenDota is rate-limiting this shared IP
-            # (lasts hours), so stop and let a later cycle backfill the rest
-            # rather than burn the whole run hammering a closed door.
+            # A 404 means OpenDota simply doesn't have that match, which is a
+            # fact about the match and not about us - it must NOT count towards
+            # "they are refusing us". It used to, and a handful of such matches
+            # sitting together at the top of the list ended every run after
+            # seven requests: 144 missing, 0 added, forever, while matches
+            # further down the list were served fine.
+            if _is_not_found(e):
+                not_found += 1
+                continue
+            # Anything else in a row does mean OpenDota is rate-limiting this
+            # IP (lasts hours), so stop and let a later cycle carry on rather
+            # than burn the whole run hammering a closed door.
             consecutive_errors += 1
             if consecutive_errors >= 8:
                 progress(f"OpenDota failing repeatedly (last: {match_id}, {e}); deferring {len(missing) - i + 1} match(es) to a later run.")
@@ -1446,6 +1473,8 @@ def seed_matches_from_mixer(
         added += 1
         if i % 25 == 0:
             progress(f"MixerCup match seed: {added} fetched so far ({i}/{len(missing)})...")
+    if not_found:
+        progress(f"MixerCup match seed: {not_found} match(es) OpenDota doesn't have (skipped, not an error)")
     progress(f"MixerCup match seed: {added} match(es) added")
     return added
 

@@ -1436,6 +1436,7 @@ def seed_matches_from_mixer(
     added = 0
     consecutive_errors = 0
     not_found = 0
+    empty = 0
     for i, match_id in enumerate(missing, start=1):
         if deadline is not None and time.monotonic() > deadline:
             progress(f"MixerCup match seed: time budget spent; {total_missing - i + 1} match(es) left for the next run")
@@ -1462,6 +1463,11 @@ def seed_matches_from_mixer(
                 break
             continue
         if not detail or detail.get("match_id") is None:
+            # OpenDota answered, but there is no match in the answer. Silently
+            # skipping this was a mistake: a run could report "21 to fetch, 0
+            # added" with no reason given anywhere, which is exactly what a
+            # diagnosis needs and exactly what was missing.
+            empty += 1
             continue
         persist_match(session, league_id, normalize_opendota_match(detail), {})
         # The detail we just paid for already carries picks_bans - store the
@@ -1475,6 +1481,9 @@ def seed_matches_from_mixer(
             progress(f"MixerCup match seed: {added} fetched so far ({i}/{len(missing)})...")
     if not_found:
         progress(f"MixerCup match seed: {not_found} match(es) OpenDota doesn't have (skipped, not an error)")
+    if empty:
+        progress(f"MixerCup match seed: {empty} match(es) came back empty - OpenDota answered "
+                 f"without an error but with no match in the body")
     progress(f"MixerCup match seed: {added} match(es) added")
     return added
 

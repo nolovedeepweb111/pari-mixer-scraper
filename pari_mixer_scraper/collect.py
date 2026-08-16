@@ -19,7 +19,7 @@ from .models import (
     SubstitutionEvent, Team, TeamTournamentName,
     build_engine, configure_sqlite, ensure_schema,
 )
-from .opendota_client import OpenDotaClient
+from .opendota_client import OpenDotaClient, OpenDotaLimitReached
 from .roster_overrides import MANUAL_ROSTER_OVERRIDES
 from .steam_client import SteamClient
 
@@ -380,6 +380,10 @@ def sync_draft_data(
         try:
             detail = fetch_detail(match_id)
             consecutive_failures = 0
+        except OpenDotaLimitReached as e:
+            progress(f"OpenDota: {e}. Драфты и KDA для {len(missing) - i + 1} матч(ей) "
+                     f"подождут обновления лимита.")
+            break
         except Exception as e:
             # Same distinction as in the match seed: a match OpenDota doesn't
             # have is skipped without counting towards "they are refusing us".
@@ -433,6 +437,9 @@ def enrich_missing_player_names(session: Session, client: OpenDotaClient, progre
             name = (info.get("profile") or {}).get("personaname")
             if name:
                 player.name = name
+        except OpenDotaLimitReached as e:
+            progress(f"OpenDota: {e}. Ники дозаполним после обновления лимита.")
+            break
         except Exception as e:
             # An account OpenDota has never seen is a 404 and stays one; it
             # must not count towards the rate-limit guard.
@@ -1444,6 +1451,10 @@ def seed_matches_from_mixer(
         try:
             detail = od_client.get_match(match_id)
             consecutive_errors = 0
+        except OpenDotaLimitReached as e:
+            progress(f"OpenDota: {e}. Осталось {len(missing) - i + 1} матч(ей) - доберём, "
+                     f"когда лимит обновится (или задайте OPENDOTA_API_KEY).")
+            break
         except Exception as e:
             # A 404 means OpenDota simply doesn't have that match, which is a
             # fact about the match and not about us - it must NOT count towards

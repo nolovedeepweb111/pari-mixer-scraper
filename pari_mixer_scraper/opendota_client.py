@@ -10,6 +10,17 @@ from .http_utils import call_with_timeout
 BASE_URL = "https://api.opendota.com/api"
 
 
+class OpenDotaLimitReached(RuntimeError):
+    """Суточный лимит запросов исчерпан.
+
+    Отдельное исключение, потому что снаружи это не похоже на ошибку:
+    OpenDota отвечает 200 и телом {"error": "daily api limit exceeded"}.
+    Ни исключения, ни 404 - код просто видел ответ без матча и шёл дальше,
+    так что прогон сообщал «нужно докачать 21, добавлено 0» и молчал о
+    причине. И продолжать после этого бессмысленно: лимит общий на все
+    запросы и до конца суток не откроется."""
+
+
 class OpenDotaClient:
     """Thin wrapper around the public OpenDota API with basic rate limiting
     and retry-on-429 handling. Unauthenticated use shares a per-IP daily
@@ -52,7 +63,15 @@ class OpenDotaClient:
                 continue
 
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            # 200, но в теле только сообщение об ошибке. Лимит выделяем
+            # отдельно: он касается всех запросов сразу, поэтому дальше идти
+            # некуда. Прочие такие ответы ("Not Found" и подобные) отдаём
+            # как есть - вызывающий пропустит эту запись и продолжит.
+            if isinstance(data, dict) and isinstance(data.get("error"), str):
+                if "limit" in data["error"].lower():
+                    raise OpenDotaLimitReached(data["error"])
+            return data
 
         resp.raise_for_status()
 

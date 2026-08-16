@@ -1423,7 +1423,10 @@ def seed_matches_from_mixer(
                 # Real Dota match ids are ~10 digits (billions); mixer-cup
                 # occasionally carries a small internal id for a game whose
                 # Dota match was never linked - skip those, OpenDota 404s them.
-                if match_id >= 1_000_000_000:
+                # The upper bound catches the same thing from the other side:
+                # there is a 14-digit value in their data that we asked
+                # OpenDota about on every single run, forever, for nothing.
+                if 1_000_000_000 <= match_id < 10_000_000_000:
                     wanted.add(match_id)
         except Exception as e:
             progress(f"MixerCup completed-games fetch failed for tournament {tid}: {e}")

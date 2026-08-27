@@ -22,6 +22,9 @@ from pari_mixer_scraper.analysis import (
     compute_player_signature_heroes, compute_team_stats, generate_coach_text,
 )
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID
+from pari_mixer_scraper.sources import (
+    PRIMARY_SOURCE, SOURCES, all_league_ids, source_for_tournament,
+)
 from pari_mixer_scraper.mixercup_client import MixerCupClient, pair_substitution_events
 from pari_mixer_scraper.models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, PlayerNote, QueuedPlayer,
@@ -42,6 +45,12 @@ LEAGUE_IDS = [
     int(x) for x in os.environ.get("LEAGUE_ID", str(DEFAULT_LEAGUE_ID)).replace(";", ",").split(",")
     if x.strip()
 ]
+# Лиги источников добавляются всегда, даже если LEAGUE_ID задан вручную: у
+# WINLINE-супермиксера своя лига, и без неё сборщик просто не пошёл бы за его
+# матчами - причём молча. Требовать правки env на сервере ради этого не стоит.
+for _lid in all_league_ids():
+    if _lid not in LEAGUE_IDS:
+        LEAGUE_IDS.append(_lid)
 CURRENT_LEAGUE_ID = LEAGUE_IDS[-1]
 
 # league_id -> display name, for tournament dividers on player pages.
@@ -483,10 +492,10 @@ def _may_see_tournament(tournament_id: int | None) -> bool:
         return False
     if tournament_id is None:
         return False
-    active = _resolve_mixer_tournament_id()
-    if active is None:
+    active_ids = _active_tournament_ids()
+    if not active_ids:
         return False
-    return tournament_id != active
+    return tournament_id not in active_ids
 
 
 def _may_see_hero_pools() -> bool:
@@ -608,7 +617,13 @@ def index():
 # rather than a bare <slug> so these rules can never swallow /app.js and
 # /style.css, which the static handler serves from the same root path.
 class _TournamentSlugConverter(BaseConverter):
-    regex = r"(?:mixercup|cup)\d+"
+    # Приставки собираются из реестра источников: /mixercup3, /winline1. Длинные
+    # первыми, иначе "cup" отъел бы начало "mixercup" при разборе адреса.
+    regex = r"(?:" + "|".join(
+        re.escape(x) for x in sorted(
+            {src.slug_prefix for src in SOURCES} | {"cup"}, key=len, reverse=True
+        )
+    ) + r")\d+"
 
 
 app.url_map.converters["tslug"] = _TournamentSlugConverter
@@ -631,6 +646,7 @@ def api_tournaments():
     """The cup switcher's menu: every tournament with an address, newest
     first, and which one is live."""
     active = _resolve_mixer_tournament_id()
+    active_ids = _active_tournament_ids()
     with Session(engine) as session:
         ids = _known_tournament_ids(session)
         played = {
@@ -641,13 +657,14 @@ def api_tournaments():
         }
     return jsonify({
         "active_id": active,
+        "active_ids": sorted(active_ids),
         "active_slug": _tournament_slug(active) if active is not None else None,
         "tournaments": [
             {
                 "id": tournament_id,
                 "slug": _tournament_slug(tournament_id),
                 "label": _tournament_label(tournament_id, None),
-                "is_active": tournament_id == active,
+                "is_active": tournament_id in active_ids,
                 "has_matches": tournament_id in played,
                 # Lets the switcher mark what this visitor can't open yet.
                 "locked": not _may_see_tournament(tournament_id),
@@ -657,12 +674,18 @@ def api_tournaments():
             # list reaches back to their own test events from before we
             # collected anything - those have an id and a name here and
             # nothing else, and they are not this cup series.
-            if tournament_id in played or tournament_id == active
+            if tournament_id in played or tournament_id in active_ids
         ],
     })
 
 
-_mixer_client = MixerCupClient()
+# По клиенту на источник. Клиент сам сдвигает номера турниров, так что
+# наружу все номера уже глобальные (см. sources.py).
+_mixer_clients = {
+    src.key: MixerCupClient(base_url=src.base_url, id_offset=src.id_offset)
+    for src in SOURCES
+}
+_mixer_client = _mixer_clients[PRIMARY_SOURCE.key]
 
 # mixer tournament id -> display name, for the tournament dividers on player
 # pages. Overridable via env MIXER_TOURNAMENT_LABELS="26:PARI Mixer Cup #1;27:...".
@@ -678,6 +701,12 @@ MIXER_TOURNAMENT_LABELS: dict[int, str] = {
     # on the site. Their branding wins - it is what players see on mixer-cup.
     28: "Mixer Cup #5",
     29: "PARI Mixer Cup #3",
+    30: "Pari Mixer Cup #4",
+    # Супермиксер WINLINE - второй источник (см. sources.py). Метка задана
+    # явно, хотя название пришло бы и из их API: без неё адрес /winline1
+    # существует только после того, как кэш имён сходит в сеть, то есть
+    # первый после перезапуска гость получил бы 404 на живой кубок.
+    20002: "WINLINE Super Mixer #1",
 }
 for _pair in os.environ.get("MIXER_TOURNAMENT_LABELS", "").replace(",", ";").split(";"):
     if ":" in _pair:
@@ -711,6 +740,19 @@ if os.environ.get("MIXER_TOURNAMENT_ID"):
 
 _tournament_lock = threading.Lock()
 _mixer_tournament_id_cache: int | None = None
+# Идущие прямо сейчас кубки - по одному на источник. Раньше активный кубок был
+# ровно один, и платный доступ, боковая колонка и признак "исторический"
+# сравнивались с ним напрямую. С появлением второго источника таких кубков
+# стало два одновременно, и сравнение с одним номером означало бы, что живой
+# супермиксер считается архивным: составы бы не показывались, а сам кубок
+# уехал бы в открытую часть.
+_mixer_active_ids: set[int] = set()
+# Последний известный активный кубок КАЖДОГО источника. Обновляется только
+# тем источником, который ответил: если один из сайтов недоступен, его кубок
+# обязан остаться живым (то есть закрытым за ключом). Иначе сбой чужого API
+# раздавал бы идущий кубок бесплатно - ровно то, чего избегает и одиночный
+# кэш ниже.
+_mixer_active_by_source: dict[str, int] = {}
 _mixer_tournament_names: dict[int, str] = {}
 _tournament_cache_expires_at = 0.0
 
@@ -743,28 +785,40 @@ def _refresh_tournament_cache() -> None:
     """One GraphQL call that answers both questions we have: which tournament
     is active, and what every tournament is called (the list carries `status`,
     so it doubles as activeTournament). Caller holds _tournament_lock."""
-    global _mixer_tournament_id_cache, _tournament_cache_expires_at
+    global _mixer_tournament_id_cache, _tournament_cache_expires_at, _mixer_active_ids
 
-    active_id = None
-    try:
-        for t in _mixer_client.list_tournaments():
-            if t.get("name"):
-                _mixer_tournament_names[t["id"]] = t["name"]
-            if active_id is None and t.get("status") == "ACTIVE":
-                active_id = t["id"]
-    except Exception:
-        pass
-    if active_id is None:
-        # The list didn't say (API shape changed, or the call failed) - ask
-        # the dedicated endpoint before giving up on this refresh.
+    for src in SOURCES:
+        client = _mixer_clients[src.key]
+        found = None
         try:
-            active = _mixer_client.get_active_tournament()
+            for t in client.list_tournaments():
+                if t.get("name"):
+                    _mixer_tournament_names[t["id"]] = t["name"]
+                if found is None and t.get("status") == "ACTIVE":
+                    found = t["id"]
         except Exception:
-            active = None
-        if active:
-            active_id = active["id"]
-            if active.get("name"):
-                _mixer_tournament_names[active_id] = active["name"]
+            pass
+        if found is None:
+            # The list didn't say (API shape changed, or the call failed) - ask
+            # the dedicated endpoint before giving up on this refresh.
+            try:
+                active = client.get_active_tournament()
+            except Exception:
+                active = None
+            if active:
+                found = active["id"]
+                if active.get("name"):
+                    _mixer_tournament_names[found] = active["name"]
+        if found is not None:
+            _mixer_active_by_source[src.key] = found
+
+    _mixer_active_ids = set(_mixer_active_by_source.values())
+    # Основной источник задаёт кубок по умолчанию - тот, что открывается на "/".
+    # Если про него неизвестно ничего, берём любой живой, чтобы сайт не
+    # остался без текущего кубка вовсе.
+    active_id = _mixer_active_by_source.get(PRIMARY_SOURCE.key)
+    if active_id is None and _mixer_active_by_source:
+        active_id = max(_mixer_active_by_source.values())
 
     if active_id is not None:
         _mixer_tournament_id_cache = active_id
@@ -780,10 +834,14 @@ def _refresh_tournament_cache() -> None:
         # that one stays closed, the rest of the archive stays open.
         if _mixer_tournament_id_cache is None:
             _mixer_tournament_id_cache = _newest_known_tournament()
+        if not _mixer_active_ids and _mixer_tournament_id_cache is not None:
+            _mixer_active_ids = {_mixer_tournament_id_cache}
         _tournament_cache_expires_at = time.monotonic() + _TOURNAMENT_RETRY_SECONDS
 
 
 def _resolve_mixer_tournament_id() -> int | None:
+    """Кубок по умолчанию: активный кубок ОСНОВНОГО источника. Это то, что
+    открывается на "/" и подставляется, когда адрес кубка не указан."""
     with _tournament_lock:
         if time.monotonic() >= _tournament_cache_expires_at:
             _refresh_tournament_cache()
@@ -792,6 +850,18 @@ def _resolve_mixer_tournament_id() -> int | None:
         if _ENV_TOURNAMENT_ID is not None:
             return _ENV_TOURNAMENT_ID
         return _mixer_tournament_id_cache
+
+
+def _active_tournament_ids() -> set[int]:
+    """Все идущие сейчас кубки - по одному на источник. Это они закрыты за
+    ключом и это они показываются как живые, а не как архив."""
+    with _tournament_lock:
+        if time.monotonic() >= _tournament_cache_expires_at:
+            _refresh_tournament_cache()
+        ids = set(_mixer_active_ids)
+    if _ENV_TOURNAMENT_ID is not None:
+        ids.add(_ENV_TOURNAMENT_ID)
+    return ids
 
 
 # Valve's own hero icons. The slug is the hero's INTERNAL name minus the
@@ -845,10 +915,19 @@ _LABEL_NUMBER_RE = re.compile(r"#\s*(\d+)")
 def _tournament_slug(tournament_id: int) -> str:
     if tournament_id in MIXER_TOURNAMENT_SLUGS:
         return MIXER_TOURNAMENT_SLUGS[tournament_id]
+    source = source_for_tournament(tournament_id)
     label = MIXER_TOURNAMENT_LABELS.get(tournament_id)
+    if label is None and source is not None and source is not PRIMARY_SOURCE:
+        # У неосновного источника своя серия и своя нумерация, поэтому его
+        # живое название годится как есть: "WINLINE Super Mixer #1" -> /winline1.
+        # Для основного так делать нельзя: там "Mixer Cup #1" и "PARI Mixer
+        # Cup #1" - РАЗНЫЕ кубки, и адрес у них совпал бы, а разрешался бы
+        # всегда в пользу того, что новее. Отсюда и карта меток выше.
+        label = _mixer_tournament_names.get(tournament_id)
     number = _LABEL_NUMBER_RE.search(label) if label else None
+    prefix = (source or PRIMARY_SOURCE).slug_prefix
     # A cup we have no label for still needs a stable address, hence the id.
-    return f"mixercup{number.group(1)}" if number else f"cup{tournament_id}"
+    return f"{prefix}{number.group(1)}" if number else f"cup{tournament_id}"
 
 
 def _known_tournament_ids(session: Session | None = None) -> list[int]:
@@ -891,12 +970,18 @@ def _requested_scope() -> int | None:
     return _resolve_mixer_tournament_id()
 
 
-def _get_next_opponent(mixer_uuid: str) -> dict | None:
-    tournament_id = _resolve_mixer_tournament_id()
+def _get_next_opponent(mixer_uuid: str, tournament_id: int | None = None) -> dict | None:
+    """Следующая игра команды по сетке. Турнир передаётся явно: сетку нужно
+    спрашивать у того сайта, которому кубок принадлежит, - у чужого этого
+    номера либо нет, либо под ним лежит посторонний турнир."""
+    if tournament_id is None:
+        tournament_id = _resolve_mixer_tournament_id()
     if tournament_id is None:
         return None
+    source = source_for_tournament(tournament_id) or PRIMARY_SOURCE
+    client = _mixer_clients.get(source.key, _mixer_client)
     try:
-        opponent = _mixer_client.get_next_opponent(tournament_id, mixer_uuid)
+        opponent = client.get_next_opponent(tournament_id, mixer_uuid)
     except Exception:
         return None
     if opponent is None:
@@ -1005,10 +1090,13 @@ def _requested_tournament(team: Team) -> tuple[int | None, bool]:
             requested = int(raw)
         except ValueError:
             pass
-    active = _resolve_mixer_tournament_id()
+    active_ids = _active_tournament_ids()
     # requested None means an unlinked team asked for with no scope: leave it
     # unscoped and on the roster path, exactly as before.
-    historical = active is not None and requested is not None and requested != active
+    # Сравнение идёт со ВСЕМИ идущими кубками: пока живы и PARI, и супермиксер,
+    # сравнение с одним кубком объявляло бы второй архивным - без составов и
+    # без MMR, хотя он играется прямо сейчас.
+    historical = bool(active_ids) and requested is not None and requested not in active_ids
     return requested, historical
 
 
@@ -1096,12 +1184,15 @@ def api_teams():
         scope = _requested_scope()
         if not _may_see_tournament(scope):
             return _deny_tournament()
-        if scope is not None and scope != active:
+        if scope is not None and scope not in _active_tournament_ids():
             return jsonify(_past_cup_teams(session, scope))
 
+        # Живых кубков теперь может быть несколько, поэтому колонка показывает
+        # команды ЗАПРОШЕННОГО кубка, а не всегда основного.
+        live_scope = scope if scope is not None else active
         team_query = select(Team.team_id, Team.name).order_by(Team.name)
-        if active is not None:
-            team_query = team_query.where(Team.tournament_id == active)
+        if live_scope is not None:
+            team_query = team_query.where(Team.tournament_id == live_scope)
         teams = session.execute(team_query).all()
         if not teams:
             teams = session.execute(
@@ -1362,7 +1453,7 @@ def api_team_detail(team_id: int):
             entry["heroes"] = []
     # A finished cup has no "next opponent" - that lookup is about the live
     # bracket, which only the current squad is in.
-    next_opponent = _get_next_opponent(mixer_uuid) if mixer_uuid and not historical else None
+    next_opponent = _get_next_opponent(mixer_uuid, tournament_id) if mixer_uuid and not historical else None
 
     return jsonify({
         "team_id": team_id,
@@ -1747,7 +1838,7 @@ def api_players_leaderboard():
             if not _may_see_tournament(scope):
                 return _deny_tournament()
             counted = [scope] if scope is not None else []
-            historical = scope is not None and scope != active
+            historical = scope is not None and scope not in _active_tournament_ids()
             tour_filter = (Match.mixer_tournament_id == scope) if scope is not None else True
             show_rosters = not historical
 
@@ -1777,11 +1868,15 @@ def api_players_leaderboard():
         # Current rosters only make sense for the live cup. On a finished
         # cup's page, a player's team is the one they actually played most of
         # that cup for - today's roster says nothing about it.
+        # Состав берётся из ПОКАЗЫВАЕМОГО кубка, а не всегда из основного:
+        # на странице игроков супермиксера иначе подставились бы команды
+        # параллельного кубка PARI, где эти же люди тоже играют.
+        roster_scope = scope if scope is not None else active
         roster_rows = session.execute(
             select(Player, Team)
             .join(Team, Team.team_id == Player.team_id)
-            .where(Team.tournament_id == active, Player.roster_confirmed.is_(True))
-        ).all() if active is not None and show_rosters else []
+            .where(Team.tournament_id == roster_scope, Player.roster_confirmed.is_(True))
+        ).all() if roster_scope is not None and show_rosters else []
         rostered = {p.account_id: (p, t) for p, t in roster_rows}
 
         past_team_of: dict[int, tuple[int, str]] = {}
@@ -1990,9 +2085,15 @@ def api_all_substitutions():
     if not _may_see_tournament(scope):
         return _deny_tournament()
     with Session(engine) as session:
+        team_filter = [Team.team_id.in_(select(SubstitutionEvent.team_id).distinct())]
+        # Команды именно этого кубка. Раньше брались все подряд: замены хранились
+        # только по одному активному кубку, так что чужих строк взяться было
+        # неоткуда. Теперь кубка два (PARI и супермиксер), и без этого фильтра
+        # команда с ещё не размеченными событиями всплыла бы на чужой странице.
+        if scope is not None:
+            team_filter.append(Team.tournament_id == scope)
         teams = session.execute(
-            select(Team.team_id, Team.name)
-            .where(Team.team_id.in_(select(SubstitutionEvent.team_id).distinct()))
+            select(Team.team_id, Team.name).where(*team_filter)
         ).all()
 
         all_swaps = []

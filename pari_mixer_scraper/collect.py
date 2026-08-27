@@ -21,6 +21,7 @@ from .models import (
 )
 from .opendota_client import OpenDotaClient, OpenDotaLimitReached
 from .roster_overrides import MANUAL_ROSTER_OVERRIDES
+from .sources import PRIMARY_SOURCE, SOURCES, all_league_ids, source_for_tournament
 from .steam_client import SteamClient
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -1255,9 +1256,13 @@ def _backfill_substitution_tournaments(session: Session, progress: ProgressFn) -
         progress(f"Tagged {filled} legacy substitution event(s) with {source}")
 
 
-def _purge_past_tournament_subs(session: Session, active_tournament_id: int, progress: ProgressFn) -> None:
+def _purge_past_tournament_subs(session: Session, active_tournament_ids, progress: ProgressFn) -> None:
     """Deletes substitution events from any tournament other than the active
-    one - the site only shows the current tournament's substitution history.
+    ones - the site only shows a running cup's substitution history.
+
+    Принимает НАБОР номеров, а не один: параллельно идут кубки двух
+    источников (PARI и WINLINE), и чистка по одному активному кубку
+    вычистила бы замены второго.
 
     Scoped by the event's OWN tournament rather than by whichever tournament
     currently owns its team: a Steam team id reused by the new cup gets
@@ -1265,10 +1270,13 @@ def _purge_past_tournament_subs(session: Session, active_tournament_id: int, pro
     last cup's swaps, displayed as the new cup's. Events still carrying no
     tournament (their team is gone, so the backfill couldn't tag them) keep
     the old team-based rule."""
+    active_ids = {t for t in active_tournament_ids if t is not None}
+    if not active_ids:
+        return
     deleted = session.execute(
         delete(SubstitutionEvent).where(
             SubstitutionEvent.tournament_id.is_not(None),
-            SubstitutionEvent.tournament_id != active_tournament_id,
+            SubstitutionEvent.tournament_id.not_in(active_ids),
         )
     ).rowcount
 
@@ -1276,7 +1284,7 @@ def _purge_past_tournament_subs(session: Session, active_tournament_id: int, pro
         t for (t,) in session.execute(
             select(Team.team_id).where(
                 Team.tournament_id.is_not(None),
-                Team.tournament_id != active_tournament_id,
+                Team.tournament_id.not_in(active_ids),
             )
         )
     ]
@@ -1321,6 +1329,7 @@ def _resolve_all_tournament_ids(
     active_id: int | None,
     mixer_client: MixerCupClient | None = None,
     progress: ProgressFn | None = None,
+    source=None,
 ) -> list[int]:
     """Every mixer tournament we should link this run.
 
@@ -1367,6 +1376,12 @@ def _resolve_all_tournament_ids(
         except Exception as e:
             if progress is not None:
                 progress(f"Could not list MixerCup tournaments ({e}); linking only what we already know.")
+
+    # Источников теперь два, а Team/Match в базе - общие на оба. Номера
+    # чужого источника спрашивать у этого API нельзя: там либо пусто, либо
+    # совсем другой турнир под тем же номером. Оставляем только свои.
+    if source is not None:
+        ids = {t for t in ids if source_for_tournament(t) is source}
 
     return sorted(ids)
 
@@ -1502,6 +1517,75 @@ def seed_matches_from_mixer(
     return added
 
 
+def _sync_mixer_source(session: Session, src, od_client: OpenDotaClient,
+                       progress: ProgressFn) -> int | None:
+    """Полный цикл по одному источнику турниров: составы, команды, замены,
+    очередь и досев матчей. Возвращает номер активного кубка этого источника
+    (уже со сдвигом, см. sources.py) или None, если источник не ответил.
+
+    Раньше это был кусок _run_collection_pass, работавший с единственным
+    mixer-cup.gg. Источников стало два, и каждому нужен свой клиент, своя лига
+    и свой активный кубок - но всё остальное для них одинаково, поэтому цикл
+    просто вызывает эту функцию по разу на источник. Падение одного источника
+    не должно уносить второй: наружу отдаётся None, и сборка продолжается.
+    """
+    mixer_client = MixerCupClient(base_url=src.base_url, id_offset=src.id_offset)
+
+    # Пин MIXER_TOURNAMENT_ID остаётся за основным источником: он задавался,
+    # когда источник был один, и молча приписывать его номер второму сайту
+    # значило бы синхронизировать не тот кубок.
+    pinned = os.environ.get("MIXER_TOURNAMENT_ID") if src is PRIMARY_SOURCE else None
+    try:
+        if pinned:
+            active_id = int(pinned)
+        else:
+            active = mixer_client.get_active_tournament()
+            active_id = active["id"] if active else None
+            if active:
+                progress(f"[{src.key}] active tournament: {active['name']} (id={active['id']})")
+    except Exception as e:
+        progress(f"[{src.key}] could not resolve tournament id, skipping team/roster linking: {e}")
+        return None
+
+    if active_id is None:
+        return None
+
+    try:
+        # #1 and #2 run concurrently and share a dotabuff league, so both
+        # must be touched. Gather the full id set (active + env override +
+        # whatever teams/matches already carry) once, and use it both to
+        # seed matches and to link every tournament for results.
+        all_tournament_ids = _resolve_all_tournament_ids(
+            session, active_id, mixer_client, progress, source=src)
+
+        # Backstop for matches Steam's league history didn't list. Must
+        # run BEFORE linking, which only updates matches that already exist.
+        seed_matches_from_mixer(
+            session, mixer_client, od_client,
+            src.league_ids[0] if src.league_ids else DEFAULT_LEAGUE_ID,
+            all_tournament_ids, progress,
+            time_budget=SEED_TIME_BUDGET_SECONDS,
+        )
+
+        # Link the ACTIVE tournament fully (rosters, team identity), then
+        # every OTHER tournament for results only.
+        link_mixercup_data(session, mixer_client, active_id, progress)
+        sync_mixer_teams(session, mixer_client, active_id, progress)
+        sync_substitution_history(session, mixer_client, active_id, progress)
+        sync_queue_snapshot(session, mixer_client, active_id, progress)
+
+        for pid in all_tournament_ids:
+            if pid == active_id:
+                continue
+            link_mixercup_data(session, mixer_client, pid, progress, apply_rosters=False)
+    except Exception as e:
+        session.rollback()
+        progress(f"[{src.key}] sync failed ({e}); this source is skipped this run.")
+        return None
+
+    return active_id
+
+
 def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
                          on_core_ready=None) -> int:
     """Does the actual collection work against `engine`, returning the
@@ -1564,51 +1648,15 @@ def _run_collection_pass(engine, league_ids: list[int], progress: ProgressFn,
         # started tournament has teams and rosters on mixer-cup before a
         # single game is played (and before its league_id is even known) -
         # the site should show them right away.
-        mixer_client = MixerCupClient()
-        mixer_tournament_id = os.environ.get("MIXER_TOURNAMENT_ID")
-        try:
-            if mixer_tournament_id:
-                mixer_tournament_id = int(mixer_tournament_id)
-            else:
-                active = mixer_client.get_active_tournament()
-                mixer_tournament_id = active["id"] if active else None
-                if active:
-                    progress(f"MixerCup active tournament: {active['name']} (id={active['id']})")
-        except Exception as e:
-            progress(f"Could not resolve MixerCup tournament id, skipping team/roster linking: {e}")
-            mixer_tournament_id = None
+        active_ids = []
+        for src in SOURCES:
+            active_id = _sync_mixer_source(session, src, od_client, progress)
+            if active_id is not None:
+                active_ids.append(active_id)
 
-        if mixer_tournament_id is not None:
-            # #1 and #2 run concurrently and share a dotabuff league, so both
-            # must be touched. Gather the full id set (active + env override +
-            # whatever teams/matches already carry) once, and use it both to
-            # seed matches and to link every tournament for results.
-            all_tournament_ids = _resolve_all_tournament_ids(
-                session, mixer_tournament_id, mixer_client, progress)
-
-            # Backstop for matches Steam's league history didn't list. Must
-            # run BEFORE linking, which only updates matches that already exist.
-            seed_matches_from_mixer(
-                session, mixer_client, od_client,
-                league_ids[0] if league_ids else DEFAULT_LEAGUE_ID,
-                all_tournament_ids, progress,
-                time_budget=SEED_TIME_BUDGET_SECONDS,
-            )
-
-            # Link the ACTIVE tournament fully (rosters, team identity), then
-            # every OTHER tournament for results only.
-            link_mixercup_data(session, mixer_client, mixer_tournament_id, progress)
-            sync_mixer_teams(session, mixer_client, mixer_tournament_id, progress)
-            sync_substitution_history(session, mixer_client, mixer_tournament_id, progress)
-            sync_queue_snapshot(session, mixer_client, mixer_tournament_id, progress)
-
-            for pid in all_tournament_ids:
-                if pid == mixer_tournament_id:
-                    continue
-                link_mixercup_data(session, mixer_client, pid, progress, apply_rosters=False)
-
-            # The user only wants the ACTIVE tournament's substitution history.
-            _purge_past_tournament_subs(session, mixer_tournament_id, progress)
+        # The user only wants the RUNNING cups' substitution history - one per
+        # source while both series are live.
+        _purge_past_tournament_subs(session, active_ids, progress)
 
         # Matches exist now, so saved drafts and player stats can be
         # re-attached. Do it before the core publish: local inserts costing no
@@ -1815,7 +1863,7 @@ def main() -> None:
         description="Collect player/hero data for a Dota 2 esports league into SQLite."
     )
     parser.add_argument(
-        "--league-id", type=str, default=str(DEFAULT_LEAGUE_ID),
+        "--league-id", type=str, default=",".join(str(x) for x in all_league_ids()),
         help=f"League id(s), comma-separated for multiple tournaments "
              f"(default: {DEFAULT_LEAGUE_ID}, Pari Mixer Cup #1)",
     )

@@ -128,8 +128,15 @@ class MixerCupClient:
     tournament's real team names and current rosters, which aren't
     registered anywhere in Steam/OpenDota for ad-hoc mixer teams."""
 
-    def __init__(self, base_url: str = BASE_URL, session: requests.Session | None = None, min_interval: float = 0.3):
+    def __init__(self, base_url: str = BASE_URL, session: requests.Session | None = None,
+                 min_interval: float = 0.3, id_offset: int = 0):
         self.base_url = base_url
+        # Копий этой платформы теперь две, и нумерация турниров у каждой
+        # своя, с единицы. Сдвиг разводит их в общем пространстве номеров:
+        # наружу клиент отдаёт номер со сдвигом, в запросы подставляет
+        # исходный. Так остальному коду второй источник не виден. См.
+        # sources.py.
+        self.id_offset = id_offset
         self.session = session or requests.Session()
         self.min_interval = min_interval
         self._last_request = 0.0
@@ -155,9 +162,17 @@ class MixerCupClient:
             raise RuntimeError(f"MixerCup GraphQL error: {body['errors']}")
         return body["data"]
 
+    def _local_id(self, tournament_id: int) -> int:
+        return tournament_id - self.id_offset
+
+    def _with_global_id(self, item: dict | None) -> dict | None:
+        if not item or item.get("id") is None or not self.id_offset:
+            return item
+        return {**item, "id": item["id"] + self.id_offset}
+
     def get_active_tournament(self) -> dict | None:
         data = self._post(_ACTIVE_TOURNAMENT_QUERY)
-        return data.get("activeTournament")
+        return self._with_global_id(data.get("activeTournament"))
 
     def list_tournaments(self, first: int = 20) -> list[dict]:
         """Every tournament mixer-cup knows, newest id first: {id, name,
@@ -171,11 +186,12 @@ class MixerCupClient:
         data = self._post(_TOURNAMENTS_QUERY, {"first": first})
         items = (data.get("tournaments") or {}).get("items") or []
         return sorted(
-            (t for t in items if t.get("id") is not None),
+            (self._with_global_id(t) for t in items if t.get("id") is not None),
             key=lambda t: t["id"], reverse=True,
         )
 
     def iter_teams(self, tournament_id: int, page_size: int = 50):
+        tournament_id = self._local_id(tournament_id)
         offset = 0
         while True:
             data = self._post(_TEAMS_QUERY, {
@@ -194,6 +210,7 @@ class MixerCupClient:
                 return
 
     def iter_completed_games(self, tournament_id: int, page_size: int = 100):
+        tournament_id = self._local_id(tournament_id)
         offset = 0
         while True:
             data = self._post(_GAMES_QUERY, {
@@ -211,6 +228,7 @@ class MixerCupClient:
     def get_next_opponent(self, tournament_id: int, team_uuid: str) -> dict | None:
         """Next not-yet-played game for this team, or None if there isn't
         one (bracket finished, or team has none scheduled yet)."""
+        tournament_id = self._local_id(tournament_id)
         data = self._post(_NEXT_GAME_QUERY, {
             "filters": {
                 "tournamentId": tournament_id,
@@ -243,6 +261,7 @@ class MixerCupClient:
         (see collect.sync_substitution_history) rather than display them
         live - event id is mixer-cup.gg's own UUID, stable enough to
         dedupe against on repeat syncs."""
+        tournament_id = self._local_id(tournament_id)
         offset = 0
         while True:
             data = self._post(_TOURNAMENT_EVENTS_QUERY, {
@@ -275,6 +294,7 @@ class MixerCupClient:
         a team, so the caller snapshots this regularly (see
         collect.sync_queue_snapshot) to know later what position a player
         held right before being substituted in."""
+        tournament_id = self._local_id(tournament_id)
         offset = 0
         while True:
             data = self._post(_PARTICIPANT_QUEUE_QUERY, {

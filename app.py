@@ -1194,7 +1194,14 @@ def api_teams():
         if live_scope is not None:
             team_query = team_query.where(Team.tournament_id == live_scope)
         teams = session.execute(team_query).all()
-        if not teams:
+        if not teams and request.args.get("tournament") is None:
+            # Запасной путь только для страницы по умолчанию: там пустой список
+            # означал бы, что активный кубок не определился, и показать вообще
+            # всё лучше, чем пустой сайт. Если же адрес кубка назван явно
+            # (/winline1), список обязан остаться пустым: иначе туда попадают
+            # команды ЧУЖОГО кубка - ровно это и вышло, когда супермиксер
+            # появился на сайте раньше, чем сборщик успел принести его данные.
+            # Команды при этом открывались с 404: в этом кубке они не играли.
             teams = session.execute(
                 select(Team.team_id, Team.name).order_by(Team.name)
             ).all()

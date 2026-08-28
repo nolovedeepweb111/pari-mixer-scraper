@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from .mixercup_client import MixerCupClient
 from .models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, PlayerNote, QueuedPlayer,
-    SubstitutionEvent, Team, TeamTournamentName, UnlinkedRosterPlayer,
+    SubstitutionEvent, Team, TeamTournamentName, UnavailableMatch, UnlinkedRosterPlayer,
     build_engine, configure_sqlite, ensure_schema,
 )
 from .opendota_client import OpenDotaClient, OpenDotaLimitReached
@@ -360,6 +360,11 @@ def sync_draft_data(
         )
     ]
     missing = [m for m in all_match_ids if m not in has_draft or m not in has_stats]
+    # Матчи, которых у OpenDota нет, пропускаем тем же правилом, что и в досеве:
+    # иначе они перебираются каждый прогон и съедают квоту (см. UnavailableMatch).
+    skipped = _recently_missing(session)
+    if skipped:
+        missing = [m for m in missing if m not in skipped]
     if not missing:
         return
 
@@ -392,6 +397,7 @@ def sync_draft_data(
             # have is skipped without counting towards "they are refusing us".
             if _is_not_found(e):
                 no_draft += 1
+                _mark_missing(session, match_id)
                 continue
             progress(f"Could not fetch detail for match {match_id}: {e}")
             consecutive_failures += 1
@@ -1483,6 +1489,41 @@ DRAFT_TIME_BUDGET_SECONDS = int(os.environ.get("DRAFT_TIME_BUDGET_SECONDS", "180
 ENRICH_TIME_BUDGET_SECONDS = int(os.environ.get("ENRICH_TIME_BUDGET_SECONDS", "60"))
 
 
+# Сколько не трогать матч, которого OpenDota не отдала. Сутки: он почти всегда
+# отсутствует навсегда (игра сыграна мимо турнирного билета, Valve её публично
+# не публикует), но изредка OpenDota добирает матчи задним числом.
+MISSING_MATCH_RETRY_HOURS = int(os.environ.get("MISSING_MATCH_RETRY_HOURS", "24"))
+
+
+def _recently_missing(session: Session) -> set[int]:
+    """Матчи, про которые мы недавно уже спрашивали и получили 404.
+
+    Без этого фильтра каждый прогон заново перебирал десятки несуществующих
+    матчей и выжигал на них суточную квоту OpenDota (см. UnavailableMatch)."""
+    if MISSING_MATCH_RETRY_HOURS <= 0:
+        return set()
+    fresh_after = time.time() - MISSING_MATCH_RETRY_HOURS * 3600
+    return {
+        row[0] for row in session.execute(
+            select(UnavailableMatch.match_id).where(UnavailableMatch.last_checked >= fresh_after)
+        )
+    }
+
+
+def _mark_missing(session: Session, match_id: int) -> None:
+    row = session.get(UnavailableMatch, match_id)
+    if row is None:
+        session.add(UnavailableMatch(match_id=match_id, last_checked=time.time(), attempts=1))
+    else:
+        row.last_checked = time.time()
+        row.attempts = (row.attempts or 0) + 1
+    # Коммитим сразу: обе петли, которые сюда попадают, делают continue до
+    # своего session.commit(), а при отказе OpenDota вызывающий откатывает
+    # сессию - отметка потерялась бы, и следующий прогон снова пошёл бы за тем
+    # же несуществующим матчем. Ровно от этого таблица и заводилась.
+    session.commit()
+
+
 def seed_matches_from_mixer(
     session: Session,
     mixer_client: MixerCupClient,
@@ -1528,8 +1569,18 @@ def seed_matches_from_mixer(
     # Newest first: if the cap defers some, the ones people are actually
     # looking at (this cup's latest games) land first.
     missing = sorted(wanted - existing, reverse=True)
+    # Те, что OpenDota уже отказалась отдавать, пропускаем: перебирать их
+    # каждый прогон - и есть то, что съедало суточную квоту (см.
+    # UnavailableMatch).
+    skipped = _recently_missing(session)
+    if skipped:
+        before = len(missing)
+        missing = [m for m in missing if m not in skipped]
+        if before != len(missing):
+            progress(f"MixerCup match seed: {before - len(missing)} match(es) OpenDota "
+                     f"doesn't have - not asking again for {MISSING_MATCH_RETRY_HOURS}h")
     if not missing:
-        progress(f"MixerCup match seed: all {len(wanted)} known matches already stored")
+        progress(f"MixerCup match seed: all {len(wanted)} known matches already stored or unavailable")
         return 0
 
     total_missing = len(missing)
@@ -1560,6 +1611,7 @@ def seed_matches_from_mixer(
             # further down the list were served fine.
             if _is_not_found(e):
                 not_found += 1
+                _mark_missing(session, match_id)
                 continue
             # Anything else in a row does mean OpenDota is rate-limiting this
             # IP (lasts hours), so stop and let a later cycle carry on rather

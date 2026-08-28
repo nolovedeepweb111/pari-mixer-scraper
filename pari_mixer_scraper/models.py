@@ -162,6 +162,30 @@ class UnlinkedRosterPlayer(Base):
     preferred_roles: Mapped[str | None]
 
 
+class UnavailableMatch(Base):
+    """Матч, которого у OpenDota нет (404), и когда мы про него спрашивали.
+
+    Список игр кубка даёт mixer-cup, а детали к ним - OpenDota. В супермиксере
+    WINLINE 66 из 95 игр сыграны мимо турнирного билета, и Valve их публично не
+    отдаёт: OpenDota на них отвечает 404 навсегда. Без этой таблицы сборщик
+    запрашивал каждую из них В КАЖДЫЙ прогон - раз в 10 минут, около 400
+    заведомо пустых запросов в час. Суточная квота OpenDota (порядка 2000
+    запросов) выгорала за несколько часов, и на то, ради чего сбор и затевался
+    - драфты, KDA и свежие матчи, - не оставалось ничего. Снаружи это выглядело
+    как «OpenDota нас лимитит», хотя лимит мы устраивали себе сами.
+
+    Поэтому: спросили, получили 404 - записали и не трогаем сутки
+    (MISSING_MATCH_RETRY_HOURS). Совсем навсегда не хороним: OpenDota иногда
+    добирает матчи задним числом, да и организаторы могут проставить билет
+    позже."""
+    __tablename__ = "unavailable_matches"
+
+    match_id: Mapped[int] = mapped_column(primary_key=True)
+    # epoch-секунды последней попытки
+    last_checked: Mapped[float]
+    attempts: Mapped[int] = mapped_column(default=1)
+
+
 class Player(Base):
     __tablename__ = "players"
 

@@ -4,8 +4,10 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import time
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 
@@ -464,6 +466,54 @@ def _lineup_account_ids(session: Session, match_id: int, is_radiant: bool) -> se
     return {account_id for (account_id,) in rows}
 
 
+_NICK_JUNK_RE = re.compile(r"[^0-9a-zA-Zа-яА-ЯёЁ]+")
+_NICK_TAIL_RE = re.compile(r"[^a-zA-Zа-яА-ЯёЁ]+$")
+# Ники короче этого по нику не сопоставляем: в базе живут люди с никами "a" и
+# "h", и такое совпадение не значит ничего.
+_NICK_MIN_LEN = 3
+
+
+def _normalize_nick(nickname: str | None) -> str:
+    if not nickname:
+        return ""
+    return _NICK_JUNK_RE.sub("", unicodedata.normalize("NFKC", nickname).casefold())
+
+
+def _resolve_account_by_nickname(session: Session, nickname: str | None) -> int | None:
+    """Найти аккаунт Dota по нику, когда mixer-cup не дал Steam-идентификатора.
+
+    Обычно сопоставление идёт строго по account_id из ссылки на аватар, а ник
+    как признак сознательно не используется: он может отличаться от того, что
+    человек носит в Steam. Здесь случай другой - аватара нет вовсе (поля
+    steamId их API не отдаёт), и выбор не между точным и приблизительным
+    признаком, а между приблизительным и никаким: иначе игрок просто выпадает
+    из состава.
+
+    Отсюда и осторожность: сравниваются приведённые ники (регистр и всё, кроме
+    букв и цифр, отбрасываются), и связываем ТОЛЬКО когда кандидат ровно один.
+    Два одинаковых ника - отказ, лучше пустая карточка, чем чужой пул героев на
+    странице разведки. Вторая попытка отбрасывает украшения на конце ника
+    ("Болячка <3" -> "болячка"), тоже при единственном кандидате."""
+    target = _normalize_nick(nickname)
+    if len(target) < _NICK_MIN_LEN:
+        return None
+
+    by_norm: dict[str, set[int]] = {}
+    by_trimmed: dict[str, set[int]] = {}
+    for account_id, name in session.execute(select(Player.account_id, Player.name)):
+        norm = _normalize_nick(name)
+        if len(norm) < _NICK_MIN_LEN:
+            continue
+        by_norm.setdefault(norm, set()).add(account_id)
+        by_trimmed.setdefault(_NICK_TAIL_RE.sub("", norm) or norm, set()).add(account_id)
+
+    for index, key in ((by_norm, target), (by_trimmed, _NICK_TAIL_RE.sub("", target) or target)):
+        found = index.get(key)
+        if found and len(found) == 1:
+            return next(iter(found))
+    return None
+
+
 def _apply_confirmed_roster(session: Session, steam_team_id: int, mixer_team: dict,
                             tournament_id: int | None = None) -> None:
     """Resets roster_confirmed for everyone who has ever played under this
@@ -493,6 +543,12 @@ def _apply_confirmed_roster(session: Session, steam_team_id: int, mixer_team: di
         account_id = mp.get("account_id")
         nickname = mp.get("nickname")
         roles = ",".join(mp["preferredRoles"]) if mp.get("preferredRoles") else None
+        if account_id is None:
+            # Аватара нет - пробуем узнать человека по нику среди тех, кто у нас
+            # уже есть. Мимо этой ветки в супермиксере WINLINE проходили люди,
+            # сыгравшие десятки матчей в прошлых кубках, а один из них играл в
+            # ЭТОМ кубке за ЭТУ же команду.
+            account_id = _resolve_account_by_nickname(session, nickname)
         if account_id is None:
             mixer_player_id = mp.get("id")
             if mixer_player_id:

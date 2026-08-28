@@ -1101,6 +1101,11 @@ def _requested_tournament(team: Team) -> tuple[int | None, bool]:
     return requested, historical
 
 
+# Так mixer-cup называет пустой слот вместо ушедшего капитана. Если они
+# сменят формулировку, карточка просто вернётся к обычному виду для
+# несвязанного игрока - ничего не сломается.
+_CAPTAIN_SLOT_PREFIX = "замена капитана"
+
 # Пороги для блока «Лучшие герои игроков» на вкладке аналитики.
 PLAYER_HERO_MIN_GAMES = int(os.environ.get("PLAYER_HERO_MIN_GAMES", "4"))
 PLAYER_HERO_MIN_WIN_RATE = int(os.environ.get("PLAYER_HERO_MIN_WIN_RATE", "60"))
@@ -1459,15 +1464,24 @@ def api_team_detail(team_id: int):
             }
 
     for mixer_player_id, nickname, mmr, roles in unlinked_players:
+        # Ушедшего капитана mixer-cup заменяет служебным слотом «Замена
+        # капитана команды X» и переносит на него рейтинг капитана - проверено
+        # по истории замен: слот входит в состав, следом капитан с тем же
+        # рейтингом выходит. За таким слотом никого нет, пока замену не
+        # выберут, поэтому объяснять «не указан Steam» тут нечего: показываем
+        # только кто это и с каким рейтингом. Название кубка в нике лишнее -
+        # мы и так на странице этой команды.
+        is_captain_slot = (nickname or "").strip().casefold().startswith(_CAPTAIN_SLOT_PREFIX)
         players[f"unlinked:{mixer_player_id}"] = {
             "account_id": None,
-            "name": nickname or "игрок без привязки",
+            "name": "Замена капитана" if is_captain_slot else (nickname or "игрок без привязки"),
             "mmr": mmr,
             "roles": roles,
             "heroes": [],
             # Фронтенд по этому признаку не рисует ссылку на страницу игрока и
             # объясняет, почему у карточки нет статистики.
             "unlinked": True,
+            "placeholder": is_captain_slot,
         }
 
     for entry in players.values():

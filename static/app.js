@@ -361,11 +361,16 @@ function renderComposition(team) {
     const emptyHint = player.unlinked
       ? "mixer-cup не указал Steam — статистики нет"
       : (team.hero_pools_locked ? "пул героев — по ключу" : "ещё не играл(а) за команду");
+    // За служебным слотом «Замена капитана» никого нет, пока замену не выбрали:
+    // объяснять нечего, показываем только подпись и рейтинг.
+    const heroBlock = player.placeholder && !heroItems
+      ? ""
+      : `<ul>${heroItems || `<li><span class="hint">${emptyHint}</span></li>`}</ul>`;
     card.innerHTML = `
       <h3>${nameCell}</h3>
       <p class="mmr">${formatMmr(player.mmr)} MMR</p>
       ${rolesLine}
-      <ul>${heroItems || `<li><span class="hint">${emptyHint}</span></li>`}</ul>
+      ${heroBlock}
     `;
     const link = card.querySelector(".player-link");
     if (link) link.addEventListener("click", () => navigate(`/player/${player.account_id}`));

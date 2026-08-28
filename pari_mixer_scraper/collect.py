@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from .mixercup_client import MixerCupClient
 from .models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, PlayerNote, QueuedPlayer,
-    SubstitutionEvent, Team, TeamTournamentName,
+    SubstitutionEvent, Team, TeamTournamentName, UnlinkedRosterPlayer,
     build_engine, configure_sqlite, ensure_schema,
 )
 from .opendota_client import OpenDotaClient, OpenDotaLimitReached
@@ -464,25 +464,47 @@ def _lineup_account_ids(session: Session, match_id: int, is_radiant: bool) -> se
     return {account_id for (account_id,) in rows}
 
 
-def _apply_confirmed_roster(session: Session, steam_team_id: int, mixer_team: dict) -> None:
+def _apply_confirmed_roster(session: Session, steam_team_id: int, mixer_team: dict,
+                            tournament_id: int | None = None) -> None:
     """Resets roster_confirmed for everyone who has ever played under this
     Steam team_id (regular roster + one-off substitutes), then confirms and
     renames exactly the accounts that match MixerCup's current roster by
     Steam account_id (derived from steamAvatar - see
     mixercup_client.steam_account_id_from_avatar_url). This is an exact
     numeric match, unlike nickname text, which can differ between a
-    player's live Steam persona name and their mixer-cup registration."""
+    player's live Steam persona name and their mixer-cup registration.
+
+    Тех, у кого аватара нет и account_id взять неоткуда, раньше просто
+    пропускали, и человек исчезал из состава на сайте. Теперь они попадают в
+    UnlinkedRosterPlayer - карточка без статистики лучше, чем дырка в составе
+    (см. докстроку модели)."""
     roster = session.execute(select(Player).where(Player.team_id == steam_team_id)).scalars().all()
     for player in roster:
         player.roster_confirmed = False
+
+    # Список несвязанных перестраивается целиком: человек мог получить аватар,
+    # уйти из команды или быть заменённым, и старая строка тогда лишняя.
+    session.execute(
+        delete(UnlinkedRosterPlayer).where(UnlinkedRosterPlayer.team_id == steam_team_id)
+    )
 
     by_account_id = {p.account_id: p for p in roster}
     for mp in mixer_team.get("players", []):
         account_id = mp.get("account_id")
         nickname = mp.get("nickname")
-        if account_id is None:
-            continue
         roles = ",".join(mp["preferredRoles"]) if mp.get("preferredRoles") else None
+        if account_id is None:
+            mixer_player_id = mp.get("id")
+            if mixer_player_id:
+                session.add(UnlinkedRosterPlayer(
+                    mixer_player_id=mixer_player_id,
+                    team_id=steam_team_id,
+                    tournament_id=tournament_id,
+                    nickname=nickname,
+                    mmr=mp.get("rating"),
+                    preferred_roles=roles,
+                ))
+            continue
         player = by_account_id.get(account_id)
         if player is None:
             # A freshly substituted-in player has no Player row yet (rows
@@ -678,7 +700,7 @@ def link_mixercup_data(
             # their team flip-flop each cycle. A past cup still contributes the
             # one thing that can't hurt: names for players it alone knows.
             if apply_rosters:
-                _apply_confirmed_roster(session, steam_team_id, mixer_team)
+                _apply_confirmed_roster(session, steam_team_id, mixer_team, tournament_id)
             else:
                 named_from_mixer += _apply_names_only(session, mixer_team)
         linked += 1
@@ -746,7 +768,7 @@ def sync_mixer_teams(
             updated += 1
         if mt.get("name"):
             _record_tournament_name(session, team_row.team_id, tournament_id, mt["name"])
-        _apply_confirmed_roster(session, team_row.team_id, mt)
+        _apply_confirmed_roster(session, team_row.team_id, mt, tournament_id)
 
     session.commit()
     progress(f"MixerCup team sync: {created} new team(s), {updated} updated for tournament {tournament_id}")

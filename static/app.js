@@ -351,13 +351,24 @@ function renderComposition(team) {
       })
       .join("");
     const rolesLine = player.roles ? `<p class="roles">${escapeHtml(formatRoles(player.roles))}</p>` : "";
+    // Игрок, которого mixer-cup не связал со Steam: аккаунта нет, поэтому ни
+    // ссылки на его страницу, ни статистики быть не может. Показываем то, что
+    // известно, и говорим почему пусто, вместо того чтобы прятать человека и
+    // оставлять в составе дырку.
+    const nameCell = player.unlinked
+      ? `<span class="player-unlinked">${escapeHtml(player.name)}</span>`
+      : `<button class="player-link" data-account-id="${player.account_id}">${escapeHtml(player.name)}</button><span class="profile-links">${profileLinks(player.account_id)}</span>`;
+    const emptyHint = player.unlinked
+      ? "mixer-cup не указал Steam — статистики нет"
+      : (team.hero_pools_locked ? "пул героев — по ключу" : "ещё не играл(а) за команду");
     card.innerHTML = `
-      <h3><button class="player-link" data-account-id="${player.account_id}">${escapeHtml(player.name)}</button><span class="profile-links">${profileLinks(player.account_id)}</span></h3>
+      <h3>${nameCell}</h3>
       <p class="mmr">${formatMmr(player.mmr)} MMR</p>
       ${rolesLine}
-      <ul>${heroItems || `<li><span class="hint">${team.hero_pools_locked ? "пул героев — по ключу" : "ещё не играл(а) за команду"}</span></li>`}</ul>
+      <ul>${heroItems || `<li><span class="hint">${emptyHint}</span></li>`}</ul>
     `;
-    card.querySelector(".player-link").addEventListener("click", () => navigate(`/player/${player.account_id}`));
+    const link = card.querySelector(".player-link");
+    if (link) link.addEventListener("click", () => navigate(`/player/${player.account_id}`));
     grid.appendChild(card);
   }
 

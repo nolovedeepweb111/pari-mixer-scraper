@@ -28,6 +28,7 @@ from pari_mixer_scraper.sources import (
 from pari_mixer_scraper.mixercup_client import MixerCupClient, pair_substitution_events
 from pari_mixer_scraper.models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, PlayerNote, QueuedPlayer,
+    UnlinkedRosterPlayer,
     TeamTournamentName,
     SubstitutionEvent, Team,
     build_engine, configure_sqlite, ensure_schema,
@@ -1206,6 +1207,16 @@ def api_teams():
                 select(Team.team_id, Team.name).order_by(Team.name)
             ).all()
 
+        # Игроки состава без привязки к Steam (см. UnlinkedRosterPlayer): в
+        # players их нет, но в команде они есть, и без них колонка показывала
+        # бы «(3)» у пятерной команды и заниженный суммарный MMR - именно так
+        # у Team VaniLLl из супермиксера выходило 17 574 вместо 33 252.
+        unlinked_by_team: dict[int, list] = {}
+        for t_id, mmr in session.execute(
+            select(UnlinkedRosterPlayer.team_id, UnlinkedRosterPlayer.mmr)
+        ):
+            unlinked_by_team.setdefault(t_id, []).append(mmr)
+
         result = []
         for team_id, name in teams:
             # The mixer-confirmed roster is authoritative and includes
@@ -1227,12 +1238,15 @@ def api_teams():
                 ).all()
             # Teams with only a single player are almost always admin/test
             # teams from a stray match rather than a real tournament squad.
-            if len(rows) > 1:
-                total_mmr = sum(mmr for _, mmr in rows if mmr is not None) or None
+            extra = unlinked_by_team.get(team_id, [])
+            if len(rows) + len(extra) > 1:
+                total_mmr = sum(
+                    mmr for mmr in [m for _, m in rows] + extra if mmr is not None
+                ) or None
                 result.append({
                     "team_id": team_id,
                     "name": name or f"Team {team_id}",
-                    "player_count": len(rows),
+                    "player_count": len(rows) + len(extra),
                     "total_mmr": total_mmr,
                 })
 
@@ -1408,6 +1422,16 @@ def api_team_detail(team_id: int):
             .where(Player.team_id == team_id, Player.roster_confirmed.is_(True))
         ).all()
 
+        # Игроки, которых mixer-cup не связал со Steam: аккаунта у них нет, а
+        # значит нет и строки в players - но в составе они есть, и прятать их
+        # нельзя (см. модель UnlinkedRosterPlayer). Ник, MMR и роли известны,
+        # статистики не будет никогда: не с чем сопоставлять матчи.
+        unlinked_players = [] if historical else session.execute(
+            select(UnlinkedRosterPlayer.mixer_player_id, UnlinkedRosterPlayer.nickname,
+                   UnlinkedRosterPlayer.mmr, UnlinkedRosterPlayer.preferred_roles)
+            .where(UnlinkedRosterPlayer.team_id == team_id)
+        ).all()
+
     roles_by_account = {account_id: roles for account_id, _, _, roles in confirmed_players}
 
     players: dict[int, dict] = {}
@@ -1433,6 +1457,18 @@ def api_team_detail(team_id: int):
                 "roles": roles,
                 "heroes": [],
             }
+
+    for mixer_player_id, nickname, mmr, roles in unlinked_players:
+        players[f"unlinked:{mixer_player_id}"] = {
+            "account_id": None,
+            "name": nickname or "игрок без привязки",
+            "mmr": mmr,
+            "roles": roles,
+            "heroes": [],
+            # Фронтенд по этому признаку не рисует ссылку на страницу игрока и
+            # объясняет, почему у карточки нет статистики.
+            "unlinked": True,
+        }
 
     for entry in players.values():
         entry["heroes"].sort(key=lambda h: -h["games"])

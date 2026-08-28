@@ -988,3 +988,10 @@ aside h2 {
   background: rgba(235, 66, 66, 0.15);
   color: var(--bad);
 }
+
+/* Игрок из состава, которого mixer-cup не связал со Steam: не ссылка, но и не
+   бледная подпись - он полноценный член состава, просто без статистики. */
+.player-unlinked {
+  color: var(--text);
+  font-weight: 600;
+}

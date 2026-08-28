@@ -135,6 +135,33 @@ class TeamTournamentName(Base):
     name: Mapped[str]
 
 
+class UnlinkedRosterPlayer(Base):
+    """Игрок из состава mixer-cup, которого не удалось связать с аккаунтом Dota.
+
+    Аккаунт мы достаём из ссылки на аватар в Steam (см.
+    mixercup_client.steam_account_id_from_avatar_url) - другого места, где их
+    публичное API отдаёт Steam-личность, нет: поле steamId существует только у
+    UserNode, а он доступен лишь для собственной учётки. Если аватар не
+    заполнен, account_id взять неоткуда, а он у нас первичный ключ игрока.
+
+    Раньше такие просто пропускались, и состав на сайте выглядел неполным: в
+    супермиксере WINLINE так терялось 6 человек в 5 командах из 10, причём у
+    команды с двумя такими игроками ещё и суммарный MMR выходил вдвое меньше
+    настоящего. Ник, рейтинг и роли mixer-cup при этом отдаёт - их и храним
+    здесь, чтобы показать карточку без статистики, а не спрятать человека.
+
+    Ключ - идентификатор игрока у mixer-cup, а не account_id, которого нет.
+    Перестраивается из mixer-cup на каждом сборе, поэтому бэкап не нужен."""
+    __tablename__ = "unlinked_roster_players"
+
+    mixer_player_id: Mapped[str] = mapped_column(primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.team_id"), index=True)
+    tournament_id: Mapped[int | None] = mapped_column(nullable=True)
+    nickname: Mapped[str | None]
+    mmr: Mapped[float | None]
+    preferred_roles: Mapped[str | None]
+
+
 class Player(Base):
     __tablename__ = "players"
 

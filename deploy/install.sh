@@ -67,6 +67,13 @@ systemctl enable pari-mixer
 # продолжал крутить в памяти прежнюю версию. Файлы новые, сайт старый.
 systemctl restart pari-mixer
 
+echo "==> Команда обновления"
+# Кладём короткую команду выката: дальше обновление - это одно слово
+# pms-update, вместо строчки с clone во временный каталог. Сам install.sh
+# запускать из /opt нельзя (он делает тому каталогу git reset --hard прямо
+# во время работы), поэтому update.sh клонирует во временный каталог сам.
+install -m 755 "$HERE/update.sh" /usr/local/bin/pms-update
+
 echo "==> nginx"
 DOMAIN=$(grep -E '^\s*APP_DOMAIN=' "$ENV_FILE" | cut -d= -f2- | tr -d '"' | xargs || true)
 NGINX_SITE=/etc/nginx/sites-available/pari-mixer
@@ -93,3 +100,5 @@ echo "  1) впишите секреты:      nano $ENV_FILE"
 echo "  2) перезапустите:        systemctl restart pari-mixer"
 echo "  3) выпустите сертификат: certbot --nginx -d ${DOMAIN:-ваш.домен}"
 echo "  4) посмотрите логи:      journalctl -u pari-mixer -f"
+echo
+echo "Дальше обновлять прод до свежего master - одной командой: pms-update"

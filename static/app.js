@@ -975,13 +975,19 @@ async function loadPlayerPage(accountId) {
   // простыня со строками-разделителями: у игрока с несколькими кубками она
   // разрослась так, что до пулов героев приходилось листать. Открытым остаётся
   // самый свежий турнир, остальные сворачиваются - развернуть можно любой.
-  const groups = [];
+  // Группируем по турниру, а не по соседству в списке: кубки идут параллельно
+  // и их матчи чередуются по времени, поэтому «пока метка та же» давало один и
+  // тот же кубок по нескольку раз. Порядок групп - по первому (то есть самому
+  // свежему) матчу каждого кубка, матчи внутри уже отсортированы.
+  const byCup = new Map();
   for (const m of p.matches) {
-    const label = m.tournament_label || "Прочие матчи";
-    const last = groups[groups.length - 1];
-    if (last && last.label === label) last.matches.push(m);
-    else groups.push({ label, matches: [m] });
+    const key = m.mixer_tournament_id ?? `league:${m.league_id ?? "?"}`;
+    if (!byCup.has(key)) {
+      byCup.set(key, { label: m.tournament_label || "Прочие матчи", matches: [] });
+    }
+    byCup.get(key).matches.push(m);
   }
+  const groups = [...byCup.values()];
   const matchGroups = groups
     .map((g, i) => {
       const wins = g.matches.filter((m) => m.won === true).length;

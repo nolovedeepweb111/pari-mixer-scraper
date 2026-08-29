@@ -683,7 +683,8 @@ def api_tournaments():
 # По клиенту на источник. Клиент сам сдвигает номера турниров, так что
 # наружу все номера уже глобальные (см. sources.py).
 _mixer_clients = {
-    src.key: MixerCupClient(base_url=src.base_url, id_offset=src.id_offset)
+    src.key: MixerCupClient(base_url=src.base_url, id_offset=src.id_offset,
+                            weeks=src.has_weeks)
     for src in SOURCES
 }
 _mixer_client = _mixer_clients[PRIMARY_SOURCE.key]
@@ -703,6 +704,7 @@ MIXER_TOURNAMENT_LABELS: dict[int, str] = {
     28: "Mixer Cup #5",
     29: "PARI Mixer Cup #3",
     30: "Pari Mixer Cup #4",
+    31: "Pari Mixer Cup #5",
     # Супермиксер WINLINE - второй источник (см. sources.py). Метка задана
     # явно, хотя название пришло бы и из их API: без неё адрес /winline1
     # существует только после того, как кэш имён сходит в сеть, то есть

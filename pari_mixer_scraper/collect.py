@@ -721,6 +721,10 @@ def link_mixercup_data(
         # one whose completed-games list it appears in), regardless of its
         # shared dotabuff league_id.
         match.mixer_tournament_id = tournament_id
+        # Неделя, в которую сыграна игра. Есть только у источников с недельными
+        # решафлами (см. Team.week_number); у остальных поля в ответе нет.
+        if g.get("weekNumber") is not None:
+            match.week_number = g["weekNumber"]
 
         result = g.get("result")
         if result in ("WIN1", "WIN2"):
@@ -757,6 +761,9 @@ def link_mixercup_data(
                     team_row.tournament_id = tournament_id
                 elif team_row.tournament_id is None:
                     team_row.tournament_id = tournament_id
+                # Неделя, к которой относится этот состав (см. Team.week_number).
+                if mixer_team.get("weekNumber") is not None:
+                    team_row.week_number = mixer_team["weekNumber"]
             # Rosters (which player is on the team now) are driven ONLY by the
             # active tournament - a player competing in both cups must not have
             # their team flip-flop each cycle. A past cup still contributes the
@@ -819,6 +826,7 @@ def sync_mixer_teams(
                 name=mt.get("name"),
                 mixer_uuid=mt["id"],
                 tournament_id=tournament_id,
+                week_number=mt.get("weekNumber"),
             )
             session.add(team_row)
             session.flush()
@@ -828,6 +836,9 @@ def sync_mixer_teams(
                 team_row.name = mt["name"]
             team_row.tournament_id = tournament_id
             updated += 1
+        # Неделя состава (см. Team.week_number); у источников без недель None.
+        if mt.get("weekNumber") is not None:
+            team_row.week_number = mt["weekNumber"]
         if mt.get("name"):
             _record_tournament_name(session, team_row.team_id, tournament_id, mt["name"])
         _apply_confirmed_roster(session, team_row.team_id, mt, tournament_id)
@@ -1659,7 +1670,8 @@ def _sync_mixer_source(session: Session, src, od_client: OpenDotaClient,
     просто вызывает эту функцию по разу на источник. Падение одного источника
     не должно уносить второй: наружу отдаётся None, и сборка продолжается.
     """
-    mixer_client = MixerCupClient(base_url=src.base_url, id_offset=src.id_offset)
+    mixer_client = MixerCupClient(base_url=src.base_url, id_offset=src.id_offset,
+                                  weeks=src.has_weeks)
 
     # Пин MIXER_TOURNAMENT_ID остаётся за основным источником: он задавался,
     # когда источник был один, и молча приписывать его номер второму сайту

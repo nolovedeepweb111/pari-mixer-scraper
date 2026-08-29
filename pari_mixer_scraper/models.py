@@ -109,6 +109,12 @@ class Team(Base):
     # only shows the active tournament's teams; earlier tournaments' teams
     # stay in the DB (reachable from player history) but off the sidebar.
     tournament_id: Mapped[int | None] = mapped_column(nullable=True)
+    # Неделя турнира, если источник их знает. Супермиксер WINLINE перетасовывает
+    # составы каждый понедельник, и команда там живёт ровно одну неделю: после
+    # решафла заводится новый набор команд. Без этого номера команды всех недель
+    # свалились бы в один список, а их статистика - в одну кучу, хотя играли её
+    # разные люди. У кубков PARI недель нет, там всегда None.
+    week_number: Mapped[int | None] = mapped_column(nullable=True)
     # NOTE: `name` above is this team's name in the tournament that owns it -
     # i.e. the ACTIVE one. It is the wrong name to print next to an older
     # tournament's match: mixer-cup recycles the same Steam team registrations
@@ -222,6 +228,8 @@ class Match(Base):
     # this does. Set from whichever tournament's completed-games list the
     # match_id appears in.
     mixer_tournament_id: Mapped[int | None] = mapped_column(nullable=True)
+    # Неделя турнира, в которую сыграна игра (см. Team.week_number).
+    week_number: Mapped[int | None] = mapped_column(nullable=True)
 
 
 class MatchPlayer(Base):

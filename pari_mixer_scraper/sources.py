@@ -36,6 +36,10 @@ class MixerSource:
     # Приставка в адресе: "PARI Mixer Cup #3" -> /mixercup3, а
     # "WINLINE Super Mixer #1" -> /winline1.
     slug_prefix: str
+    # Знает ли эта копия платформы про недели (еженедельные решафлы составов).
+    # У api.mixer-cup.gg схема старее: запрос с полями недель отвечает 400 и
+    # роняет сбор целиком, поэтому их туда не отправляем.
+    has_weeks: bool = False
 
 
 PARI = MixerSource(
@@ -45,6 +49,7 @@ PARI = MixerSource(
     id_offset=0,
     league_ids=(19924,),
     slug_prefix="mixercup",
+    has_weeks=False,
 )
 
 WINLINE = MixerSource(
@@ -54,6 +59,7 @@ WINLINE = MixerSource(
     id_offset=20_000,
     league_ids=(20165,),
     slug_prefix="winline",
+    has_weeks=True,
 )
 
 # Первый в списке - основной: его активный кубок сайт показывает на "/".
@@ -61,12 +67,12 @@ DEFAULT_SOURCES: tuple[MixerSource, ...] = (PARI, WINLINE)
 
 
 def _parse_env(raw: str) -> tuple[MixerSource, ...]:
-    """MIXER_SOURCES="ключ|Название|url|сдвиг|лиги|приставка; ..." - на случай,
+    """MIXER_SOURCES="ключ|Название|url|сдвиг|лиги|приставка[|недели]" - на случай,
     если поднимут третью копию, а выкатывать код будет некогда."""
     out = []
     for chunk in raw.split(";"):
         parts = [p.strip() for p in chunk.split("|")]
-        if len(parts) != 6:
+        if len(parts) not in (6, 7):
             continue
         try:
             out.append(MixerSource(
@@ -74,6 +80,7 @@ def _parse_env(raw: str) -> tuple[MixerSource, ...]:
                 id_offset=int(parts[3]),
                 league_ids=tuple(int(x) for x in parts[4].replace(",", " ").split()),
                 slug_prefix=parts[5].lower(),
+                has_weeks=len(parts) > 6 and parts[6].strip() in ("1", "true", "yes"),
             ))
         except ValueError:
             continue

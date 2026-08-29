@@ -53,6 +53,18 @@ query Tournaments($first: Int) {
 }
 """
 
+_WEEKS_QUERY = """
+query TournamentWeeks($tournamentId: Int!) {
+    tournamentWeeks(tournamentId: $tournamentId) {
+        id
+        weekNumber
+        status
+        startTime
+        endTime
+    }
+}
+"""
+
 _TEAMS_QUERY = """
 query Teams($filters: TeamFilterInput!, $first: Int, $offset: Int) {
     teams(first: $first, offset: $offset, filters: $filters) {
@@ -61,6 +73,7 @@ query Teams($filters: TeamFilterInput!, $first: Int, $offset: Int) {
             id
             name
             number
+            __WEEK_FIELD__
             players { id nickname proName steamAvatar rating preferredRoles }
         }
     }
@@ -76,6 +89,7 @@ query Games($first: Int, $offset: Int, $filters: GameFilterInput) {
             status
             matchId
             result
+            __WEEK_FIELD__
             team1 { id number name }
             team2 { id number name }
         }
@@ -129,7 +143,7 @@ class MixerCupClient:
     registered anywhere in Steam/OpenDota for ad-hoc mixer teams."""
 
     def __init__(self, base_url: str = BASE_URL, session: requests.Session | None = None,
-                 min_interval: float = 0.3, id_offset: int = 0):
+                 min_interval: float = 0.3, id_offset: int = 0, weeks: bool = False):
         self.base_url = base_url
         # Копий этой платформы теперь две, и нумерация турниров у каждой
         # своя, с единицы. Сдвиг разводит их в общем пространстве номеров:
@@ -137,9 +151,20 @@ class MixerCupClient:
         # исходный. Так остальному коду второй источник не виден. См.
         # sources.py.
         self.id_offset = id_offset
+        # Недели (еженедельные решафлы) есть только у той копии платформы, где
+        # они заведены. У api.mixer-cup.gg схема старее: запрос с полями weekId
+        # и weekNumber отвечает 400 и роняет сбор целиком - проверено. Поэтому
+        # поля подставляются в запрос только для источников, где они есть.
+        self.weeks = weeks
+        self._week_numbers: dict[int, dict[str, int]] = {}
         self.session = session or requests.Session()
         self.min_interval = min_interval
         self._last_request = 0.0
+
+    def _q(self, query: str, week_field: str) -> str:
+        """Подставляет поле недели в запрос - или убирает его, если источник
+        про недели не знает (см. self.weeks)."""
+        return query.replace("__WEEK_FIELD__", week_field if self.weeks else "")
 
     def _post(self, query: str, variables: dict | None = None) -> dict:
         elapsed = time.monotonic() - self._last_request
@@ -190,18 +215,58 @@ class MixerCupClient:
             key=lambda t: t["id"], reverse=True,
         )
 
+    def list_weeks(self, tournament_id: int) -> list[dict]:
+        """Недели турнира: {id, weekNumber, status, startTime, endTime}.
+
+        Супермиксер WINLINE перетасовывает составы каждый понедельник, и у них
+        это оформлено неделями: у команды есть weekId, у игры - weekNumber.
+        Команда живёт одну неделю, то есть после решафла появляется новый
+        набор команд, а не меняется состав прежних."""
+        if not self.weeks:
+            return []
+        tournament_id = self._local_id(tournament_id)
+        data = self._post(_WEEKS_QUERY, {"tournamentId": tournament_id})
+        return data.get("tournamentWeeks") or []
+
+    def _week_number_by_id(self, local_tournament_id: int) -> dict[str, int]:
+        """weekId -> weekNumber. У команды в ответе только идентификатор недели,
+        а работать удобнее с номером. Кэшируется на время жизни клиента: за один
+        прогон сбора недели не меняются.
+
+        Принимает номер турнира УЖЕ без сдвига источника - вызывается из мест,
+        которые его сняли: list_weeks снял бы его второй раз, и запрос ушёл бы
+        с отрицательным номером."""
+        if not self.weeks:
+            return {}
+        if local_tournament_id not in self._week_numbers:
+            try:
+                data = self._post(_WEEKS_QUERY, {"tournamentId": local_tournament_id})
+                self._week_numbers[local_tournament_id] = {
+                    w["id"]: w["weekNumber"]
+                    for w in (data.get("tournamentWeeks") or [])
+                    if w.get("id") and w.get("weekNumber") is not None
+                }
+            except Exception:
+                self._week_numbers[local_tournament_id] = {}
+        return self._week_numbers[local_tournament_id]
+
     def iter_teams(self, tournament_id: int, page_size: int = 50):
         tournament_id = self._local_id(tournament_id)
         offset = 0
         while True:
-            data = self._post(_TEAMS_QUERY, {
+            data = self._post(self._q(_TEAMS_QUERY, "weekId"), {
                 "filters": {"tournamentId": tournament_id},
                 "first": page_size,
                 "offset": offset,
             })
             result = data["teams"]
             items = result["items"]
+            # Неделя приходит идентификатором, а наружу удобнее отдавать номер:
+            # хранить и сравнивать проще, и в базе он читаемее uuid.
+            weeks = self._week_number_by_id(tournament_id) if self.weeks else {}
             for team in items:
+                if weeks:
+                    team["weekNumber"] = weeks.get(team.get("weekId"))
                 for player in team["players"]:
                     player["account_id"] = steam_account_id_from_avatar_url(player.get("steamAvatar"))
             yield from items
@@ -213,7 +278,7 @@ class MixerCupClient:
         tournament_id = self._local_id(tournament_id)
         offset = 0
         while True:
-            data = self._post(_GAMES_QUERY, {
+            data = self._post(self._q(_GAMES_QUERY, "weekNumber"), {
                 "filters": {"tournamentId": tournament_id, "status": ["COMPLETE"]},
                 "first": page_size,
                 "offset": offset,

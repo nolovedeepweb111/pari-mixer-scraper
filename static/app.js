@@ -614,7 +614,7 @@ async function renderAnalysisTab(teamId, container, scope) {
               </div>`;
           })
           .join("")
-      : '<span class="hint">никому ничего не банят заметно чаще обычного</span>';
+      : `<span class="hint">никому ничего не банят заметно чаще обычного — либо матчей пока меньше ${a.player_bans_min_games}</span>`;
 
   container.innerHTML = `
     <!-- Assembled on the server, but out of the team's name - so it carries
@@ -652,7 +652,9 @@ async function renderAnalysisTab(teamId, container, scope) {
            героев соперник забирает баном в матчах игрока чаще обычного. Бан мог
            быть нацелен и на соседа по составу, и просто в мету. Полагаться на
            этот блок стоит с осторожностью — но он показывает то, чего не видно
-           в пуле героев: героя, которого игроку не дают взять.</p>
+           в пуле героев: героя, которого игроку не дают взять.
+           Игроки меньше чем с ${a.player_bans_min_games} матчами сюда не
+           попадают — на короткой выборке это гадание.</p>
         ${playerBansHtml}
       </div>
     </div>

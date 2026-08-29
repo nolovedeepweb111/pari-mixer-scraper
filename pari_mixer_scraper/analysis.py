@@ -297,7 +297,7 @@ def compute_targeted_bans(
     account_id: int,
     min_bans: int = 3,
     min_lift: float = 1.6,
-    min_games: int = 5,
+    min_games: int = 15,
     mixer_tournament_id: int | None = None,
     context: BanContext | None = None,
 ) -> list[dict]:
@@ -313,8 +313,9 @@ def compute_targeted_bans(
         return []
 
     own_games = games_by_player.get(account_id, 0)
-    # Меньше min_games матчей - молчим. На трёх играх всё выглядит как «3 из 3»
-    # со стопроцентной частотой, и блок заполняется случайностями.
+    # Меньше min_games матчей - молчим. На маленькой выборке всё выглядит как
+    # «3 из 3» со стопроцентной частотой, и блок заполняется случайностями, а
+    # доверия к нему это стоит куда больше, чем приносит пара лишних строк.
     if own_games < min_games:
         return []
 

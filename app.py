@@ -1126,8 +1126,10 @@ _CAPTAIN_SLOT_PREFIX = "замена капитана"
 TARGETED_BAN_MIN_BANS = int(os.environ.get("TARGETED_BAN_MIN_BANS", "3"))
 TARGETED_BAN_MIN_LIFT = float(os.environ.get("TARGETED_BAN_MIN_LIFT", "1.6"))
 # И у самого игрока должно быть достаточно матчей, иначе «3 из 3» лезет
-# наверх как стопроцентная закономерность.
-TARGETED_BAN_MIN_GAMES = int(os.environ.get("TARGETED_BAN_MIN_GAMES", "5"))
+# наверх как стопроцентная закономерность. Порог намеренно высокий: блок и так
+# идёт с оговоркой, и лучше промолчать про человека, чем показать про него
+# правдоподобную случайность.
+TARGETED_BAN_MIN_GAMES = int(os.environ.get("TARGETED_BAN_MIN_GAMES", "15"))
 
 
 # Разбор всех банов стоит одинаково для любого игрока (около 300 мс на боевой
@@ -2238,6 +2240,7 @@ def api_team_analysis(team_id: int):
 
     return jsonify({
         "player_bans": player_bans,
+        "player_bans_min_games": TARGETED_BAN_MIN_GAMES,
         "player_heroes": player_heroes,
         "player_heroes_locked": pools_locked,
         "player_heroes_min_games": PLAYER_HERO_MIN_GAMES,

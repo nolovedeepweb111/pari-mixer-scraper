@@ -1,114 +1,105 @@
-# Карта проекта
+# Project map
 
-Разведывательный сайт по кубкам PARI Mixer Cup и супермиксеру WINLINE: составы,
-пулы героев, драфты, замены, аналитика соперника. Доступ к идущим кубкам
-продаётся по ключу, архив открыт всем.
+Scouting site for PARI Mixer Cup and the WINLINE super mixer: rosters, hero
+pools, drafts, substitutions, opponent analysis. Running cups are sold by key;
+the archive is free.
 
-Подробности «почему так» живут в комментариях к коду и в [README.md](README.md).
-Здесь — только карта: где что лежит и обо что легко споткнуться.
+*Русская версия карты — опубликованная страница, ссылку спросите у владельца.
+Здесь то же самое короче: английский текст стоит вдвое меньше токенов.*
 
-## Быстрые команды
+## Commands
 
-| Зачем | Как |
+| Task | How |
 |---|---|
-| Запустить локально | `.venv\Scripts\python.exe app.py` (см. `.claude/launch.json`) |
-| Выкатить на прод | `ssh root@45.12.238.194 "pms-update"` |
-| Логи прода | `journalctl -u pari-mixer -f` |
-| Состояние сбора | `GET /api/collect/status` — публичный, врать не умеет |
+| Run locally | `.venv\Scripts\python.exe app.py` (see `.claude/launch.json`) |
+| Deploy | `ssh root@45.12.238.194 "pms-update"` |
+| Logs | `journalctl -u pari-mixer -f` |
+| Collector state | `GET /api/collect/status` — public, never lies |
 
-Секреты (`ACCESS_KEYS`, `AUTH_SECRET`, `OPS_TOKEN`, `STEAM_API_KEY`) живут только
-в `/etc/pari-mixer/env` на сервере. Журнал «ключ → кому» — `D:\claude\keys-pari-mixer-cup.md`,
-**намеренно вне репозитория**: репозиторий публичный.
+Secrets (`ACCESS_KEYS`, `AUTH_SECRET`, `OPS_TOKEN`, `STEAM_API_KEY`) live only in
+`/etc/pari-mixer/env` on the server. Key ledger: `D:\claude\keys-pari-mixer-cup.md`,
+deliberately outside the repo — the repo is public.
 
-## Карта файлов
+## Files
 
-| Файл | За что отвечает |
+| File | Responsibility |
 |---|---|
-| `app.py` | Flask: все эндпоинты, доступ по ключам, разрешение турниров и адресов, запуск сборщика |
-| `pari_mixer_scraper/collect.py` | Сбор: Steam → mixer-cup → OpenDota, сборка базы в стороне и подмена |
-| `pari_mixer_scraper/models.py` | Таблицы SQLite; `ensure_schema` дописывает недостающие колонки |
-| `pari_mixer_scraper/sources.py` | Реестр источников турниров: адрес API, сдвиг номеров, лиги, приставка адреса |
-| `pari_mixer_scraper/mixercup_client.py` | GraphQL к mixer-cup; сам сдвигает номера турниров |
-| `pari_mixer_scraper/steam_client.py` | История матчей лиги (единственный дешёвый источник списка матчей) |
-| `pari_mixer_scraper/opendota_client.py` | Детали матча: драфт, KDA. Ловит суточный лимит отдельным исключением |
-| `pari_mixer_scraper/analysis.py` | Аналитика команд, коронные герои, разбор адресных банов |
-| `static/app.js` | Весь фронтенд: маршрутизация по адресам, отрисовка, фильтры |
-| `deploy/` | Установщик, systemd, nginx, `update.sh` (он же `pms-update` на сервере) |
-| `.github/workflows/keep-alive.yml` | Бэкап состояния в ветку `data-backup` |
+| `app.py` | Flask: endpoints, key access, tournament/slug resolution, launches collector |
+| `collect.py` | Collection: Steam → mixer-cup → OpenDota; builds DB aside, swaps it in |
+| `models.py` | 12 SQLite tables; `ensure_schema` adds missing columns |
+| `sources.py` | Tournament sources: API url, id offset, leagues, address prefix |
+| `mixercup_client.py` | mixer-cup GraphQL; applies the id offset itself |
+| `steam_client.py` | League match history — the only cheap source of a match list |
+| `opendota_client.py` | Match details (draft, KDA); raises on the daily quota |
+| `analysis.py` | Team stats, signature heroes, targeted-ban inference |
+| `static/app.js` | Whole front end: History-API routing, rendering, filters |
+| `deploy/` | Installer, systemd, nginx, `update.sh` (= `pms-update` on the server) |
 
-## Поток данных
+## Data flow
 
-1. **Steam** отдаёт список матчей лиги с составами — дёшево, одним запросом.
-2. **mixer-cup** отдаёт то, чего нет в доте: названия команд, составы, MMR,
-   результаты, замены, очередь, недели.
-3. **OpenDota** отдаёт детали конкретного матча: драфт и KDA. По запросу на матч,
-   поэтому это самое узкое место.
-4. Сборщик — **отдельный процесс**. Он копирует живую базу, наполняет копию и
-   подменяет её через `os.replace`. Приложение читает базу с `NullPool`, поэтому
-   видит подменённый файл сразу.
+Steam gives the league's match list with lineups (one cheap call). mixer-cup
+gives what Dota does not have: team names, rosters, MMR, results, substitutions,
+queue, weeks. OpenDota gives per-match draft and KDA — one call per match, the
+bottleneck.
 
-## Несущие идеи
+The collector is a **separate process**: it copies the live DB, fills the copy,
+and swaps it in with `os.replace`. The app uses `NullPool`, so it sees the new
+file immediately.
 
-**`mixer_tournament_id` — глобальный ключ.** По нему собираются адреса, пулы
-героев, доступ, лидерборды. Источников турниров два, и нумерация у каждого своя,
-поэтому номера разведены сдвигом (`sources.py`): супермиксер WINLINE #1 лежит под
-номером 20002. Сдвиг делает клиент, остальной код о втором источнике не знает.
+## Invariants
 
-**Воркер обязан быть один.** Привязки устройств к ключам, статус сбора и кэши
-(активные кубки, разбор банов) живут в памяти процесса. Второй воркер — и половина
-запросов будет видеть чужое состояние.
+- **One worker only.** Device bindings, collect status and caches live in process
+  memory. A second worker means half the requests see different state.
+- **`mixer_tournament_id` is the global key** — addresses, hero pools, access,
+  leaderboards. Two sources, each numbering from its own 1, so ids are separated
+  by an offset (`sources.py`): WINLINE #1 is stored as 20002. The client applies
+  the offset; nothing else knows there is a second source.
+- **A team lives one cup, sometimes one week.** Steam team ids are reused cup to
+  cup, so a match shows the name from `team_tournament_names`, not `teams.name`.
+  Sources with reshuffles also carry `teams.week_number`.
+- **Hero pools are always gated**, even in the free archive. That is the product.
+- **Cups run concurrently** and their matches interleave in time. Any "while the
+  label is the same" grouping breaks — group by tournament id.
 
-**Платный доступ.** Закрыты все идущие кубки (их может быть несколько сразу),
-архив открыт. Пулы героев закрыты всегда, даже в архиве, — это и есть товар.
+## Traps (measured, not assumed)
 
-**Команда живёт один кубок.** Steam-идентификаторы переиспользуются от кубка к
-кубку, поэтому имя команды в конкретном матче берётся из `team_tournament_names`,
-а не из `teams.name`. У источников с решафлами команда живёт ещё меньше — одну
-неделю (`teams.week_number`).
+- **Steam returns at most 500 league matches.** Old cups fall out of the league
+  history by themselves, so matches are kept in the backup or the archive shrinks.
+- **OpenDota never has private-lobby matches.** A game played without the league
+  ticket is 404 forever. Such ids go to `unavailable_matches`: without that the
+  collector re-asked for them every 10 minutes and burned the daily quota itself,
+  which looked exactly like being rate-limited from outside.
+- **Steam `GetMatchDetails` 500s** for this league. Drafts come only from OpenDota.
+- **The two mixer-cup deployments run different schemas.** `api.mixer-cup.gg` has
+  no week fields and answers 400 to a query mentioning them, which kills that
+  source's whole sync. Hence `MixerSource.has_weeks`.
+- **mixer-cup exposes no Steam id for a player** — it is parsed out of the avatar
+  URL. No avatar: match by nickname among known players
+  (`_resolve_account_by_nickname`), else show a card with no stats
+  (`unlinked_roster_players`).
+- **Never run `install.sh` from `/opt`** — it `git reset --hard`s that directory
+  while running, rewriting the file bash is reading itself from. That is what
+  `pms-update` exists for.
 
-## Грабли (проверено, не догадки)
+## Env
 
-- **Steam отдаёт максимум 500 матчей лиги.** Старые кубки из истории лиги
-  выпадают, поэтому матчи лежат в бэкапе — иначе архив худеет сам собой.
-- **OpenDota не знает матчей из приватных лобби.** Игра, сыгранная мимо
-  турнирного билета, отдаёт 404 навсегда. Такие матчи запоминаются в
-  `unavailable_matches`: без этого сборщик перезапрашивал их каждые 10 минут и
-  выжигал суточную квоту, а выглядело это как «нас лимитят».
-- **`GetMatchDetails` у Steam отвечает 500** на матчи этой лиги. Драфт берётся
-  только у OpenDota.
-- **У `api.mixer-cup.gg` схема старее**, чем у копии под WINLINE: запрос с полями
-  недель отвечает 400 и роняет сбор целиком. Отсюда `MixerSource.has_weeks`.
-- **mixer-cup не отдаёт Steam-идентификатор игрока.** Он выковыривается из ссылки
-  на аватар; если аватара нет, игрока опознают по нику среди уже известных
-  (`analysis`, `_resolve_account_by_nickname`), а совсем неопознанных показывают
-  карточкой без статистики (`unlinked_roster_players`).
-- **`install.sh` нельзя запускать из `/opt`**: он делает своему же каталогу
-  `git reset --hard` во время работы. Для этого и есть `pms-update`, который
-  клонирует свежий код во временный каталог.
-- **Кубки идут параллельно**, и их матчи чередуются по времени. Любая группировка
-  «пока метка та же» ломается — группировать только по номеру турнира.
-
-## Переменные окружения
-
-Обязательные на проде: `STEAM_API_KEY`, `ACCESS_KEYS`, `AUTH_SECRET`, `OPS_TOKEN`,
+Required in production: `STEAM_API_KEY`, `ACCESS_KEYS`, `AUTH_SECRET`, `OPS_TOKEN`,
 `APP_DOMAIN`, `PUBLIC_ARCHIVE=1`, `MAX_DEVICES_PER_KEY=2`.
 
-Полезные пороги (все со здравыми значениями по умолчанию):
-`TARGETED_BAN_MIN_BANS`, `TARGETED_BAN_MIN_LIFT`, `TARGETED_BAN_MIN_GAMES`,
+Thresholds, all with sane defaults: `TARGETED_BAN_MIN_BANS|_LIFT|_GAMES`,
 `PLAYER_HERO_MIN_GAMES`, `PLAYER_HERO_MIN_WIN_RATE`, `MISSING_MATCH_RETRY_HOURS`,
 `COLLECT_INTERVAL_SECONDS`, `TOURNAMENT_CACHE_TTL_SECONDS`.
 
-`OPENDOTA_API_KEY` не задан — стоит завести: он снимает суточный потолок и
-ускоряет добор драфтов.
+`OPENDOTA_API_KEY` is unset — worth adding; it lifts the daily cap.
 
-## Как проверять изменения
+## How to verify a change
 
-Локальная база — копия боевой, обычно отставшая; на ней видно механику, но не
-объёмы. Порядок, который себя оправдал:
+The local DB is a stale copy of production: good for mechanism, useless for
+volume. What works:
 
-1. Скопировать `tournament.db` во временный каталог и работать с копией.
-2. Прогнать нужный кусок сборщика точечно (`sync_mixer_teams`, `seed_matches_from_mixer`)
-   вместо полного цикла.
-3. Поднять приложение с `TOURNAMENT_DB`, указывающим на копию, и проверить
-   эндпоинты через `app.test_client()` — быстрее и надёжнее браузера.
-4. Фронтенд смотреть в браузере, но проверять не скриншотом, а чтением DOM.
+1. Copy the DB to a temp dir and work on the copy.
+2. Run the relevant collector function directly, not a whole cycle.
+3. Point `TOURNAMENT_DB` at the copy and hit endpoints via `app.test_client()` —
+   faster and more reliable than the browser.
+4. Check the front end in the browser, but verify by reading the DOM, not by
+   screenshot.

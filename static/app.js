@@ -37,7 +37,7 @@ let selectedWeek = null;
 let lastTeamList = null; // последний полученный список - для перерисовки без запроса
 // Whether the running cup is paid-only for this visitor, and what to offer
 // them if so. Filled from /api/auth/status before the first render.
-let access = { enabled: false, authenticated: true, publicArchive: false, offer: null };
+let access = { enabled: false, authenticated: true, publicArchive: false, offer: null, until: null };
 
 // «1 матч / 2 матча / 5 матчей» - иначе заголовок группы читается как отчёт.
 function plural(n, one, few, many) {
@@ -1348,8 +1348,19 @@ async function loadAccessStatus() {
       authenticated: !!s.authenticated,
       publicArchive: !!s.public_archive,
       offer: s.offer || null,
+      until: s.access_until || null,
     };
   } catch (_) { /* keep the permissive default; the API is the real gate */ }
+
+  // Пробный ключ выдаётся на несколько дней, и человек должен видеть, до какого
+  // числа он работает, — иначе доступ однажды пропадёт без объяснений.
+  const untilEl = document.getElementById("access-until");
+  if (untilEl && access.until) {
+    const d = new Date(access.until + "T00:00:00");
+    untilEl.textContent = `доступ до ${d.toLocaleDateString("ru-RU", { day: "numeric", month: "long" })}`;
+    untilEl.title = "После этой даты ключ перестанет работать";
+    untilEl.style.display = "";
+  }
 
   // "Выйти" only makes sense for someone who is actually logged in.
   const logoutBtn = document.getElementById("logout-btn");

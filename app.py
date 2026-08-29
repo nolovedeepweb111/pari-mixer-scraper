@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -89,7 +89,33 @@ ensure_schema(engine)
 # git branch), so bindings are stored keyed by HMAC(key) with AUTH_SECRET -
 # the keys themselves never touch git. Device ids are random, non-secret.
 # ---------------------------------------------------------------------------
-_ACCESS_KEYS = [k.strip() for k in os.environ.get("ACCESS_KEYS", "").split(",") if k.strip()]
+# У ключа может быть срок: "KEY@2026-09-01" - работает по это число включительно
+# (по UTC), после чего перестаёт. Нужно для пробных ключей: раздать два десятка
+# на пару дней и не полагаться на то, что их не забудут убрать. Забытый пробный
+# ключ - это бесплатный доступ навсегда, а ключи и есть источник дохода.
+def _parse_access_keys(raw: str):
+    keys, expiry = [], {}
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        key, _, until = chunk.partition("@")
+        key = key.strip()
+        if not key:
+            continue
+        keys.append(key)
+        until = until.strip()
+        if until:
+            try:
+                expiry[key] = date.fromisoformat(until)
+            except ValueError:
+                # Дата не разобралась - ключ остаётся бессрочным, а не мёртвым:
+                # опечатка в env не должна отнимать доступ у того, кто заплатил.
+                pass
+    return keys, expiry
+
+
+_ACCESS_KEYS, _KEY_EXPIRY_BY_KEY = _parse_access_keys(os.environ.get("ACCESS_KEYS", ""))
 AUTH_ENABLED = bool(_ACCESS_KEYS)
 # Stable across restarts without extra config: falls back to a hash of the
 # key set (changing the keys logs everyone out, which is acceptable).
@@ -132,6 +158,20 @@ def _key_hash(key: str) -> str:
 
 
 VALID_KEY_HASHES = {_key_hash(k) for k in _ACCESS_KEYS}
+# хеш ключа -> последний день, когда он работает
+KEY_EXPIRY = {_key_hash(k): until for k, until in _KEY_EXPIRY_BY_KEY.items()}
+
+
+def _key_expiry(key_hash: str):
+    return KEY_EXPIRY.get(key_hash)
+
+
+def _key_active(key_hash: str) -> bool:
+    """Ключ существует и его срок ещё не вышел."""
+    if key_hash not in VALID_KEY_HASHES:
+        return False
+    until = KEY_EXPIRY.get(key_hash)
+    return until is None or datetime.now(timezone.utc).date() <= until
 _device_bindings: dict[str, set[str]] = {}  # key_hash -> {device_id}
 _bindings_lock = threading.Lock()
 
@@ -455,7 +495,9 @@ _LOGIN_HTML = _LOGIN_HTML.replace("__ACCESS_OFFER__", _ACCESS_OFFER_HTML)
 def _session_ok() -> bool:
     kh = session.get("kh")
     device = session.get("device")
-    if not kh or not device or kh not in VALID_KEY_HASHES:
+    # Срок проверяется и здесь, а не только на входе: иначе тот, кто уже вошёл,
+    # ходил бы по сайту и после того, как его пробный ключ истёк.
+    if not kh or not device or not _key_active(kh):
         return False
     with _bindings_lock:
         devices = _device_bindings.setdefault(kh, set())
@@ -568,6 +610,10 @@ def api_auth_login():
     kh = _key_hash(key)
     if kh not in VALID_KEY_HASHES:
         return jsonify({"error": "Неверный ключ."}), 403
+    if not _key_active(kh):
+        # Отдельным сообщением: человек с истёкшим пробным ключом должен понять,
+        # что он не ошибся при вводе, а срок вышел.
+        return jsonify({"error": "Срок этого ключа истёк."}), 403
     with _bindings_lock:
         devices = _device_bindings.setdefault(kh, set())
         if device not in devices:
@@ -584,9 +630,12 @@ def api_auth_login():
 
 @app.get("/api/auth/status")
 def api_auth_status():
+    until = _key_expiry(session.get("kh") or "") if _session_ok() else None
     return jsonify({
         "enabled": AUTH_ENABLED,
         "authenticated": _viewer_has_key(),
+        # Дата, по которую действует ключ этого гостя, если срок задан.
+        "access_until": until.isoformat() if until else None,
         "public_archive": PUBLIC_ARCHIVE,
         # Shown on the lock panel, so the offer lives in one place.
         "offer": ACCESS_OFFER,

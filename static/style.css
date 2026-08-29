@@ -1032,3 +1032,25 @@ aside h2 {
   border-left: 2px solid var(--bad);
   padding-left: 8px;
 }
+
+/* Сортировка списка команд: две кнопки вместо выпадающего списка - вариантов
+   всего два, и нажатие понятнее выбора. */
+.sort-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.sort-btn {
+  background: var(--panel-deep);
+  color: var(--muted);
+  border: none;
+  border-radius: 0;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.sort-btn + .sort-btn { border-left: 1px solid var(--border); }
+.sort-btn:hover { background: var(--panel); color: var(--text); }
+.sort-btn.active { background: var(--accent); color: #fff; }
+.sort-btn.active:hover { background: var(--accent-hover); }

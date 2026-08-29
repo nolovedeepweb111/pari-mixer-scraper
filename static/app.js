@@ -34,6 +34,7 @@ let sidebarTournamentId; // undefined until the sidebar has been filled once
 // показывает ту, что выбрана, по умолчанию последнюю.
 let teamSort = "mmr";
 let selectedWeek = null;
+let lastTeamList = null; // последний полученный список - для перерисовки без запроса
 // Whether the running cup is paid-only for this visitor, and what to offer
 // them if so. Filled from /api/auth/status before the first render.
 let access = { enabled: false, authenticated: true, publicArchive: false, offer: null };
@@ -309,6 +310,9 @@ function sortTeams(teams) {
 }
 
 // Переключатели над списком: неделя (если кубок с решафлами) и сортировка.
+// Неделя осталась выпадающим списком - их со временем станет много, кнопками
+// такое не выложить. Сортировка - две кнопки: вариантов всего два, и нажатие
+// понятнее выбора из списка.
 function renderTeamControls(tournamentId, weeks) {
   const bar = document.createElement("div");
   bar.className = "team-controls";
@@ -321,22 +325,25 @@ function renderTeamControls(tournamentId, weeks) {
     : "";
   bar.innerHTML = `
     ${weekPart}
-    <label>Сортировка
-      <select id="team-sort">
-        <option value="mmr"${teamSort === "mmr" ? " selected" : ""}>по MMR</option>
-        <option value="wins"${teamSort === "wins" ? " selected" : ""}>по победам</option>
-      </select>
-    </label>
+    <div class="sort-toggle" role="group" aria-label="Сортировка команд">
+      <button class="sort-btn${teamSort === "mmr" ? " active" : ""}" data-sort="mmr">MMR</button>
+      <button class="sort-btn${teamSort === "wins" ? " active" : ""}" data-sort="wins">Победы</button>
+    </div>
   `;
   const weekSel = bar.querySelector("#week-select");
   if (weekSel) weekSel.addEventListener("change", () => {
     selectedWeek = Number(weekSel.value);
     loadTeams(tournamentId);
   });
-  bar.querySelector("#team-sort").addEventListener("change", (e) => {
-    teamSort = e.target.value;
-    loadTeams(tournamentId);
-  });
+  for (const btn of bar.querySelectorAll(".sort-btn")) {
+    btn.addEventListener("click", () => {
+      if (btn.dataset.sort === teamSort) return;
+      teamSort = btn.dataset.sort;
+      // Порядок - дело фронтенда, данные те же: перерисовываем из того, что уже
+      // получено, вместо повторного запроса к серверу.
+      renderTeamList();
+    });
+  }
   return bar;
 }
 
@@ -358,12 +365,25 @@ async function loadTeams(tournamentId) {
     // Locked cup (403) - the panel in the main area explains it.
     teamsEl.innerHTML = '<p class="hint">Список команд — по ключу.</p>';
     sidebarTournamentId = undefined;
+    lastTeamList = null;
     return;
   }
   if (teams.length === 0) {
     teamsEl.innerHTML = '<p class="hint">Нет данных. Обновляется автоматически, зайдите чуть позже.</p>';
+    lastTeamList = null;
     return;
   }
+
+  lastTeamList = { tournamentId, teams, weeks };
+  renderTeamList();
+}
+
+// Отрисовка уже полученного списка. Отдельно от загрузки, чтобы смена
+// сортировки не ходила лишний раз на сервер: данные те же, меняется порядок.
+function renderTeamList() {
+  if (!lastTeamList) return;
+  const { tournamentId, teams, weeks } = lastTeamList;
+  teamsEl.innerHTML = "";
 
   if (weeks.length > 1 || teams.length > 1) {
     teamsEl.appendChild(renderTeamControls(tournamentId, weeks));

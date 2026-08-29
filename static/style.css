@@ -995,3 +995,34 @@ aside h2 {
   color: var(--text);
   font-weight: 600;
 }
+
+/* Переключатели над списком команд: неделя турнира и сортировка. */
+.team-controls {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.team-controls label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.team-controls select {
+  background: var(--panel-deep);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+/* Название команды и строка с числами под ним. */
+.team-btn .team-name { display: block; }
+.team-btn .team-meta {
+  display: block;
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--muted);
+}

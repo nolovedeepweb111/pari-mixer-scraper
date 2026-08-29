@@ -29,6 +29,11 @@ let activeTab = "composition";
 let route = { view: "cup" };
 let cups = { activeId: null, activeSlug: null, list: [], bySlug: new Map(), byId: new Map() };
 let sidebarTournamentId; // undefined until the sidebar has been filled once
+// Как отсортирован список команд и какая неделя выбрана. Неделя есть только у
+// кубков с решафлами (супермиксер): там команда живёт одну неделю, и список
+// показывает ту, что выбрана, по умолчанию последнюю.
+let teamSort = "mmr";
+let selectedWeek = null;
 // Whether the running cup is paid-only for this visitor, and what to offer
 // them if so. Filled from /api/auth/status before the first render.
 let access = { enabled: false, authenticated: true, publicArchive: false, offer: null };
@@ -291,8 +296,60 @@ function highlightSidebar() {
   }
 }
 
+function sortTeams(teams) {
+  const byMmr = (a, b) => (b.total_mmr || 0) - (a.total_mmr || 0);
+  if (teamSort === "wins") {
+    // При равном числе побед выше тот, кто меньше проиграл, а уже потом - по
+    // рейтингу: иначе команда, сыгравшая один матч, вставала бы рядом с той,
+    // что выиграла столько же из десяти.
+    return teams.slice().sort((a, b) =>
+      (b.wins || 0) - (a.wins || 0) || (a.losses || 0) - (b.losses || 0) || byMmr(a, b));
+  }
+  return teams.slice().sort(byMmr);
+}
+
+// Переключатели над списком: неделя (если кубок с решафлами) и сортировка.
+function renderTeamControls(tournamentId, weeks) {
+  const bar = document.createElement("div");
+  bar.className = "team-controls";
+  const weekPart = weeks.length > 1
+    ? `<label>Неделя
+         <select id="week-select">${weeks.map((w) =>
+           `<option value="${w}"${w === selectedWeek ? " selected" : ""}>${w}</option>`).join("")}
+         </select>
+       </label>`
+    : "";
+  bar.innerHTML = `
+    ${weekPart}
+    <label>Сортировка
+      <select id="team-sort">
+        <option value="mmr"${teamSort === "mmr" ? " selected" : ""}>по MMR</option>
+        <option value="wins"${teamSort === "wins" ? " selected" : ""}>по победам</option>
+      </select>
+    </label>
+  `;
+  const weekSel = bar.querySelector("#week-select");
+  if (weekSel) weekSel.addEventListener("change", () => {
+    selectedWeek = Number(weekSel.value);
+    loadTeams(tournamentId);
+  });
+  bar.querySelector("#team-sort").addEventListener("change", (e) => {
+    teamSort = e.target.value;
+    loadTeams(tournamentId);
+  });
+  return bar;
+}
+
 async function loadTeams(tournamentId) {
-  const res = await fetch(`/api/teams${scopeQuery(tournamentId)}`);
+  const cup = cups.byId.get(tournamentId);
+  const weeks = (cup && cup.weeks) || [];
+  // Неделя сбрасывается при переходе в другой кубок: её номера свои у каждого.
+  if (selectedWeek != null && !weeks.includes(selectedWeek)) selectedWeek = null;
+  if (selectedWeek == null && weeks.length) selectedWeek = weeks[weeks.length - 1];
+  const weekQuery = selectedWeek != null
+    ? (scopeQuery(tournamentId) ? `&week=${selectedWeek}` : `?week=${selectedWeek}`)
+    : "";
+  const res = await fetch(`/api/teams${scopeQuery(tournamentId)}${weekQuery}`);
   const teams = await res.json();
   sidebarTournamentId = tournamentId;
 
@@ -308,15 +365,24 @@ async function loadTeams(tournamentId) {
     return;
   }
 
-  for (const team of teams) {
+  if (weeks.length > 1 || teams.length > 1) {
+    teamsEl.appendChild(renderTeamControls(tournamentId, weeks));
+  }
+
+  for (const team of sortTeams(teams)) {
     const btn = document.createElement("button");
     btn.className = "team-btn";
     btn.dataset.teamId = team.team_id;
+    // Название отдельной строкой, всё остальное - строкой помельче под ним:
+    // одной строкой это переносилось как попало, а со счётом стало бы совсем
+    // нечитаемо.
+    const meta = [`(${team.player_count})`];
+    if ((team.wins || 0) + (team.losses || 0) > 0) meta.push(`${team.wins}–${team.losses}`);
     // A finished cup has no meaningful team total (see api_team_detail), so
     // the MMR half of the label is dropped rather than shown as "?".
-    btn.textContent = team.total_mmr != null
-      ? `${team.name} (${team.player_count}) · ${formatMmr(team.total_mmr)} MMR`
-      : `${team.name} (${team.player_count})`;
+    if (team.total_mmr != null) meta.push(`${formatMmr(team.total_mmr)} MMR`);
+    btn.innerHTML = `<span class="team-name">${escapeHtml(team.name)}</span>` +
+      `<span class="team-meta">${escapeHtml(meta.join(" · "))}</span>`;
     btn.onclick = () => navigate(cupPath(tournamentId, `team/${team.team_id}`));
     teamsEl.appendChild(btn);
   }

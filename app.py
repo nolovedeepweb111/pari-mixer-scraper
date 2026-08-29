@@ -650,6 +650,13 @@ def api_tournaments():
     active_ids = _active_tournament_ids()
     with Session(engine) as session:
         ids = _known_tournament_ids(session)
+        weeks_by_cup: dict[int, list[int]] = {}
+        for cup_id, week in session.execute(
+            select(Team.tournament_id, Team.week_number)
+            .where(Team.tournament_id.is_not(None), Team.week_number.is_not(None))
+            .distinct()
+        ):
+            weeks_by_cup.setdefault(cup_id, []).append(week)
         played = {
             t for (t,) in session.execute(
                 select(Match.mixer_tournament_id)
@@ -667,6 +674,9 @@ def api_tournaments():
                 "label": _tournament_label(tournament_id, None),
                 "is_active": tournament_id in active_ids,
                 "has_matches": tournament_id in played,
+                # Недели внутри кубка - переключатель над списком команд.
+                # У кубков без решафлов список пуст, и переключателя нет.
+                "weeks": sorted(weeks_by_cup.get(tournament_id, [])),
                 # Lets the switcher mark what this visitor can't open yet.
                 "locked": not _may_see_tournament(tournament_id),
             }
@@ -1149,6 +1159,64 @@ def _roster_filter(session: Session, team_id: int):
     return MatchPlayer.team_id == team_id
 
 
+def _cup_weeks(session: Session, tournament_id: int | None) -> list[int]:
+    """Недели, которые есть у этого кубка, по возрастанию. Пусто у источников
+    без недельных решафлов - там переключать нечего."""
+    if tournament_id is None:
+        return []
+    return sorted(
+        w for (w,) in session.execute(
+            select(Team.week_number)
+            .where(Team.tournament_id == tournament_id, Team.week_number.is_not(None))
+            .distinct()
+        )
+    )
+
+
+def _requested_week(session: Session, tournament_id: int | None) -> int | None:
+    """?week=<N> у списка команд, по умолчанию - последняя известная неделя.
+
+    Именно последняя, а не «все»: после решафла команды прошлой недели уже не
+    существуют, и показывать их вперемешку с нынешними значит показывать
+    полтора десятка команд, половина которых распущена."""
+    weeks = _cup_weeks(session, tournament_id)
+    if not weeks:
+        return None
+    raw = (request.args.get("week") or "").strip()
+    if raw:
+        try:
+            asked = int(raw)
+        except ValueError:
+            return weeks[-1]
+        return asked if asked in weeks else weeks[-1]
+    return weeks[-1]
+
+
+def _team_records(session: Session, tournament_id: int | None,
+                  week: int | None = None) -> dict[int, tuple[int, int]]:
+    """Побед и поражений у каждой команды кубка (и недели, если задана).
+
+    Считается по матчам с известным исходом: ничьих в доте нет, поэтому одна
+    игра всегда даёт кому-то победу, а кому-то поражение. Матчи без результата
+    (ещё не подтянулся) не считаются ни туда, ни сюда."""
+    if tournament_id is None:
+        return {}
+    query = select(Match.radiant_team_id, Match.dire_team_id, Match.radiant_win).where(
+        Match.mixer_tournament_id == tournament_id,
+        Match.radiant_win.is_not(None),
+    )
+    if week is not None:
+        query = query.where(Match.week_number == week)
+    records: dict[int, tuple[int, int]] = {}
+    for radiant_id, dire_id, radiant_win in session.execute(query):
+        for team_id, won in ((radiant_id, radiant_win), (dire_id, not radiant_win)):
+            if team_id is None:
+                continue
+            wins, losses = records.get(team_id, (0, 0))
+            records[team_id] = (wins + 1, losses) if won else (wins, losses + 1)
+    return records
+
+
 def _past_cup_teams(session: Session, tournament_id: int) -> list[dict]:
     """Sidebar for a FINISHED cup: the teams that actually played in it, under
     the names they carried then. Can't come from the Team rows - those are
@@ -1164,6 +1232,7 @@ def _past_cup_teams(session: Session, tournament_id: int) -> list[dict]:
         select(TeamTournamentName.team_id, TeamTournamentName.name)
         .where(TeamTournamentName.tournament_id == tournament_id)
     ).all())
+    records = _team_records(session, tournament_id)
     teams = [
         {
             "team_id": team_id,
@@ -1172,6 +1241,8 @@ def _past_cup_teams(session: Session, tournament_id: int) -> list[dict]:
             # No total: a finished cup's list includes every substitute who
             # passed through, and their ratings are today's (see api_team_detail).
             "total_mmr": None,
+            "wins": records.get(team_id, (0, 0))[0],
+            "losses": records.get(team_id, (0, 0))[1],
         }
         for team_id, player_count in counts.items()
         if team_id is not None and player_count > 1
@@ -1198,9 +1269,15 @@ def api_teams():
         # Живых кубков теперь может быть несколько, поэтому колонка показывает
         # команды ЗАПРОШЕННОГО кубка, а не всегда основного.
         live_scope = scope if scope is not None else active
+        # Неделя внутри кубка: у супермиксера составы тасуются каждый
+        # понедельник, и команда живёт ровно неделю (см. Team.week_number).
+        # Без номера показываем последнюю известную - то есть текущую.
+        week = _requested_week(session, live_scope)
         team_query = select(Team.team_id, Team.name).order_by(Team.name)
         if live_scope is not None:
             team_query = team_query.where(Team.tournament_id == live_scope)
+        if week is not None:
+            team_query = team_query.where(Team.week_number == week)
         teams = session.execute(team_query).all()
         if not teams and request.args.get("tournament") is None:
             # Запасной путь только для страницы по умолчанию: там пустой список
@@ -1224,6 +1301,7 @@ def api_teams():
         ):
             unlinked_by_team.setdefault(t_id, []).append(mmr)
 
+        records = _team_records(session, live_scope, week)
         result = []
         for team_id, name in teams:
             # The mixer-confirmed roster is authoritative and includes
@@ -1250,11 +1328,14 @@ def api_teams():
                 total_mmr = sum(
                     mmr for mmr in [m for _, m in rows] + extra if mmr is not None
                 ) or None
+                wins, losses = records.get(team_id, (0, 0))
                 result.append({
                     "team_id": team_id,
                     "name": name or f"Team {team_id}",
                     "player_count": len(rows) + len(extra),
                     "total_mmr": total_mmr,
+                    "wins": wins,
+                    "losses": losses,
                 })
 
     result.sort(key=lambda t: t["total_mmr"] if t["total_mmr"] is not None else -1, reverse=True)

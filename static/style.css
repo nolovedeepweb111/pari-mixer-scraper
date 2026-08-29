@@ -1026,3 +1026,9 @@ aside h2 {
   font-size: 12px;
   color: var(--muted);
 }
+
+/* Подпись к блоку, которому нельзя верить безоговорочно. */
+.warn-note {
+  border-left: 2px solid var(--bad);
+  padding-left: 8px;
+}

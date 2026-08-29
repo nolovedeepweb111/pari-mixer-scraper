@@ -1125,6 +1125,9 @@ _CAPTAIN_SLOT_PREFIX = "замена капитана"
 # в разы и вылезает наверх, - и быть заметно чаще обычной частоты этого героя.
 TARGETED_BAN_MIN_BANS = int(os.environ.get("TARGETED_BAN_MIN_BANS", "3"))
 TARGETED_BAN_MIN_LIFT = float(os.environ.get("TARGETED_BAN_MIN_LIFT", "1.6"))
+# И у самого игрока должно быть достаточно матчей, иначе «3 из 3» лезет
+# наверх как стопроцентная закономерность.
+TARGETED_BAN_MIN_GAMES = int(os.environ.get("TARGETED_BAN_MIN_GAMES", "5"))
 
 
 # Разбор всех банов стоит одинаково для любого игрока (около 300 мс на боевой
@@ -1148,6 +1151,7 @@ def _targeted_bans_for(account_id: int) -> list[dict]:
         rows = compute_targeted_bans(
             session, account_id, context=context,
             min_bans=TARGETED_BAN_MIN_BANS, min_lift=TARGETED_BAN_MIN_LIFT,
+            min_games=TARGETED_BAN_MIN_GAMES,
         )
     for row in rows:
         row["hero_icon"] = _hero_icon_url(row.pop("hero_key", ""))
@@ -2202,6 +2206,20 @@ def api_team_analysis(team_id: int):
             min_games=PLAYER_HERO_MIN_GAMES, min_win_rate=PLAYER_HERO_MIN_WIN_RATE,
         )
 
+    # Кого банят каждому из состава - тот же расчёт, что на странице игрока
+    # (см. build_ban_context). Общая часть берётся из кэша, так что пять
+    # игроков стоят почти столько же, сколько один.
+    player_bans = []
+    if not pools_locked:
+        for account_id, player_name in sorted(roster.items(), key=lambda kv: kv[1].lower()):
+            bans = _targeted_bans_for(account_id)
+            if bans:
+                player_bans.append({
+                    "account_id": account_id,
+                    "name": player_name,
+                    "heroes": bans,
+                })
+
     by_player: dict[int, list] = {}
     for hero in signature:
         by_player.setdefault(hero["account_id"], []).append({
@@ -2219,6 +2237,7 @@ def api_team_analysis(team_id: int):
     ]
 
     return jsonify({
+        "player_bans": player_bans,
         "player_heroes": player_heroes,
         "player_heroes_locked": pools_locked,
         "player_heroes_min_games": PLAYER_HERO_MIN_GAMES,

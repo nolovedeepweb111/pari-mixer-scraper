@@ -562,6 +562,29 @@ async function renderAnalysisTab(teamId, container, scope) {
           .join("")
       : `<span class="hint">ни у кого нет героя с ${a.player_heroes_min_games}+ играми и винрейтом выше ${a.player_heroes_min_win_rate}%</span>`;
 
+  // Кого банят игрокам этой команды. Оценка по банам соперника (см.
+  // build_ban_context на сервере), поэтому блок идёт с предупреждением: тут
+  // сказано не «так есть», а «так похоже».
+  const playerBansHtml = a.player_heroes_locked
+    ? '<span class="hint">по ключу — здесь видно, кого сопернику приходится банить</span>'
+    : (a.player_bans && a.player_bans.length)
+      ? a.player_bans
+          .map((p) => {
+            const tags = p.heroes
+              .map((h) => {
+                const own = h.played ? `сыграл ${h.played}` : "сыграть не дали";
+                return `<span class="tag tag-ban"><img class="hero-icon" src="${escapeHtml(h.hero_icon)}" alt="" loading="lazy" onerror="this.remove()">${escapeHtml(h.hero)} — ${h.bans} из ${h.games}, обычно ${h.base_rate}% · ${own}</span>`;
+              })
+              .join("");
+            return `
+              <div class="player-heroes-row">
+                <button class="player-link" data-account-id="${p.account_id}">${escapeHtml(p.name)}</button>
+                <div class="tag-list">${tags}</div>
+              </div>`;
+          })
+          .join("")
+      : '<span class="hint">никому ничего не банят заметно чаще обычного</span>';
+
   container.innerHTML = `
     <!-- Assembled on the server, but out of the team's name - so it carries
          whatever the captain called their team. -->
@@ -591,6 +614,15 @@ async function renderAnalysisTab(teamId, container, scope) {
         <h4>Лучшие герои игроков</h4>
         <p class="hint">От ${a.player_heroes_min_games} игр и винрейта выше ${a.player_heroes_min_win_rate}%, по всем турнирам.</p>
         ${playerHeroesHtml}
+      </div>
+      <div class="analysis-block analysis-block-wide">
+        <h4>⚠️ Кого им банят</h4>
+        <p class="hint warn-note">Это оценка, а не факт: считается по тому, каких
+           героев соперник забирает баном в матчах игрока чаще обычного. Бан мог
+           быть нацелен и на соседа по составу, и просто в мету. Полагаться на
+           этот блок стоит с осторожностью — но он показывает то, чего не видно
+           в пуле героев: героя, которого игроку не дают взять.</p>
+        ${playerBansHtml}
       </div>
     </div>
   `;

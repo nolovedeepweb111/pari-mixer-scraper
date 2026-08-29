@@ -400,9 +400,11 @@ function renderComposition(team) {
     nextLine.innerHTML = `Следующий соперник: ${opponentLabel} · ${when}`;
     const link = nextLine.querySelector(".opponent-link");
     if (link) {
-      // Always the live cup: the next opponent only exists there.
+      // Кубок, который сейчас открыт, а не кубок по умолчанию: живых теперь
+      // два (PARI и супермиксер), и переход к следующему сопернику
+      // выбрасывал из супермиксера в PARI.
       link.addEventListener("click", () =>
-        navigate(cupPath(cups.activeId, `team/${opp.opponent_team_id}`)));
+        navigate(cupPath(currentCupId(), `team/${opp.opponent_team_id}`)));
     }
     container.appendChild(nextLine);
   }
@@ -842,8 +844,10 @@ async function loadPlayerPage(accountId) {
     // A row from a past cup carries that cup's id, so the link points at that
     // cup's address and opens the squad that actually played the match.
     const tid = link.dataset.tournamentId;
+    // Без своего номера строка относится к открытому кубку - опять же не к
+    // кубку по умолчанию, иначе ссылка уводит в чужой турнир.
     link.addEventListener("click", () =>
-      navigate(cupPath(tid ? Number(tid) : cups.activeId, `team/${link.dataset.teamId}`)));
+      navigate(cupPath(tid ? Number(tid) : currentCupId(), `team/${link.dataset.teamId}`)));
   }
   for (const row of detailEl.querySelectorAll(".match-row")) {
     row.addEventListener("click", (e) => {

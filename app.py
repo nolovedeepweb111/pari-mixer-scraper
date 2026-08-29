@@ -19,7 +19,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
 from pari_mixer_scraper.analysis import (
-    compute_player_signature_heroes, compute_team_stats, generate_coach_text,
+    build_ban_context, compute_player_signature_heroes, compute_targeted_bans,
+    compute_team_stats,
+    generate_coach_text,
 )
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID
 from pari_mixer_scraper.sources import (
@@ -1118,6 +1120,40 @@ def _requested_tournament(team: Team) -> tuple[int | None, bool]:
 # несвязанного игрока - ничего не сломается.
 _CAPTAIN_SLOT_PREFIX = "замена капитана"
 
+# Пороги для блока «Кого ему банят» на странице игрока. Бан должен встретиться
+# хотя бы TARGETED_BAN_MIN_BANS раз - иначе одна случайная игра даёт кратность
+# в разы и вылезает наверх, - и быть заметно чаще обычной частоты этого героя.
+TARGETED_BAN_MIN_BANS = int(os.environ.get("TARGETED_BAN_MIN_BANS", "3"))
+TARGETED_BAN_MIN_LIFT = float(os.environ.get("TARGETED_BAN_MIN_LIFT", "1.6"))
+
+
+# Разбор всех банов стоит одинаково для любого игрока (около 300 мс на боевой
+# базе) и зависит только от данных, а те меняются раз в цикл сбора. Поэтому
+# считаем его раз и держим в памяти: иначе каждая страница игрока платила бы
+# эти 300 мс заново, а воркер у нас один.
+_BAN_CONTEXT_TTL_SECONDS = int(os.environ.get("BAN_CONTEXT_TTL_SECONDS", "300"))
+_ban_context_lock = threading.Lock()
+_ban_context = None
+_ban_context_expires_at = 0.0
+
+
+def _targeted_bans_for(account_id: int) -> list[dict]:
+    global _ban_context, _ban_context_expires_at
+    with Session(engine) as session:
+        with _ban_context_lock:
+            if _ban_context is None or time.monotonic() >= _ban_context_expires_at:
+                _ban_context = build_ban_context(session)
+                _ban_context_expires_at = time.monotonic() + _BAN_CONTEXT_TTL_SECONDS
+            context = _ban_context
+        rows = compute_targeted_bans(
+            session, account_id, context=context,
+            min_bans=TARGETED_BAN_MIN_BANS, min_lift=TARGETED_BAN_MIN_LIFT,
+        )
+    for row in rows:
+        row["hero_icon"] = _hero_icon_url(row.pop("hero_key", ""))
+    return rows
+
+
 # Пороги для блока «Лучшие герои игроков» на вкладке аналитики.
 PLAYER_HERO_MIN_GAMES = int(os.environ.get("PLAYER_HERO_MIN_GAMES", "4"))
 PLAYER_HERO_MIN_WIN_RATE = int(os.environ.get("PLAYER_HERO_MIN_WIN_RATE", "60"))
@@ -1731,6 +1767,11 @@ def api_player_detail(account_id: int):
         # counted-up pool is what's held back.
         visible_pools = []
 
+    # Кого ему банят. Считается по всем кубкам сразу: чем больше матчей, тем
+    # надёжнее оценка, а игрок один и тот же. Закрыто ключом наравне с пулами -
+    # это ровно та работа, ради которой сайт и покупают.
+    targeted_bans = [] if pools_locked else _targeted_bans_for(account_id)
+
     return jsonify({
         "account_id": account_id,
         "name": name or f"account {account_id}",
@@ -1747,6 +1788,8 @@ def api_player_detail(account_id: int):
         "locked_tournaments": len(hero_pools) - len(visible_pools) if not pools_locked else 0,
         "current_team_locked": bool(current_team) and not show_current_team,
         "hero_pools_locked": pools_locked,
+        "targeted_bans": targeted_bans,
+        "targeted_bans_min_lift": TARGETED_BAN_MIN_LIFT,
     })
 
 

@@ -8,6 +8,11 @@ from sqlalchemy.orm import Session
 
 from .models import Hero, Match, MatchDraftEntry, MatchPlayer
 
+# Насколько соотношение у сокомандника должно превосходить наше, чтобы отдать
+# герой ему. Не 1.0: перевес в пару процентов ничего не значит и просто отбирал
+# бы у игрока его же героя.
+RIVAL_MARGIN = 1.25
+
 
 class TeamStats(TypedDict):
     games: int
@@ -183,6 +188,181 @@ def compute_player_signature_heroes(
         })
     # Best first, and a longer sample breaks ties: 5/5 says more than 3/4.
     out.sort(key=lambda h: (-h["win_rate"], -h["games"]))
+    return out
+
+
+class BanContext(TypedDict):
+    """Разбор банов по всей базе - общая часть расчёта «кого ему банят».
+
+    Вынесена отдельно, потому что стоит она одинаково для любого игрока
+    (перебор всех драфтов и составов, порядка 300 мс на боевой базе), а
+    зависит только от данных. Вызывающий считает её раз и переиспользует."""
+    total_matches: int
+    banned_in_matches: Counter
+    games_by_player: Counter
+    against_by_player: dict[int, Counter]
+    hero_names: dict[int, str]
+    hero_keys: dict[int, str]
+
+
+def build_ban_context(session: Session,
+                      mixer_tournament_id: int | None = None) -> BanContext:
+    """Каких героев соперники банят ИМЕННО против этого игрока.
+
+    Зачем: сильнейший герой игрока может не попадать в его статистику вовсе -
+    именно потому, что его забирают баном. Пример, с которого всё началось:
+    Earth Spirit банили в 7 из 10 его игр при обычной частоте банов 17%, а
+    сыграть дали трижды. По пулу героев такого не увидеть, по банам - видно.
+
+    Как считаем. Берём матчи игрока, где известен драфт, и смотрим только те
+    баны, которые сделала КОМАНДА СОПЕРНИКА - свои баны про соперника, а не про
+    него. Частоту сравниваем с тем, как часто этого героя банят вообще:
+    Invoker банят почти всегда и это ничего не значит про конкретного человека,
+    а Earth Spirit - нет.
+
+    Отдельная забота - сокомандники: бан мог быть нацелен на соседа по составу.
+    Разбираем это двумя правилами. Если игрок сам играет этого героя, герой
+    остаётся за ним: собственные игры - прямое свидетельство, и неважно, что
+    сосед тоже под него попадает (банят обоих). Если же не играет ни разу, то
+    отдаём героя сокоманднику, у которого соотношение ЗАМЕТНО выше - иначе
+    любой перевес на пару процентов отбирал бы у человека его же героя.
+
+    Работает это благодаря самим миксам: составы тасуются, соседи всё время
+    разные, а постоянная величина в его матчах - он сам.
+
+    Это оценка, а не факт: настоящую причину бана знает только тот, кто банил.
+    """
+    match_filter = [MatchDraftEntry.is_pick.is_(False)]
+    drafted_query = select(MatchDraftEntry.match_id).distinct()
+    sides_query = select(Match.match_id, Match.radiant_team_id, Match.dire_team_id)
+    if mixer_tournament_id is not None:
+        drafted_query = drafted_query.join(
+            Match, Match.match_id == MatchDraftEntry.match_id
+        ).where(Match.mixer_tournament_id == mixer_tournament_id)
+        sides_query = sides_query.where(Match.mixer_tournament_id == mixer_tournament_id)
+
+    drafted = {m for (m,) in session.execute(drafted_query)}
+    if not drafted:
+        return []
+    sides = {
+        match_id: (radiant, dire)
+        for match_id, radiant, dire in session.execute(sides_query)
+        if match_id in drafted
+    }
+
+    # Кого банили в каждом матче: (матч, команда-жертва) -> {герои}.
+    # У записи драфта хранится команда, которая банила, а нас интересует
+    # сторона, ПРОТИВ которой бан, - это вторая команда матча.
+    banned_against: dict[tuple[int, int], set[int]] = {}
+    banned_in_matches: Counter = Counter()
+    for match_id, hero_id, banning_team in session.execute(
+        select(MatchDraftEntry.match_id, MatchDraftEntry.hero_id, MatchDraftEntry.team_id)
+        .where(*match_filter)
+    ):
+        if match_id not in sides or hero_id is None:
+            continue
+        radiant, dire = sides[match_id]
+        victim = dire if banning_team == radiant else radiant if banning_team == dire else None
+        if victim is None:
+            continue
+        banned_against.setdefault((match_id, victim), set()).add(hero_id)
+    for (match_id, _victim), heroes in banned_against.items():
+        for hero_id in heroes:
+            banned_in_matches[hero_id] += 1
+
+    # Сколько матчей у каждого игрока и сколько раз против него банили героя.
+    games_by_player: Counter = Counter()
+    against_by_player: dict[int, Counter] = {}
+    for match_id, player_id, team_id in session.execute(
+        select(MatchPlayer.match_id, MatchPlayer.account_id, MatchPlayer.team_id)
+    ):
+        if match_id not in sides:
+            continue
+        games_by_player[player_id] += 1
+        for hero_id in banned_against.get((match_id, team_id), ()):
+            against_by_player.setdefault(player_id, Counter())[hero_id] += 1
+
+    return BanContext(
+        total_matches=len(sides),
+        banned_in_matches=banned_in_matches,
+        games_by_player=games_by_player,
+        against_by_player=against_by_player,
+        hero_names=dict(session.execute(select(Hero.hero_id, Hero.localized_name)).all()),
+        hero_keys=dict(session.execute(select(Hero.hero_id, Hero.name)).all()),
+    )
+
+
+def compute_targeted_bans(
+    session: Session,
+    account_id: int,
+    min_bans: int = 3,
+    min_lift: float = 1.6,
+    mixer_tournament_id: int | None = None,
+    context: BanContext | None = None,
+) -> list[dict]:
+    """Каких героев соперники банят именно против этого игрока - см.
+    build_ban_context, где описан и сам приём, и его ограничения. context
+    передаётся, когда общая часть уже посчитана и переиспользуется."""
+    ctx = context if context is not None else build_ban_context(session, mixer_tournament_id)
+    total_matches = ctx["total_matches"]
+    banned_in_matches = ctx["banned_in_matches"]
+    games_by_player = ctx["games_by_player"]
+    against_by_player = ctx["against_by_player"]
+    if not total_matches:
+        return []
+
+    own_games = games_by_player.get(account_id, 0)
+    if own_games == 0:
+        return []
+
+    def lift_of(player_id: int, hero_id: int) -> float:
+        games = games_by_player.get(player_id, 0)
+        if not games:
+            return 0.0
+        base = banned_in_matches.get(hero_id, 0) / total_matches
+        if base <= 0:
+            return 0.0
+        return (against_by_player.get(player_id, Counter()).get(hero_id, 0) / games) / base
+
+    played = dict(session.execute(
+        select(MatchPlayer.hero_id, func.count())
+        .where(MatchPlayer.account_id == account_id)
+        .group_by(MatchPlayer.hero_id)
+    ).all())
+    hero_names = ctx["hero_names"]
+    hero_keys = ctx["hero_keys"]
+
+    out: list[dict] = []
+    for hero_id, bans in against_by_player.get(account_id, Counter()).items():
+        if bans < min_bans:
+            continue
+        lift = lift_of(account_id, hero_id)
+        if lift < min_lift:
+            continue
+        # Чужой бан себе не приписываем - но только когда своих игр на герое
+        # нет вовсе. Если игрок на нём играет, герой его, даже если сосед по
+        # составу попадает под тот же бан.
+        if not played.get(hero_id):
+            rival_best = max(
+                (lift_of(other, hero_id) for other in against_by_player
+                 if other != account_id and games_by_player.get(other, 0) >= min_bans),
+                default=0.0,
+            )
+            if rival_best > lift * RIVAL_MARGIN:
+                continue
+        base = banned_in_matches.get(hero_id, 0) / total_matches
+        out.append({
+            "hero_id": hero_id,
+            "hero": hero_names.get(hero_id, str(hero_id)),
+            "hero_key": hero_keys.get(hero_id, ""),
+            "bans": bans,
+            "games": own_games,
+            "ban_rate": round(100 * bans / own_games),
+            "base_rate": round(100 * base),
+            "lift": round(lift, 1),
+            "played": played.get(hero_id, 0),
+        })
+    out.sort(key=lambda h: (-h["lift"], -h["bans"]))
     return out
 
 

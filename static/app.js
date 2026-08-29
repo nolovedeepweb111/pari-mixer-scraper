@@ -852,6 +852,29 @@ async function loadPlayerPage(accountId) {
           .join("")
       : emptyPools("нет сыгранных матчей");
 
+  // Кого ему банят: герои, которых соперник забирает баном заметно чаще, чем
+  // их банят вообще. Смысл блока в том, что сильнейший герой может не попасть
+  // в пул выше именно потому, что сыграть его не дают.
+  const banRows = (p.targeted_bans || [])
+    .map((b) => {
+      const icon = b.hero_icon
+        ? `<img class="hero-icon" src="${escapeHtml(b.hero_icon)}" alt="" loading="lazy" onerror="this.remove()">`
+        : "";
+      const own = b.played ? `сыграл ${b.played}` : "сыграть не дали";
+      return `<span class="tag tag-hero tag-ban">${icon}<span>${escapeHtml(b.hero)} — ` +
+        `${b.bans} из ${b.games} игр, обычно ${b.base_rate}% · ${own}</span></span>`;
+    })
+    .join("");
+  const targetedBansHtml = p.hero_pools_locked
+    ? ""
+    : `<div class="analysis-block player-heroes-block">
+         <h4>Кого ему банят</h4>
+         <div class="tag-list">${banRows || '<span class="hint">ничего не банят заметно чаще обычного</span>'}</div>
+         <p class="hint">Оценка по банам соперника в его матчах: насколько чаще
+            героя забирают именно против него, чем банят вообще. Сокомандники
+            учтены — чужие цели отсеиваются.</p>
+       </div>`;
+
   let lastLabel = null;
   const matchRows = p.matches
     .map((m) => {
@@ -899,6 +922,7 @@ async function loadPlayerPage(accountId) {
       </div>
       <aside class="player-pools">
         ${heroPoolsHtml}
+      ${targetedBansHtml}
         <div class="analysis-block player-notes-block" id="player-notes"></div>
       </aside>
     </div>

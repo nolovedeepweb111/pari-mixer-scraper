@@ -1054,3 +1054,18 @@ aside h2 {
 .sort-btn:hover { background: var(--panel); color: var(--text); }
 .sort-btn.active { background: var(--accent); color: #fff; }
 .sort-btn.active:hover { background: var(--accent-hover); }
+
+/* Заголовок колонки и сортировка в одну строку. Перенос разрешён: в узкой
+   колонке пара кнопок помещается впритык, и при другом шрифте лучше пусть
+   съедет на строку ниже, чем обрежется. */
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.sidebar-head h2 { margin: 0; }
+/* В строке заголовка кнопки чуть компактнее, чем были сами по себе. */
+.sidebar-head .sort-btn { padding: 4px 10px; }

@@ -309,6 +309,11 @@ function sortTeams(teams) {
   return teams.slice().sort(byMmr);
 }
 
+function clearSortSlot() {
+  const slot = document.getElementById("team-sort-slot");
+  if (slot) slot.innerHTML = "";
+}
+
 // Переключатели над списком: неделя (если кубок с решафлами) и сортировка.
 // Неделя осталась выпадающим списком - их со временем станет много, кнопками
 // такое не выложить. Сортировка - две кнопки: вариантов всего два, и нажатие
@@ -323,27 +328,28 @@ function renderTeamControls(tournamentId, weeks) {
          </select>
        </label>`
     : "";
-  bar.innerHTML = `
-    ${weekPart}
-    <div class="sort-toggle" role="group" aria-label="Сортировка команд">
-      <button class="sort-btn${teamSort === "mmr" ? " active" : ""}" data-sort="mmr">MMR</button>
-      <button class="sort-btn${teamSort === "wins" ? " active" : ""}" data-sort="wins">Победы</button>
-    </div>
-  `;
+  bar.innerHTML = weekPart;
+  // Сортировка живёт в строке заголовка, а не здесь: см. .sidebar-head.
+  const slot = document.getElementById("team-sort-slot");
+  if (slot) {
+    slot.innerHTML = `
+      <div class="sort-toggle" role="group" aria-label="Сортировка команд">
+        <button class="sort-btn${teamSort === "mmr" ? " active" : ""}" data-sort="mmr">MMR</button>
+        <button class="sort-btn${teamSort === "wins" ? " active" : ""}" data-sort="wins">Победы</button>
+      </div>`;
+    for (const btn of slot.querySelectorAll(".sort-btn")) {
+      btn.addEventListener("click", () => {
+        if (btn.dataset.sort === teamSort) return;
+        teamSort = btn.dataset.sort;
+        renderTeamList();
+      });
+    }
+  }
   const weekSel = bar.querySelector("#week-select");
   if (weekSel) weekSel.addEventListener("change", () => {
     selectedWeek = Number(weekSel.value);
     loadTeams(tournamentId);
   });
-  for (const btn of bar.querySelectorAll(".sort-btn")) {
-    btn.addEventListener("click", () => {
-      if (btn.dataset.sort === teamSort) return;
-      teamSort = btn.dataset.sort;
-      // Порядок - дело фронтенда, данные те же: перерисовываем из того, что уже
-      // получено, вместо повторного запроса к серверу.
-      renderTeamList();
-    });
-  }
   return bar;
 }
 
@@ -364,12 +370,14 @@ async function loadTeams(tournamentId) {
   if (!Array.isArray(teams)) {
     // Locked cup (403) - the panel in the main area explains it.
     teamsEl.innerHTML = '<p class="hint">Список команд — по ключу.</p>';
+    clearSortSlot();
     sidebarTournamentId = undefined;
     lastTeamList = null;
     return;
   }
   if (teams.length === 0) {
     teamsEl.innerHTML = '<p class="hint">Нет данных. Обновляется автоматически, зайдите чуть позже.</p>';
+    clearSortSlot();
     lastTeamList = null;
     return;
   }
@@ -385,8 +393,11 @@ function renderTeamList() {
   const { tournamentId, teams, weeks } = lastTeamList;
   teamsEl.innerHTML = "";
 
-  if (weeks.length > 1 || teams.length > 1) {
-    teamsEl.appendChild(renderTeamControls(tournamentId, weeks));
+  if (teams.length > 1) {
+    // renderTeamControls заодно наполняет строку заголовка сортировкой, поэтому
+    // вызывается всегда; сам он добавляет в колонку только выбор недели.
+    const bar = renderTeamControls(tournamentId, weeks);
+    if (bar.innerHTML.trim()) teamsEl.appendChild(bar);
   }
 
   for (const team of sortTeams(teams)) {

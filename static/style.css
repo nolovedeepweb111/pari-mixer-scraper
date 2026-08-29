@@ -1069,3 +1069,37 @@ aside h2 {
 .sidebar-head h2 { margin: 0; }
 /* В строке заголовка кнопки чуть компактнее, чем были сами по себе. */
 .sidebar-head .sort-btn { padding: 4px 10px; }
+
+/* История матчей игрока: по сворачиваемому блоку на турнир. */
+.match-group {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 10px;
+  background: var(--panel);
+}
+.match-group > summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  font-weight: 600;
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.match-group > summary::-webkit-details-marker { display: none; }
+.match-group > summary::before {
+  content: "▸";
+  color: var(--muted);
+  margin-right: 8px;
+  font-weight: 400;
+}
+.match-group[open] > summary::before { content: "▾"; }
+.match-group > summary:hover { color: var(--accent); }
+.match-group-meta {
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.match-group .subs-table { margin: 0; }

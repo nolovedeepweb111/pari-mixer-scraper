@@ -39,6 +39,16 @@ let lastTeamList = null; // последний полученный список
 // them if so. Filled from /api/auth/status before the first render.
 let access = { enabled: false, authenticated: true, publicArchive: false, offer: null };
 
+// «1 матч / 2 матча / 5 матчей» - иначе заголовок группы читается как отчёт.
+function plural(n, one, few, many) {
+  const mod100 = n % 100;
+  if (mod100 >= 11 && mod100 <= 14) return many;
+  const mod10 = n % 10;
+  if (mod10 === 1) return one;
+  if (mod10 >= 2 && mod10 <= 4) return few;
+  return many;
+}
+
 function cupIsLocked(tournamentId) {
   const cup = cups.byId.get(tournamentId);
   return !!(cup && cup.locked);
@@ -940,9 +950,7 @@ async function loadPlayerPage(accountId) {
             учтены — чужие цели отсеиваются.</p>
        </div>`;
 
-  let lastLabel = null;
-  const matchRows = p.matches
-    .map((m) => {
+  const matchRowHtml = (m) => {
       const when = m.start_time
         ? new Date(m.start_time * 1000).toLocaleDateString("ru-RU", { day: "numeric", month: "short" })
         : "";
@@ -952,15 +960,7 @@ async function loadPlayerPage(accountId) {
       const formerBadge = (p.current_team_id != null && m.team_id !== p.current_team_id)
         ? ' <span class="former-team-badge">прошлая команда</span>'
         : "";
-      // Divider row whenever the tournament changes (matches are newest-first,
-      // so each tournament forms one contiguous block).
-      let divider = "";
-      if (m.tournament_label && m.tournament_label !== lastLabel) {
-        lastLabel = m.tournament_label;
-        divider = `<tr class="tournament-divider"><td colspan="5">${escapeHtml(m.tournament_label)}</td></tr>`;
-      }
       return `
-        ${divider}
         <tr class="match-row" data-match-id="${m.match_id}" title="Открыть страницу матча">
           <td class="subs-date">${when}</td>
           <td>${escapeHtml(m.hero)}</td>
@@ -969,6 +969,32 @@ async function loadPlayerPage(accountId) {
           <td>против ${escapeHtml(m.opponent_name)}</td>
         </tr>
       `;
+  };
+
+  // История по турнирам, каждый - сворачиваемый блок. Раньше это была одна
+  // простыня со строками-разделителями: у игрока с несколькими кубками она
+  // разрослась так, что до пулов героев приходилось листать. Открытым остаётся
+  // самый свежий турнир, остальные сворачиваются - развернуть можно любой.
+  const groups = [];
+  for (const m of p.matches) {
+    const label = m.tournament_label || "Прочие матчи";
+    const last = groups[groups.length - 1];
+    if (last && last.label === label) last.matches.push(m);
+    else groups.push({ label, matches: [m] });
+  }
+  const matchGroups = groups
+    .map((g, i) => {
+      const wins = g.matches.filter((m) => m.won === true).length;
+      const losses = g.matches.filter((m) => m.won === false).length;
+      const score = wins + losses ? ` · ${wins}–${losses}` : "";
+      return `
+        <details class="match-group"${i === 0 ? " open" : ""}>
+          <summary>${escapeHtml(g.label)} <span class="match-group-meta">${g.matches.length} ${plural(g.matches.length, "матч", "матча", "матчей")}${score}</span></summary>
+          <table class="subs-table">
+            <thead><tr><th>Дата</th><th>Герой</th><th>Результат</th><th>За команду</th><th>Соперник</th></tr></thead>
+            <tbody>${g.matches.map(matchRowHtml).join("")}</tbody>
+          </table>
+        </details>`;
     })
     .join("");
 
@@ -979,11 +1005,7 @@ async function loadPlayerPage(accountId) {
     <div class="player-body">
       <div class="player-history">
         <h3 class="history-title">История матчей</h3>
-        ${p.matches.length ? `
-          <table class="subs-table">
-            <thead><tr><th>Дата</th><th>Герой</th><th>Результат</th><th>За команду</th><th>Соперник</th></tr></thead>
-            <tbody>${matchRows}</tbody>
-          </table>` : '<p class="hint">Матчей пока нет.</p>'}
+        ${p.matches.length ? matchGroups : '<p class="hint">Матчей пока нет.</p>'}
       </div>
       <aside class="player-pools">
         ${heroPoolsHtml}

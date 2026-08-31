@@ -1722,7 +1722,12 @@ def _sync_mixer_source(session: Session, src, od_client: OpenDotaClient,
             link_mixercup_data(session, mixer_client, pid, progress, apply_rosters=False)
     except Exception as e:
         session.rollback()
-        progress(f"[{src.key}] sync failed ({e}); this source is skipped this run.")
+        # Тип и текст в ОДНОЙ строке: у SQLAlchemy полезная часть ("UNIQUE
+        # constraint failed: ...") лежит во второй строке сообщения, и в логе её
+        # легко потерять - именно так падение супермиксера сутки выглядело как
+        # безобидная жалоба на autoflush.
+        detail = " ".join(str(e).split())[:300]
+        progress(f"[{src.key}] sync failed ({type(e).__name__}: {detail}); this source is skipped this run.")
         return None
 
     return active_id

@@ -28,6 +28,11 @@ def build_engine(db_path: str, poolclass=None) -> Engine:
     return create_engine(f"sqlite:///{db_path}", **kwargs)
 
 
+# Таблицы, которые можно молча пересоздать при смене первичного ключа: они не
+# хранят ничего, чего нельзя собрать заново из mixer-cup за один цикл.
+_REBUILD_IF_PK_CHANGED = {"unlinked_roster_players", "unavailable_matches"}
+
+
 def ensure_schema(engine: Engine) -> None:
     """Adds columns introduced after a database file was first created.
 
@@ -42,6 +47,19 @@ def ensure_schema(engine: Engine) -> None:
 
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
+
+    # Таблицы, у которых поменялся первичный ключ, пересоздаём: ALTER TABLE в
+    # SQLite так не умеет, а обе эти таблицы целиком перестраиваются из внешних
+    # источников на каждом сборе, так что терять нечего.
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables or table.name not in _REBUILD_IF_PK_CHANGED:
+            continue
+        have = set(inspector.get_pk_constraint(table.name)["constrained_columns"])
+        want = {c.name for c in table.primary_key.columns}
+        if have and have != want:
+            table.drop(engine)
+            existing_tables.discard(table.name)
+    Base.metadata.create_all(engine)
     for table in Base.metadata.sorted_tables:
         if table.name not in existing_tables:
             continue  # create_all just built it, with every column
@@ -156,12 +174,18 @@ class UnlinkedRosterPlayer(Base):
     настоящего. Ник, рейтинг и роли mixer-cup при этом отдаёт - их и храним
     здесь, чтобы показать карточку без статистики, а не спрятать человека.
 
-    Ключ - идентификатор игрока у mixer-cup, а не account_id, которого нет.
+    Ключ - ПАРА «игрок + команда». Не один только идентификатор игрока: у
+    источников с еженедельными решафлами один и тот же человек состоит в
+    команде первой недели и в команде второй, а mixer-cup выдаёт ему один и тот
+    же идентификатор. С ключом по игроку вставка строки для новой недели
+    упиралась в строку прошлой, и синхронизация всего источника обрывалась -
+    матчи новой недели переставали появляться вовсе.
+
     Перестраивается из mixer-cup на каждом сборе, поэтому бэкап не нужен."""
     __tablename__ = "unlinked_roster_players"
 
     mixer_player_id: Mapped[str] = mapped_column(primary_key=True)
-    team_id: Mapped[int] = mapped_column(ForeignKey("teams.team_id"), index=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.team_id"), primary_key=True)
     tournament_id: Mapped[int | None] = mapped_column(nullable=True)
     nickname: Mapped[str | None]
     mmr: Mapped[float | None]

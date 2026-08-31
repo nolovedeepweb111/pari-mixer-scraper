@@ -30,6 +30,7 @@ from pari_mixer_scraper.sources import (
 from pari_mixer_scraper.mixercup_client import MixerCupClient, pair_substitution_events
 from pari_mixer_scraper.models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, PlayerNote, QueuedPlayer,
+    TeamWeekName,
     UnlinkedRosterPlayer,
     TeamTournamentName,
     SubstitutionEvent, Team,
@@ -1118,12 +1119,22 @@ def _get_substitution_history(session: Session, team_id: int,
 
 
 def _team_name_in_tournament(session: Session, team_id: int | None,
-                             tournament_id: int | None) -> str | None:
-    """What this Steam team_id was called in that tournament, falling back to
-    its current name. Steam ids are recycled between cups, so Teams.name is
-    the wrong label for anything shown against an older cup."""
+                             tournament_id: int | None,
+                             week: int | None = None) -> str | None:
+    """What this Steam team_id was called in that tournament - and, when the
+    week is known, in that week.
+
+    Steam ids are recycled between cups AND, at sources with weekly
+    reshuffles, between weeks: 10232528 was Team BAXA in week one of the super
+    mixer and Team VaniLLl in week two. Teams.name holds only the current
+    owner, so anything shown against an older match needs the name of its own
+    week first, then of its own cup, and only then today's."""
     if team_id is None:
         return None
+    if tournament_id is not None and week is not None:
+        row = session.get(TeamWeekName, (team_id, tournament_id, week))
+        if row is not None:
+            return row.name
     if tournament_id is not None:
         row = session.get(TeamTournamentName, (team_id, tournament_id))
         if row is not None:
@@ -1308,22 +1319,34 @@ def _team_records(session: Session, tournament_id: int | None,
     return records
 
 
-def _past_cup_teams(session: Session, tournament_id: int) -> list[dict]:
-    """Sidebar for a FINISHED cup: the teams that actually played in it, under
-    the names they carried then. Can't come from the Team rows - those are
-    owned by whichever cup last reused their Steam ids - so it's built from
-    that cup's own matches."""
+def _past_cup_teams(session: Session, tournament_id: int,
+                    week: int | None = None) -> list[dict]:
+    """Sidebar for a FINISHED cup - or for a week that has already been
+    reshuffled: the teams that actually played then, under the names they
+    carried then. Can't come from the Team rows - those are owned by whichever
+    cup, and now whichever week, last reused their Steam ids - so it's built
+    from that period's own matches."""
+    scope = [Match.mixer_tournament_id == tournament_id]
+    if week is not None:
+        scope.append(Match.week_number == week)
     counts = dict(session.execute(
         select(MatchPlayer.team_id, func.count(func.distinct(MatchPlayer.account_id)))
         .join(Match, Match.match_id == MatchPlayer.match_id)
-        .where(Match.mixer_tournament_id == tournament_id)
+        .where(*scope)
         .group_by(MatchPlayer.team_id)
     ).all())
-    names = dict(session.execute(
-        select(TeamTournamentName.team_id, TeamTournamentName.name)
-        .where(TeamTournamentName.tournament_id == tournament_id)
-    ).all())
-    records = _team_records(session, tournament_id)
+    if week is not None:
+        names = dict(session.execute(
+            select(TeamWeekName.team_id, TeamWeekName.name)
+            .where(TeamWeekName.tournament_id == tournament_id,
+                   TeamWeekName.week_number == week)
+        ).all())
+    else:
+        names = dict(session.execute(
+            select(TeamTournamentName.team_id, TeamTournamentName.name)
+            .where(TeamTournamentName.tournament_id == tournament_id)
+        ).all())
+    records = _team_records(session, tournament_id, week)
     teams = [
         {
             "team_id": team_id,
@@ -1364,6 +1387,13 @@ def api_teams():
         # понедельник, и команда живёт ровно неделю (см. Team.week_number).
         # Без номера показываем последнюю известную - то есть текущую.
         week = _requested_week(session, live_scope)
+        # Прошедшая неделя собирается по своим матчам: после решафла её команды
+        # уже не владеют строками - тот же Steam-идентификатор достался команде
+        # текущей недели (см. TeamWeekName).
+        weeks = _cup_weeks(session, live_scope)
+        if week is not None and weeks and week != weeks[-1]:
+            return jsonify(_past_cup_teams(session, live_scope, week))
+
         team_query = select(Team.team_id, Team.name).order_by(Team.name)
         if live_scope is not None:
             team_query = team_query.where(Team.tournament_id == live_scope)
@@ -1589,7 +1619,7 @@ def api_team_detail(team_id: int):
         recent_drafts = _recent_drafts(session, team_id, tournament_id)
         last_match_lineup = _last_match_lineup(session, team_id, tournament_id)
         mixer_uuid = team.mixer_uuid
-        team_name = _team_name_in_tournament(session, team_id, tournament_id)
+        team_name = _team_name_in_tournament(session, team_id, tournament_id, team.week_number)
 
         # Confirmed roster members with no matches yet (fresh substitutes)
         # have no MatchPlayer rows, so the inner-join query above misses
@@ -1733,6 +1763,7 @@ def api_player_detail(account_id: int):
                 MatchPlayer.is_radiant, MatchPlayer.team_id,
                 Match.radiant_team_id, Match.dire_team_id,
                 Hero.localized_name, Match.league_id, Match.mixer_tournament_id,
+                Match.week_number,
             )
             .join(MatchPlayer, MatchPlayer.match_id == Match.match_id)
             .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
@@ -1753,6 +1784,14 @@ def api_player_detail(account_id: int):
             (r.team_id, r.tournament_id): r.name
             for r in session.execute(
                 select(TeamTournamentName).where(TeamTournamentName.team_id.in_(involved_ids))
+            ).scalars()
+        } if involved_ids else {}
+        # И то же по неделям: у источников с решафлами одна Steam-команда за две
+        # недели успевает побыть двумя разными командами.
+        names_by_week = {
+            (r.team_id, r.tournament_id, r.week_number): r.name
+            for r in session.execute(
+                select(TeamWeekName).where(TeamWeekName.team_id.in_(involved_ids))
             ).scalars()
         } if involved_ids else {}
 
@@ -1783,15 +1822,16 @@ def api_player_detail(account_id: int):
 
     matches = []
     for (match_id, start_time, radiant_win, is_radiant, played_for, r_id, d_id,
-         hero, league_id, mixer_tid) in match_rows:
+         hero, league_id, mixer_tid, week_number) in match_rows:
         opponent_id = d_id if played_for == r_id else r_id
 
-        def name_in_this_match(team_id):
-            # The name this team went by in THIS match's tournament; only fall
-            # back to Teams.name when that cup never listed them.
+        def name_in_this_match(team_id, mixer_tid=mixer_tid, week_number=week_number):
+            # The name this team went by in THIS match's week, then in its cup;
+            # only fall back to Teams.name when neither listed them.
             if team_id is None:
                 return "?"
-            return (names_by_tour.get((team_id, mixer_tid))
+            return (names_by_week.get((team_id, mixer_tid, week_number))
+                    or names_by_tour.get((team_id, mixer_tid))
                     or team_names.get(team_id)
                     or f"Team {team_id}")
 
@@ -1963,7 +2003,8 @@ def api_match_detail(match_id: int):
             # recycled between cups), falling back to the current name.
             if team_id is None:
                 return "?"
-            return _team_name_in_tournament(session, team_id, mixer_tid) or f"Team {team_id}"
+            return (_team_name_in_tournament(session, team_id, mixer_tid, match.week_number)
+                    or f"Team {team_id}")
 
         player_rows = session.execute(
             select(
@@ -2244,7 +2285,7 @@ def api_team_analysis(team_id: int):
         tournament_id, historical = _requested_tournament(team)
         if not _may_see_tournament(tournament_id):
             return _deny_tournament()
-        team_name = _team_name_in_tournament(session, team_id, tournament_id) or f"Team {team_id}"
+        team_name = _team_name_in_tournament(session, team_id, tournament_id, team.week_number) or f"Team {team_id}"
         stats = compute_team_stats(session, team_id, tournament_id)
         text = generate_coach_text(team_name, stats)
 

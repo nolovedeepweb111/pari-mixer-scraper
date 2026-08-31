@@ -18,7 +18,8 @@ from sqlalchemy.orm import Session
 from .mixercup_client import MixerCupClient
 from .models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, PlayerNote, QueuedPlayer,
-    SubstitutionEvent, Team, TeamTournamentName, UnavailableMatch, UnlinkedRosterPlayer,
+    SubstitutionEvent, Team, TeamTournamentName, TeamWeekName, UnavailableMatch,
+    UnlinkedRosterPlayer,
     build_engine, configure_sqlite, ensure_schema,
 )
 from .opendota_client import OpenDotaClient, OpenDotaLimitReached
@@ -590,6 +591,21 @@ def _apply_confirmed_roster(session: Session, steam_team_id: int, mixer_team: di
             player.preferred_roles = roles
 
 
+def _record_week_name(session: Session, team_id: int, tournament_id: int,
+                      week_number: int | None, name: str) -> None:
+    """Как команда называлась в эту неделю (см. TeamWeekName). Записывается для
+    ЛЮБОЙ недели, включая прошлые: именно из этого потом берётся подпись матча,
+    сыгранного до решафла."""
+    if week_number is None:
+        return
+    row = session.get(TeamWeekName, (team_id, tournament_id, week_number))
+    if row is None:
+        session.add(TeamWeekName(team_id=team_id, tournament_id=tournament_id,
+                                 week_number=week_number, name=name))
+    elif row.name != name:
+        row.name = name
+
+
 def _record_tournament_name(session: Session, team_id: int, tournament_id: int, name: str) -> None:
     """Remember a team's name within one tournament (see TeamTournamentName).
     Upsert: mixer-cup is authoritative and a captain can rename mid-cup."""
@@ -644,6 +660,7 @@ def link_mixercup_data(
     tournament_id: int,
     progress: ProgressFn,
     apply_rosters: bool = True,
+    current_week: int | None = None,
 ) -> None:
     """Uses mixer-cup.gg's own GraphQL API to attach real team names and
     current roster nicknames to the matches we already collected from
@@ -738,8 +755,11 @@ def link_mixercup_data(
             # the row. Teams.name can hold only one name, and mixer-cup recycles
             # the same Steam registrations every cup, so without this an older
             # cup's matches get labelled with the current cup's names.
+            team_week = mixer_team.get("weekNumber")
             if mixer_team.get("name"):
                 _record_tournament_name(session, steam_team_id, tournament_id, mixer_team["name"])
+                _record_week_name(session, steam_team_id, tournament_id, team_week,
+                                  mixer_team["name"])
 
             team_row = session.get(Team, steam_team_id)
             if team_row is not None:
@@ -749,7 +769,14 @@ def link_mixercup_data(
                 # tournament - otherwise a steam_team_id reused across the two
                 # concurrent cups would get renamed to the other cup's name
                 # (how "Team B3SHA" became "Team yuusha").
-                owns = apply_rosters or team_row.tournament_id in (None, tournament_id)
+                # И то же самое на уровень мельче - по неделям. Пул команд
+                # переиспользуется и между ними: строку переписывает только
+                # состав ТЕКУЩЕЙ недели, иначе прошлая неделя возвращает своё
+                # имя обратно и матчи новой подписываются чужой командой.
+                right_week = (current_week is None or team_week is None
+                              or team_week == current_week)
+                owns = right_week and (
+                    apply_rosters or team_row.tournament_id in (None, tournament_id))
                 if owns:
                     if mixer_team.get("name"):
                         team_row.name = mixer_team["name"]
@@ -757,18 +784,18 @@ def link_mixercup_data(
                         team_row.mixer_uuid = mixer_team["id"]
                 # Active reclaims the team; past claims only if unclaimed, so
                 # a team known only from an old cup still gets a tournament.
-                if apply_rosters:
+                if apply_rosters and right_week:
                     team_row.tournament_id = tournament_id
                 elif team_row.tournament_id is None:
                     team_row.tournament_id = tournament_id
                 # Неделя, к которой относится этот состав (см. Team.week_number).
-                if mixer_team.get("weekNumber") is not None:
-                    team_row.week_number = mixer_team["weekNumber"]
+                if right_week and team_week is not None:
+                    team_row.week_number = team_week
             # Rosters (which player is on the team now) are driven ONLY by the
             # active tournament - a player competing in both cups must not have
             # their team flip-flop each cycle. A past cup still contributes the
             # one thing that can't hurt: names for players it alone knows.
-            if apply_rosters:
+            if apply_rosters and right_week:
                 _apply_confirmed_roster(session, steam_team_id, mixer_team, tournament_id)
             else:
                 named_from_mixer += _apply_names_only(session, mixer_team)
@@ -795,6 +822,7 @@ def sync_mixer_teams(
     mixer_client: MixerCupClient,
     tournament_id: int,
     progress: ProgressFn,
+    current_week: int | None = None,
 ) -> None:
     """Makes sure every team of the ACTIVE mixer tournament exists in the
     DB with its current name, roster and tournament marker - even before a
@@ -812,8 +840,21 @@ def sync_mixer_teams(
         select(func.max(Team.team_id)).where(Team.team_id >= _SYNTHETIC_TEAM_ID_BASE)
     ).scalar() or _SYNTHETIC_TEAM_ID_BASE
 
-    created = updated = 0
+    created = updated = skipped_weeks = 0
     for mt in mixer_teams:
+        # Состав прошлой недели не владеет строкой команды и не заводит новых:
+        # его Steam-команда уже отдана составу текущей недели, а пустышка на
+        # него была бы командой без единого матча. Имя за ту неделю сохраняем -
+        # по нему подписываются её матчи.
+        team_week = mt.get("weekNumber")
+        if current_week is not None and team_week is not None and team_week != current_week:
+            skipped_weeks += 1
+            existing = session.execute(
+                select(Team.team_id).where(Team.mixer_uuid == mt["id"])
+            ).scalar_one_or_none()
+            if existing is not None and mt.get("name"):
+                _record_week_name(session, existing, tournament_id, team_week, mt["name"])
+            continue
         if not mt.get("id"):
             continue
         team_row = session.execute(
@@ -844,7 +885,9 @@ def sync_mixer_teams(
         _apply_confirmed_roster(session, team_row.team_id, mt, tournament_id)
 
     session.commit()
-    progress(f"MixerCup team sync: {created} new team(s), {updated} updated for tournament {tournament_id}")
+    tail = f", {skipped_weeks} from earlier weeks left alone" if skipped_weeks else ""
+    progress(f"MixerCup team sync: {created} new team(s), {updated} updated "
+             f"for tournament {tournament_id}{tail}")
 
 
 def _merge_duplicate_steam_teams(session: Session, teams_by_id: dict, progress: ProgressFn) -> None:
@@ -1692,6 +1735,22 @@ def _sync_mixer_source(session: Session, src, od_client: OpenDotaClient,
     if active_id is None:
         return None
 
+    # Какая неделя идёт сейчас. Только её составы владеют строками команд:
+    # источник переиспользует один и тот же пул зарегистрированных в доте
+    # команд от недели к неделе (см. TeamWeekName).
+    current_week = None
+    if src.has_weeks:
+        try:
+            weeks = mixer_client.list_weeks(active_id)
+            active_weeks = [w["weekNumber"] for w in weeks if w.get("status") == "ACTIVE"]
+            numbers = [w["weekNumber"] for w in weeks if w.get("weekNumber") is not None]
+            current_week = active_weeks[0] if active_weeks else (max(numbers) if numbers else None)
+            if current_week is not None:
+                progress(f"[{src.key}] current week: {current_week}")
+        except Exception as e:
+            progress(f"[{src.key}] could not resolve the current week ({e}); "
+                     f"team ownership left as is.")
+
     try:
         # #1 and #2 run concurrently and share a dotabuff league, so both
         # must be touched. Gather the full id set (active + env override +
@@ -1711,8 +1770,10 @@ def _sync_mixer_source(session: Session, src, od_client: OpenDotaClient,
 
         # Link the ACTIVE tournament fully (rosters, team identity), then
         # every OTHER tournament for results only.
-        link_mixercup_data(session, mixer_client, active_id, progress)
-        sync_mixer_teams(session, mixer_client, active_id, progress)
+        link_mixercup_data(session, mixer_client, active_id, progress,
+                           current_week=current_week)
+        sync_mixer_teams(session, mixer_client, active_id, progress,
+                         current_week=current_week)
         sync_substitution_history(session, mixer_client, active_id, progress)
         sync_queue_snapshot(session, mixer_client, active_id, progress)
 

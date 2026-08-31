@@ -159,6 +159,25 @@ class TeamTournamentName(Base):
     name: Mapped[str]
 
 
+class TeamWeekName(Base):
+    """Как называлась команда в конкретную НЕДЕЛЮ турнира.
+
+    То же, что TeamTournamentName, но на уровень мельче. Источники с
+    еженедельными решафлами переиспользуют свой пул зарегистрированных в доте
+    команд не только от кубка к кубку, но и от недели к неделе: Steam-команда
+    10232528 на первой неделе супермиксера была Team BAXA, а на второй досталась
+    Team VaniLLl. Без этой таблицы матчи второй недели подписывались именем
+    первой - на странице разведки это прямая ложь про соперника.
+
+    Перестраивается из mixer-cup на каждом сборе, поэтому бэкап не нужен."""
+    __tablename__ = "team_week_names"
+
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.team_id"), primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(primary_key=True)
+    week_number: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+
+
 class UnlinkedRosterPlayer(Base):
     """Игрок из состава mixer-cup, которого не удалось связать с аккаунтом Dota.
 

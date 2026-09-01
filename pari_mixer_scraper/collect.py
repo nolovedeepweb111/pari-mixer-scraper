@@ -705,11 +705,7 @@ def _apply_names_only(session: Session, mixer_team: dict) -> int:
         if mp.get("nickname") and not player.name:
             player.name = mp["nickname"]
             named += 1
-        # Рейтинг обновляем ВСЕГДА, а не только когда пусто: у mixer-cup он
-        # ходит вместе с результатами, и записанный однажды устаревает молча.
-        # Так у игрока, попавшего к нам в июле, на карточке годами висело бы
-        # 14 469 при нынешних 8 603 - и это выглядело бы нашей ошибкой.
-        if mp.get("rating") is not None:
+        if mp.get("rating") is not None and player.mmr is None:
             player.mmr = mp["rating"]
     return named
 

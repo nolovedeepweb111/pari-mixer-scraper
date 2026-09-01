@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import TypedDict
 
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
 from .models import Hero, Match, MatchDraftEntry, MatchPlayer
@@ -28,11 +28,19 @@ class TeamStats(TypedDict):
 
 
 def compute_team_stats(session: Session, team_id: int,
-                       tournament_id: int | None = None) -> TeamStats:
-    # Scope to the team's own tournament: a steam team_id can be reused
-    # across tournaments sharing a dotabuff league, so without this the
-    # stats mix both. None means no scoping (unlinked team).
-    tour_filter = (Match.mixer_tournament_id == tournament_id) if tournament_id is not None else True
+                       tournament_id: int | None = None,
+                       week: int | None = None) -> TeamStats:
+    # Scope to the team's own tournament AND, where the source reshuffles
+    # weekly, its own week: a steam team_id is reused across tournaments
+    # sharing a dotabuff league and between weeks of one cup, so without this
+    # the stats mix in games another team played under the same id. None means
+    # no scoping (unlinked team).
+    scope = []
+    if tournament_id is not None:
+        scope.append(Match.mixer_tournament_id == tournament_id)
+    if week is not None:
+        scope.append(Match.week_number == week)
+    tour_filter = and_(*scope) if scope else True
 
     matches = session.execute(
         select(Match.match_id, Match.radiant_team_id, Match.dire_team_id, Match.radiant_win)

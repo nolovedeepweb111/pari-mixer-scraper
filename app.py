@@ -14,7 +14,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, redirect, request, send_from_directory, session
 from werkzeug.routing import BaseConverter
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
@@ -1226,7 +1226,7 @@ PLAYER_HERO_MIN_WIN_RATE = int(os.environ.get("PLAYER_HERO_MIN_WIN_RATE", "60"))
 
 
 def _team_player_names(session: Session, team_id: int, tournament_id: int | None,
-                       historical: bool) -> dict[int, str]:
+                       historical: bool, week: int | None = None) -> dict[int, str]:
     """Кто считается составом этой команды: подтверждённый ростер для текущего
     кубка (включая только что заведённых замен) и все, кто реально играл, — для
     прошедшего или когда ростера нет. То же правило, что на странице состава."""
@@ -1242,7 +1242,8 @@ def _team_player_names(session: Session, team_id: int, tournament_id: int | None
             select(Player.account_id, Player.name)
             .join(MatchPlayer, MatchPlayer.account_id == Player.account_id)
             .join(Match, Match.match_id == MatchPlayer.match_id)
-            .where(MatchPlayer.team_id == team_id, _team_tournament_filter(tournament_id))
+            .where(MatchPlayer.team_id == team_id,
+                   _team_tournament_filter(tournament_id, week))
             .distinct()
         ):
             names[account_id] = name or f"account {account_id}"
@@ -1470,17 +1471,27 @@ def _hero_icon_slug(internal_name: str) -> str:
     return internal_name[len(prefix):] if internal_name.startswith(prefix) else internal_name
 
 
-def _team_tournament_filter(tournament_id: int | None):
-    """Restrict a team's matches to its OWN tournament. A steam team_id can
-    be reused across tournaments that share a dotabuff league (e.g. B3SHA in
-    #2 kept yuusha's #1 team_id), so without this a team page mixes both
-    tournaments' games. None (unlinked team) means no scoping."""
+def _team_tournament_filter(tournament_id: int | None, week: int | None = None):
+    """Restrict a team's matches to its OWN tournament - and, where the source
+    reshuffles weekly, to its own week.
+
+    A steam team_id is reused across tournaments that share a dotabuff league
+    (B3SHA in #2 kept yuusha's #1 team_id) and, at the super mixer, between
+    weeks: the id that was Team BAXA last week belongs to Team VaniLLl now.
+    Without the week the page shows this week's team playing last week's games
+    under someone else's name. None (unlinked team) means no scoping."""
+    scope = []
     if tournament_id is not None:
-        return Match.mixer_tournament_id == tournament_id
-    return True
+        scope.append(Match.mixer_tournament_id == tournament_id)
+    if week is not None:
+        scope.append(Match.week_number == week)
+    if not scope:
+        return True
+    return and_(*scope) if len(scope) > 1 else scope[0]
 
 
-def _last_match_lineup(session: Session, team_id: int, tournament_id: int | None = None) -> dict | None:
+def _last_match_lineup(session: Session, team_id: int, tournament_id: int | None = None,
+                       week: int | None = None) -> dict | None:
     """Who actually played the team's most recent match. The roster cards
     only show mixer-confirmed players with at least one game, so a team can
     display fewer than five (fresh substitute who hasn't played yet, or an
@@ -1489,7 +1500,7 @@ def _last_match_lineup(session: Session, team_id: int, tournament_id: int | None
         select(Match.match_id, Match.start_time, Match.radiant_team_id, Match.dire_team_id)
         .where(
             (Match.radiant_team_id == team_id) | (Match.dire_team_id == team_id),
-            _team_tournament_filter(tournament_id),
+            _team_tournament_filter(tournament_id, week),
         )
         .order_by(Match.start_time.desc())
         .limit(1)
@@ -1522,7 +1533,7 @@ def _last_match_lineup(session: Session, team_id: int, tournament_id: int | None
 
 
 def _recent_drafts(session: Session, team_id: int, tournament_id: int | None = None,
-                   limit: int = 23) -> list[dict]:
+                   limit: int = 23, week: int | None = None) -> list[dict]:
     """Full draft (both teams' picks and bans, in actual draft order) for
     this team's last few matches - not just this team's own bans, since
     what the *opponent* banned against them is the more useful signal."""
@@ -1530,7 +1541,7 @@ def _recent_drafts(session: Session, team_id: int, tournament_id: int | None = N
         select(Match.match_id, Match.radiant_team_id, Match.dire_team_id, Match.radiant_win)
         .where(
             (Match.radiant_team_id == team_id) | (Match.dire_team_id == team_id),
-            _team_tournament_filter(tournament_id),
+            _team_tournament_filter(tournament_id, week),
         )
         .order_by(Match.start_time.desc())
     ).all()
@@ -1588,6 +1599,10 @@ def api_team_detail(team_id: int):
             return jsonify({"error": "not found"}), 404
 
         tournament_id, historical = _requested_tournament(team)
+        # Матчи команды ограничены её неделей: тот же Steam-идентификатор на
+        # прошлой неделе принадлежал другой команде, и без этого её игры
+        # показывались бы здесь как свои (см. _team_tournament_filter).
+        week = team.week_number
         if not _may_see_tournament(tournament_id):
             return _deny_tournament()
         # A past cup's page must be built from who actually PLAYED for the team
@@ -1611,13 +1626,13 @@ def api_team_detail(team_id: int):
             .join(Match, Match.match_id == MatchPlayer.match_id)
             .where(
                 MatchPlayer.team_id == team_id, player_filter,
-                _team_tournament_filter(tournament_id),
+                _team_tournament_filter(tournament_id, week),
             )
             .group_by(Player.account_id, Hero.hero_id)
         ).all()
 
-        recent_drafts = _recent_drafts(session, team_id, tournament_id)
-        last_match_lineup = _last_match_lineup(session, team_id, tournament_id)
+        recent_drafts = _recent_drafts(session, team_id, tournament_id, week=team.week_number)
+        last_match_lineup = _last_match_lineup(session, team_id, tournament_id, team.week_number)
         mixer_uuid = team.mixer_uuid
         team_name = _team_name_in_tournament(session, team_id, tournament_id, team.week_number)
 
@@ -2286,12 +2301,12 @@ def api_team_analysis(team_id: int):
         if not _may_see_tournament(tournament_id):
             return _deny_tournament()
         team_name = _team_name_in_tournament(session, team_id, tournament_id, team.week_number) or f"Team {team_id}"
-        stats = compute_team_stats(session, team_id, tournament_id)
+        stats = compute_team_stats(session, team_id, tournament_id, team.week_number)
         text = generate_coach_text(team_name, stats)
 
         # Which heroes this squad's players are dangerous on. It is a hero pool
         # by another name, so it lives behind the key like every other one.
-        roster = _team_player_names(session, team_id, tournament_id, historical)
+        roster = _team_player_names(session, team_id, tournament_id, historical, team.week_number)
         pools_locked = not _may_see_hero_pools()
         signature = [] if pools_locked else compute_player_signature_heroes(
             session, list(roster),

@@ -521,8 +521,49 @@ def _resolve_account_by_nickname(session: Session, nickname: str | None) -> int 
     return None
 
 
+def _slot_from_last_lineup(session: Session, steam_team_id: int,
+                           tournament_id: int | None, week: int | None,
+                           taken: set[int]) -> int | None:
+    """Кто занимает неопознанный слот состава - по последней игре команды.
+
+    В матче за команду играют пятеро. Если четверых мы уже опознали, а слот
+    остался один, то пятый в составе последней игры и есть тот, кто на нём
+    стоит. Отсюда берутся люди, которых mixer-cup показывает как «Замена
+    капитана»: имени и Steam-идентификатора у них там нет, а сыграть они уже
+    успели.
+
+    Осторожность та же, что и везде: связываем, только если кандидат ровно
+    один. Двое лишних в составе означают, что кто-то выходил разово, и гадать
+    в таком случае нельзя."""
+    scope = [MatchPlayer.team_id == steam_team_id]
+    if tournament_id is not None:
+        scope.append(Match.mixer_tournament_id == tournament_id)
+    if week is not None:
+        scope.append(Match.week_number == week)
+    last_match = session.execute(
+        select(Match.match_id)
+        .join(MatchPlayer, MatchPlayer.match_id == Match.match_id)
+        .where(*scope)
+        .order_by(Match.start_time.desc().nulls_last())
+        .limit(1)
+    ).scalar()
+    if last_match is None:
+        return None
+    lineup = {
+        account_id for (account_id,) in session.execute(
+            select(MatchPlayer.account_id).where(
+                MatchPlayer.match_id == last_match,
+                MatchPlayer.team_id == steam_team_id,
+            )
+        )
+    }
+    extra = lineup - taken
+    return next(iter(extra)) if len(extra) == 1 else None
+
+
 def _apply_confirmed_roster(session: Session, steam_team_id: int, mixer_team: dict,
-                            tournament_id: int | None = None) -> None:
+                            tournament_id: int | None = None,
+                            week: int | None = None) -> None:
     """Resets roster_confirmed for everyone who has ever played under this
     Steam team_id (regular roster + one-off substitutes), then confirms and
     renames exactly the accounts that match MixerCup's current roster by
@@ -546,28 +587,35 @@ def _apply_confirmed_roster(session: Session, steam_team_id: int, mixer_team: di
     )
 
     by_account_id = {p.account_id: p for p in roster}
+
+    # Сначала разбираем, кого вообще удалось опознать: по аватару, а если его
+    # нет - по нику среди уже известных игроков.
+    resolved: list[tuple[dict, int, bool]] = []   # (запись состава, аккаунт, вычислен ли)
+    unresolved: list[dict] = []
     for mp in mixer_team.get("players", []):
         account_id = mp.get("account_id")
+        if account_id is None:
+            # Мимо этой ветки в супермиксере WINLINE проходили люди, сыгравшие
+            # десятки матчей в прошлых кубках, а один из них играл в ЭТОМ кубке
+            # за ЭТУ же команду.
+            account_id = _resolve_account_by_nickname(session, mp.get("nickname"))
+        if account_id is None:
+            unresolved.append(mp)
+        else:
+            resolved.append((mp, account_id, False))
+
+    # Остался ровно один неопознанный - вычисляем его по составу последней игры.
+    if len(unresolved) == 1:
+        guess = _slot_from_last_lineup(
+            session, steam_team_id, tournament_id, week,
+            {account_id for _, account_id, _ in resolved},
+        )
+        if guess is not None:
+            resolved.append((unresolved.pop(), guess, True))
+
+    for mp, account_id, inferred in resolved:
         nickname = mp.get("nickname")
         roles = ",".join(mp["preferredRoles"]) if mp.get("preferredRoles") else None
-        if account_id is None:
-            # Аватара нет - пробуем узнать человека по нику среди тех, кто у нас
-            # уже есть. Мимо этой ветки в супермиксере WINLINE проходили люди,
-            # сыгравшие десятки матчей в прошлых кубках, а один из них играл в
-            # ЭТОМ кубке за ЭТУ же команду.
-            account_id = _resolve_account_by_nickname(session, nickname)
-        if account_id is None:
-            mixer_player_id = mp.get("id")
-            if mixer_player_id:
-                session.add(UnlinkedRosterPlayer(
-                    mixer_player_id=mixer_player_id,
-                    team_id=steam_team_id,
-                    tournament_id=tournament_id,
-                    nickname=nickname,
-                    mmr=mp.get("rating"),
-                    preferred_roles=roles,
-                ))
-            continue
         player = by_account_id.get(account_id)
         if player is None:
             # A freshly substituted-in player has no Player row yet (rows
@@ -583,12 +631,29 @@ def _apply_confirmed_roster(session: Session, steam_team_id: int, mixer_team: di
                 player = Player(account_id=account_id, team_id=steam_team_id)
                 session.add(player)
         player.roster_confirmed = True
-        if nickname:
+        # У вычисленного по составу игрока своё имя уже есть, а в записи состава
+        # стоит название слота («Замена капитана»). Подписывать им живого
+        # человека нельзя - берём оттуда только то, чего у нас нет.
+        if nickname and (not inferred or not player.name):
             player.name = nickname
-        if mp.get("rating") is not None:
+        if mp.get("rating") is not None and (not inferred or player.mmr is None):
             player.mmr = mp["rating"]
-        if roles:
+        if roles and (not inferred or not player.preferred_roles):
             player.preferred_roles = roles
+
+    # Кого опознать не удалось вовсе - карточкой без статистики.
+    for mp in unresolved:
+        mixer_player_id = mp.get("id")
+        if not mixer_player_id:
+            continue
+        session.add(UnlinkedRosterPlayer(
+            mixer_player_id=mixer_player_id,
+            team_id=steam_team_id,
+            tournament_id=tournament_id,
+            nickname=mp.get("nickname"),
+            mmr=mp.get("rating"),
+            preferred_roles=",".join(mp["preferredRoles"]) if mp.get("preferredRoles") else None,
+        ))
 
 
 def _record_week_name(session: Session, team_id: int, tournament_id: int,
@@ -796,7 +861,8 @@ def link_mixercup_data(
             # their team flip-flop each cycle. A past cup still contributes the
             # one thing that can't hurt: names for players it alone knows.
             if apply_rosters and right_week:
-                _apply_confirmed_roster(session, steam_team_id, mixer_team, tournament_id)
+                _apply_confirmed_roster(session, steam_team_id, mixer_team, tournament_id,
+                                        team_week)
             else:
                 named_from_mixer += _apply_names_only(session, mixer_team)
         linked += 1
@@ -882,7 +948,8 @@ def sync_mixer_teams(
             team_row.week_number = mt["weekNumber"]
         if mt.get("name"):
             _record_tournament_name(session, team_row.team_id, tournament_id, mt["name"])
-        _apply_confirmed_roster(session, team_row.team_id, mt, tournament_id)
+        _apply_confirmed_roster(session, team_row.team_id, mt, tournament_id,
+                                mt.get("weekNumber"))
 
     session.commit()
     tail = f", {skipped_weeks} from earlier weeks left alone" if skipped_weeks else ""

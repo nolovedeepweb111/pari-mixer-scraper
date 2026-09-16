@@ -772,6 +772,7 @@ MIXER_TOURNAMENT_LABELS: dict[int, str] = {
     # существует только после того, как кэш имён сходит в сеть, то есть
     # первый после перезапуска гость получил бы 404 на живой кубок.
     20002: "WINLINE Super Mixer #1",
+    30001: "PARI Super Mixer #1",
 }
 for _pair in os.environ.get("MIXER_TOURNAMENT_LABELS", "").replace(",", ";").split(";"):
     if ":" in _pair:
@@ -855,8 +856,13 @@ def _refresh_tournament_cache() -> None:
     for src in SOURCES:
         client = _mixer_clients[src.key]
         found = None
+        # Ответил ли источник хоть на что-то. Только тогда отсутствие живого
+        # кубка - это новость, а не сбой связи.
+        answered = False
         try:
-            for t in client.list_tournaments():
+            listed = client.list_tournaments()
+            answered = True
+            for t in listed:
                 if t.get("name"):
                     _mixer_tournament_names[t["id"]] = t["name"]
                 if found is None and t.get("status") == "ACTIVE":
@@ -868,6 +874,7 @@ def _refresh_tournament_cache() -> None:
             # the dedicated endpoint before giving up on this refresh.
             try:
                 active = client.get_active_tournament()
+                answered = True
             except Exception:
                 active = None
             if active:
@@ -876,6 +883,11 @@ def _refresh_tournament_cache() -> None:
                     _mixer_tournament_names[found] = active["name"]
         if found is not None:
             _mixer_active_by_source[src.key] = found
+        elif answered:
+            # Кубок источника закончился. Без этого он оставался "идущим" до
+            # перезапуска: закрытым за ключом и главным на "/", хотя его место
+            # уже в бесплатном архиве. Так было с Pari Mixer Cup #4.
+            _mixer_active_by_source.pop(src.key, None)
 
     _mixer_active_ids = set(_mixer_active_by_source.values())
     # Основной источник задаёт кубок по умолчанию - тот, что открывается на "/".

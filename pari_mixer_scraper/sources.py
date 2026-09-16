@@ -62,8 +62,22 @@ WINLINE = MixerSource(
     has_weeks=True,
 )
 
+# Третья копия платформы - супермиксер PARI, начался 14.09.2026, когда обычный
+# PARI Mixer Cup ушёл на паузу. Устроен как WINLINE: недели и решафлы. Матчи
+# идут в лигу 19965 ("PARI Mixer Cup #1" в доте), а не в 19924 обычного кубка.
+PARI_SUPER = MixerSource(
+    key="parisuper",
+    title="PARI Super Mixer",
+    base_url="https://api.pari-super-mixer.sportpostproduction.com",
+    id_offset=30_000,
+    league_ids=(19965,),
+    slug_prefix="parisuper",
+    has_weeks=True,
+)
+
 # Первый в списке - основной: его активный кубок сайт показывает на "/".
-DEFAULT_SOURCES: tuple[MixerSource, ...] = (PARI, WINLINE)
+# Когда у основного живого кубка нет, на "/" открывается любой живой.
+DEFAULT_SOURCES: tuple[MixerSource, ...] = (PARI, WINLINE, PARI_SUPER)
 
 
 def _parse_env(raw: str) -> tuple[MixerSource, ...]:

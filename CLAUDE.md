@@ -1,6 +1,6 @@
 # Project map
 
-Scouting site for PARI Mixer Cup and the WINLINE super mixer: rosters, hero
+Scouting site for PARI Mixer Cup and the WINLINE and PARI super mixers: rosters, hero
 pools, drafts, substitutions, opponent analysis. Running cups are sold by key;
 the archive is free.
 
@@ -51,13 +51,16 @@ file immediately.
 - **One worker only.** Device bindings, collect status and caches live in process
   memory. A second worker means half the requests see different state.
 - **`mixer_tournament_id` is the global key** — addresses, hero pools, access,
-  leaderboards. Two sources, each numbering from its own 1, so ids are separated
-  by an offset (`sources.py`): WINLINE #1 is stored as 20002. The client applies
+  leaderboards. Three sources, each numbering from its own 1, so ids are separated
+  by an offset (`sources.py`): WINLINE #1 is 20002, PARI Super #1 is 30001. The client applies
   the offset; nothing else knows there is a second source.
 - **A team lives one cup, sometimes one week.** Steam team ids are reused cup to
   cup, so a match shows the name from `team_tournament_names`, not `teams.name`.
   Sources with reshuffles also carry `teams.week_number`.
 - **Hero pools are always gated**, even in the free archive. That is the product.
+- **PARI Super (league 19965) plays on the same Steam team ids as PARI Mixer
+  Cup (19924).** Harmless while one is paused; if both run at once they will
+  fight over `teams.tournament_id` every collection run.
 - **Cups run concurrently** and their matches interleave in time. Any "while the
   label is the same" grouping breaks — group by tournament id.
 
@@ -70,7 +73,7 @@ file immediately.
   collector re-asked for them every 10 minutes and burned the daily quota itself,
   which looked exactly like being rate-limited from outside.
 - **Steam `GetMatchDetails` 500s** for this league. Drafts come only from OpenDota.
-- **The two mixer-cup deployments run different schemas.** `api.mixer-cup.gg` has
+- **The mixer-cup deployments run different schemas.** `api.mixer-cup.gg` has
   no week fields and answers 400 to a query mentioning them, which kills that
   source's whole sync. Hence `MixerSource.has_weeks`.
 - **mixer-cup exposes no Steam id for a player** — it is parsed out of the avatar

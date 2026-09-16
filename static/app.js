@@ -611,8 +611,10 @@ function renderComposition(team) {
       } else if (draft.team_won === false) {
         resultBadge = '<span class="match-result result-loss">Поражение</span>';
       }
+      // Драфта у OpenDota нет - показаны только пики из составов.
+      const partialNote = draft.partial ? '<span class="hint draft-partial">только пики, без банов</span>' : "";
       match.innerHTML =
-        resultBadge +
+        resultBadge + partialNote +
         renderDraftTeamRow(team.name, draft.team_entries) +
         renderDraftTeamRow(draft.opponent_name, draft.opponent_entries);
       draftsSection.appendChild(match);

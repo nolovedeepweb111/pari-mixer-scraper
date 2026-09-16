@@ -1122,3 +1122,6 @@ aside h2 {
   color: var(--muted);
 }
 .week-pool .sort-btn { padding: 3px 9px; }
+
+/* Игра без драфта у OpenDota: пики восстановлены по составам. */
+.draft-partial { margin-left: 8px; font-size: 12px; }

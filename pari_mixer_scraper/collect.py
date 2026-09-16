@@ -413,9 +413,15 @@ def sync_draft_data(
 
         got_draft = persist_draft_entries(session, match_id, detail)
         update_player_stats(session, match_id, detail)
+        session.commit()
         if not got_draft:
             no_draft += 1
-        session.commit()
+            # Матч разобран, статистика записана, а драфта нет (не капитанский
+            # режим или OpenDota его не отдал). Раньше такой матч оставался «без
+            # драфта» навсегда и запрашивался в КАЖДЫЙ прогон: 18 штук раз в
+            # 10 минут - около 2600 запросов в сутки, больше всей квоты.
+            # Откладываем тем же правилом, что и 404.
+            _mark_missing(session, match_id)
         if i % 10 == 0 or i == len(missing):
             progress(f"  match details {i}/{len(missing)}")
 
@@ -1616,18 +1622,41 @@ ENRICH_TIME_BUDGET_SECONDS = int(os.environ.get("ENRICH_TIME_BUDGET_SECONDS", "6
 MISSING_MATCH_RETRY_HOURS = int(os.environ.get("MISSING_MATCH_RETRY_HOURS", "24"))
 
 
-def _recently_missing(session: Session) -> set[int]:
-    """Матчи, про которые мы недавно уже спрашивали и получили 404.
+# Свежий матч OpenDota отдаёт не сразу: сначала его нужно разобрать, и первые
+# минуты-часы после игры он честно отвечает 404. Прежнее правило «404 - не
+# трогаем сутки» откладывало на сутки и такие матчи: у good_mma две игры вечера
+# 15.09 так и остались без драфтов до следующего дня. Поэтому для недавних игр
+# повторы идут с нарастающей паузой (полчаса, час, два, ...), а сутки - только
+# для старых, про которые уже ясно, что это закрытое лобби.
+MISSING_MATCH_FRESH_HOURS = int(os.environ.get("MISSING_MATCH_FRESH_HOURS", "48"))
+MISSING_MATCH_FIRST_RETRY_MINUTES = int(os.environ.get("MISSING_MATCH_FIRST_RETRY_MINUTES", "30"))
 
-    Без этого фильтра каждый прогон заново перебирал десятки несуществующих
-    матчей и выжигал на них суточную квоту OpenDota (см. UnavailableMatch)."""
+
+def _retry_after_seconds(start_time: int | None, attempts: int | None, now: float) -> float:
+    full = MISSING_MATCH_RETRY_HOURS * 3600
+    if start_time is None or now - start_time > MISSING_MATCH_FRESH_HOURS * 3600:
+        return full
+    step = MISSING_MATCH_FIRST_RETRY_MINUTES * 60 * 2 ** max((attempts or 1) - 1, 0)
+    return min(step, full)
+
+
+def _recently_missing(session: Session) -> set[int]:
+    """Матчи, про которые мы недавно уже спрашивали и не получили нужного:
+    404 или разобранный матч без драфта.
+
+    Без этого фильтра каждый прогон заново перебирал десятки таких матчей и
+    выжигал на них суточную квоту OpenDota (см. UnavailableMatch)."""
     if MISSING_MATCH_RETRY_HOURS <= 0:
         return set()
-    fresh_after = time.time() - MISSING_MATCH_RETRY_HOURS * 3600
+    now = time.time()
+    rows = session.execute(
+        select(UnavailableMatch.match_id, UnavailableMatch.last_checked,
+               UnavailableMatch.attempts, Match.start_time)
+        .outerjoin(Match, Match.match_id == UnavailableMatch.match_id)
+    ).all()
     return {
-        row[0] for row in session.execute(
-            select(UnavailableMatch.match_id).where(UnavailableMatch.last_checked >= fresh_after)
-        )
+        match_id for match_id, last_checked, attempts, start_time in rows
+        if now - last_checked < _retry_after_seconds(start_time, attempts, now)
     }
 
 

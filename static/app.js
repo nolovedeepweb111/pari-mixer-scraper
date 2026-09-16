@@ -443,6 +443,67 @@ function formatRoles(roles) {
   return roles.split(",").map((r) => ROLE_LABELS[r] || r).join(" / ");
 }
 
+function heroItemsHtml(heroes) {
+  return heroes
+    .map((h) => {
+      const wr = h.win_rate == null ? "" : `<span class="winrate ${h.win_rate >= 50 ? "wr-good" : "wr-bad"}">${h.win_rate}%</span>`;
+      return `<li><span>${escapeHtml(h.name)}</span><span>${wr}<span class="count">×${h.games}</span></span></li>`;
+    })
+    .join("");
+}
+
+// Пул игрока в выбранную неделю кубка с решафлами. Текущая неделя - это его
+// игры за ЭТУ команду (то, что карточка показывала всегда), прошлые - все его
+// игры той недели, за какую бы команду он ни играл. «Все» складывает недели.
+function weekPoolHeroes(player, currentWeek, choice) {
+  const pools = player.week_pools || [];
+  if (choice === String(currentWeek)) return player.heroes;
+  const picked = choice === "all" ? pools : pools.filter((p) => String(p.week) === choice);
+  const merged = new Map();
+  for (const pool of picked) {
+    for (const h of pool.heroes) {
+      const m = merged.get(h.hero_id) || { hero_id: h.hero_id, name: h.name, games: 0, wins: 0, decided: 0 };
+      m.games += h.games;
+      m.wins += h.wins;
+      m.decided += h.decided;
+      merged.set(h.hero_id, m);
+    }
+  }
+  return [...merged.values()]
+    .map((m) => ({ ...m, win_rate: m.decided ? Math.round((100 * m.wins) / m.decided) : null }))
+    .sort((a, b) => b.games - a.games);
+}
+
+function weekToggleHtml(player, currentWeek) {
+  if (currentWeek == null || !player.week_pools) return "";
+  const weeks = new Set(player.week_pools.map((p) => p.week));
+  weeks.add(currentWeek);
+  // Переключатель нужен, только если есть что сравнивать: хоть одна другая
+  // неделя с играми.
+  if (weeks.size < 2) return "";
+  const buttons = [...weeks].sort((a, b) => a - b).map((w) =>
+    `<button class="sort-btn${w === currentWeek ? " active" : ""}" data-week="${w}" title="Неделя ${w}">${w}</button>`);
+  buttons.push(`<button class="sort-btn" data-week="all" title="Все недели кубка">Все</button>`);
+  return `<div class="week-pool"><span>Неделя</span><div class="sort-toggle" role="group" aria-label="Неделя">${buttons.join("")}</div></div>`;
+}
+
+function bindWeekToggle(card, player, currentWeek, emptyHint) {
+  for (const btn of card.querySelectorAll(".week-pool .sort-btn")) {
+    btn.addEventListener("click", () => {
+      for (const b of card.querySelectorAll(".week-pool .sort-btn")) b.classList.toggle("active", b === btn);
+      const choice = btn.dataset.week;
+      const items = heroItemsHtml(weekPoolHeroes(player, currentWeek, choice));
+      const hint = choice === String(currentWeek) ? emptyHint : "в эту неделю не играл(а)";
+      let list = card.querySelector("ul");
+      if (!list) {
+        list = document.createElement("ul");
+        card.appendChild(list);
+      }
+      list.innerHTML = items || `<li><span class="hint">${hint}</span></li>`;
+    });
+  }
+}
+
 function renderComposition(team) {
   const container = document.createElement("div");
 
@@ -451,12 +512,7 @@ function renderComposition(team) {
   for (const player of team.players) {
     const card = document.createElement("div");
     card.className = "player-card";
-    const heroItems = player.heroes
-      .map((h) => {
-        const wr = h.win_rate == null ? "" : `<span class="winrate ${h.win_rate >= 50 ? "wr-good" : "wr-bad"}">${h.win_rate}%</span>`;
-        return `<li><span>${escapeHtml(h.name)}</span><span>${wr}<span class="count">×${h.games}</span></span></li>`;
-      })
-      .join("");
+    const heroItems = heroItemsHtml(player.heroes);
     const rolesLine = player.roles ? `<p class="roles">${escapeHtml(formatRoles(player.roles))}</p>` : "";
     // Игрок, которого mixer-cup не связал со Steam: аккаунта нет, поэтому ни
     // ссылки на его страницу, ни статистики быть не может. Показываем то, что
@@ -473,12 +529,15 @@ function renderComposition(team) {
     const heroBlock = player.placeholder && !heroItems
       ? ""
       : `<ul>${heroItems || `<li><span class="hint">${emptyHint}</span></li>`}</ul>`;
+    const weekToggle = weekToggleHtml(player, team.week);
     card.innerHTML = `
       <h3>${nameCell}</h3>
       <p class="mmr">${formatMmr(player.mmr)} MMR</p>
       ${rolesLine}
+      ${weekToggle}
       ${heroBlock}
     `;
+    if (weekToggle) bindWeekToggle(card, player, team.week, emptyHint);
     const link = card.querySelector(".player-link");
     if (link) link.addEventListener("click", () => navigate(`/player/${player.account_id}`));
     grid.appendChild(card);

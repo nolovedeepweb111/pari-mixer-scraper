@@ -1739,6 +1739,12 @@ def api_team_detail(team_id: int):
     if pools_locked:
         for entry in ordered_players:
             entry["heroes"] = []
+    elif week is not None and tournament_id is not None:
+        # Пулы игроков по неделям кубка - для переключателя в карточке. После
+        # решафла человек играет за другую команду, поэтому здесь берутся ВСЕ
+        # его игры недели, а не только за эту команду: иначе прошлые недели
+        # были бы пустыми почти у всех.
+        _attach_week_pools(ordered_players, tournament_id)
     # A finished cup has no "next opponent" - that lookup is about the live
     # bracket, which only the current squad is in.
     next_opponent = _get_next_opponent(mixer_uuid, tournament_id) if mixer_uuid and not historical else None
@@ -1755,7 +1761,48 @@ def api_team_detail(team_id: int):
         "recent_drafts": recent_drafts,
         "next_opponent": next_opponent,
         "last_match_lineup": last_match_lineup,
+        "week": week,
     })
+
+
+def _attach_week_pools(players: list[dict], tournament_id: int) -> None:
+    """Добавляет каждому игроку week_pools: [{week, heroes}] по неделям, где он
+    играл в этом кубке. В героях, кроме процента, лежат wins и decided, чтобы
+    фронтенд мог сложить недели в «Все» без отдельного запроса."""
+    account_ids = [p["account_id"] for p in players if p.get("account_id")]
+    if not account_ids:
+        return
+    decided = case((Match.radiant_win.is_not(None), 1), else_=0)
+    won = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
+    with Session(engine) as session:
+        rows = session.execute(
+            select(
+                MatchPlayer.account_id, Match.week_number,
+                Hero.hero_id, Hero.localized_name,
+                func.count(), func.sum(decided), func.sum(won),
+            )
+            .join(Match, Match.match_id == MatchPlayer.match_id)
+            .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
+            .where(
+                Match.mixer_tournament_id == tournament_id,
+                Match.week_number.is_not(None),
+                MatchPlayer.account_id.in_(account_ids),
+            )
+            .group_by(MatchPlayer.account_id, Match.week_number, Hero.hero_id)
+        ).all()
+    pools: dict[int, dict[int, list[dict]]] = {}
+    for account_id, week, hero_id, hero_name, games, decided_games, wins in rows:
+        pools.setdefault(account_id, {}).setdefault(week, []).append({
+            "hero_id": hero_id, "name": hero_name, "games": games,
+            "wins": wins or 0, "decided": decided_games or 0,
+            "win_rate": round(100 * wins / decided_games) if decided_games else None,
+        })
+    for entry in players:
+        by_week = pools.get(entry.get("account_id"), {})
+        entry["week_pools"] = [
+            {"week": w, "heroes": sorted(heroes, key=lambda h: -h["games"])}
+            for w, heroes in sorted(by_week.items())
+        ]
 
 
 @app.get("/api/players/<int:account_id>")

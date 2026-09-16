@@ -1584,7 +1584,7 @@ def _recent_drafts(session: Session, team_id: int, tournament_id: int | None = N
             # Сторона берётся из is_radiant, а не из team_id игрока: у строк
             # из Steam он бывает пустым.
             rows = [
-                (0, True, radiant_team_id if is_radiant else dire_team_id, hero_name, internal_name)
+                (None, True, radiant_team_id if is_radiant else dire_team_id, hero_name, internal_name)
                 for is_radiant, hero_name, internal_name in session.execute(
                     select(MatchPlayer.is_radiant, Hero.localized_name, Hero.name)
                     .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
@@ -1616,7 +1616,7 @@ def _recent_drafts(session: Session, team_id: int, tournament_id: int | None = N
             "team_entries": side(rows, team_id),
             "opponent_name": opponent.name if opponent and opponent.name else f"Team {opponent_team_id}",
             "opponent_entries": side(rows, opponent_team_id),
-            # Только пики из составов, без банов и порядка.
+            # Только пики из составов, без банов и порядка (order у них None).
             "partial": partial,
         })
     return drafts

@@ -285,7 +285,7 @@ function renderDraftTeamRow(teamName, entries) {
   const cells = entries
     .map((e) => `
       <div class="draft-cell ${e.is_pick ? "cell-pick" : "cell-ban"}">
-        <span class="cell-order">${e.order + 1}</span>
+        ${e.order == null ? "" : `<span class="cell-order">${e.order + 1}</span>`}
         <img src="${escapeHtml(heroIconUrl(e.hero_icon))}" alt="${escapeHtml(e.hero)}" title="${escapeHtml(e.hero)}">
         <span class="cell-label">${e.is_pick ? "PICK" : "BAN"}</span>
       </div>

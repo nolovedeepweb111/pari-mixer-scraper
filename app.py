@@ -1002,22 +1002,38 @@ CAPTAIN_SLOTS = int(os.environ.get("CAPTAIN_SLOTS", "24"))
 _LABEL_NUMBER_RE = re.compile(r"#\s*(\d+)")
 
 
-def _tournament_slug(tournament_id: int) -> str:
-    if tournament_id in MIXER_TOURNAMENT_SLUGS:
-        return MIXER_TOURNAMENT_SLUGS[tournament_id]
+def _base_tournament_slug(tournament_id: int) -> str:
     source = source_for_tournament(tournament_id)
     label = MIXER_TOURNAMENT_LABELS.get(tournament_id)
     if label is None and source is not None and source is not PRIMARY_SOURCE:
         # У неосновного источника своя серия и своя нумерация, поэтому его
         # живое название годится как есть: "WINLINE Super Mixer #1" -> /winline1.
         # Для основного так делать нельзя: там "Mixer Cup #1" и "PARI Mixer
-        # Cup #1" - РАЗНЫЕ кубки, и адрес у них совпал бы, а разрешался бы
-        # всегда в пользу того, что новее. Отсюда и карта меток выше.
+        # Cup #1" - РАЗНЫЕ кубки, и адрес у них совпал бы. Отсюда карта меток
+        # выше и развод одинаковых адресов в _tournament_slug.
         label = _mixer_tournament_names.get(tournament_id)
     number = _LABEL_NUMBER_RE.search(label) if label else None
     prefix = (source or PRIMARY_SOURCE).slug_prefix
     # A cup we have no label for still needs a stable address, hence the id.
     return f"{prefix}{number.group(1)}" if number else f"cup{tournament_id}"
+
+
+def _tournament_slug(tournament_id: int) -> str:
+    """Адрес кубка. По номеру из названия - но номера в серии повторяются:
+    "Mixer Cup #5" (кубок 28, лето) и "Pari Mixer Cup #5" (кубок 31) оба
+    просятся в /mixercup5. Такой адрес разрешался в пользу НОВОГО кубка, то
+    есть архив старого становился недоступен - проверено на этой паре.
+
+    Поэтому при совпадении адрес по номеру остаётся за новым кубком, а старый
+    уезжает на /cupNN. Адрес там стабильный: номер кубка не меняется."""
+    if tournament_id in MIXER_TOURNAMENT_SLUGS:
+        return MIXER_TOURNAMENT_SLUGS[tournament_id]
+    base = _base_tournament_slug(tournament_id)
+    if base != f"cup{tournament_id}":
+        for other in _known_tournament_ids():
+            if other > tournament_id and other not in MIXER_TOURNAMENT_SLUGS                     and _base_tournament_slug(other) == base:
+                return f"cup{tournament_id}"
+    return base
 
 
 def _known_tournament_ids(session: Session | None = None) -> list[int]:

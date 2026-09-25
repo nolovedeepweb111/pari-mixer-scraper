@@ -91,12 +91,16 @@ function renderCupSwitcher() {
   const sel = document.getElementById("cup-switcher");
   if (!sel) return;
   // A cup with no games of its own is only worth listing while it's the live
-  // one (a freshly opened cup has rosters before it has matches).
-  const shown = cups.list.filter((t) => t.has_matches || t.is_active);
+  // one (a freshly opened cup has rosters before it has matches) - or while it
+  // is gathering players, when the list of who signed up is the whole point.
+  const shown = cups.list.filter((t) => t.has_matches || t.is_active || t.registrations > 0);
   if (shown.length < 2) return;
   sel.innerHTML = shown
     .map((t) => {
-      const mark = t.locked ? " 🔒" : t.is_active ? " · сейчас" : "";
+      const mark = t.locked ? " 🔒"
+        : t.is_active ? " · сейчас"
+        : !t.has_matches && t.registrations > 0 ? " · набор"
+        : "";
       // The label is the tournament's name as mixer-cup reports it.
       return `<option value="${escapeHtml(t.slug)}">${escapeHtml(t.label)}${mark}</option>`;
     })
@@ -224,6 +228,7 @@ async function renderRoute() {
     case "match":
       return loadMatchPage(route.matchId);
     default:
+      if (cupIsRegistering(cupId)) return loadRegistrations(cupId);
       detailEl.innerHTML = '<p class="hint">Выберите команду слева</p>';
       highlightSidebar();
   }
@@ -386,7 +391,9 @@ async function loadTeams(tournamentId) {
     return;
   }
   if (teams.length === 0) {
-    teamsEl.innerHTML = '<p class="hint">Нет данных. Обновляется автоматически, зайдите чуть позже.</p>';
+    teamsEl.innerHTML = cupIsRegistering(tournamentId)
+      ? '<p class="hint">Команд ещё нет: идёт набор. Список заявок — справа.</p>'
+      : '<p class="hint">Нет данных. Обновляется автоматически, зайдите чуть позже.</p>';
     clearSortSlot();
     lastTeamList = null;
     return;
@@ -441,6 +448,63 @@ const ROLE_LABELS = {
 function formatRoles(roles) {
   if (!roles) return "";
   return roles.split(",").map((r) => ROLE_LABELS[r] || r).join(" / ");
+}
+
+// Кубок, который ещё набирает игроков: команд нет, есть заявки.
+function cupIsRegistering(tournamentId) {
+  const cup = cups.byId.get(tournamentId);
+  return !!cup && !cup.has_matches && cup.registrations > 0;
+}
+
+async function loadRegistrations(tournamentId) {
+  detailEl.innerHTML = '<p class="hint">Загружаю заявки...</p>';
+  const res = await fetch(`/api/registrations?tournament=${tournamentId}`);
+  if (!res.ok) {
+    detailEl.innerHTML = '<p class="hint">Не удалось получить список заявок.</p>';
+    return;
+  }
+  const data = await res.json();
+  const rows = data.players.map((p, i) => {
+    const nameCell = p.account_id
+      ? `<button class="player-link" data-account-id="${p.account_id}">${escapeHtml(p.name)}</button>`
+      : escapeHtml(p.name);
+    // Капитан известен только после редукциона; до него подсказка - ставка.
+    const captain = p.is_captain ? '<span class="tag tag-captain">Капитан</span>' : "";
+    const record = p.games
+      ? `${p.games} · ${p.win_rate}%`
+      : '<span class="hint">не играл(а) у нас</span>';
+    const heroes = data.hero_pools_locked
+      ? '<span class="hint">по ключу</span>'
+      : p.top_heroes
+          .map((h) => `<img class="hero-icon" src="${escapeHtml(heroIconUrl(h.icon))}" alt="${escapeHtml(h.name)}" title="${escapeHtml(h.name)} ×${h.games}" loading="lazy" onerror="this.remove()">`)
+          .join("") || '<span class="hint">—</span>';
+    return `
+      <tr>
+        <td class="lb-rank">${i + 1}</td>
+        <td>${nameCell} ${captain}</td>
+        <td>${formatMmr(p.mmr)}</td>
+        <td class="reg-roles">${escapeHtml(formatRoles(p.roles))}</td>
+        <td class="reg-bid">${p.bid == null ? "—" : p.bid.toFixed(2)}</td>
+        <td>${record}</td>
+        <td class="lb-heroes">${heroes}</td>
+      </tr>`;
+  }).join("");
+  const captainNote = data.captains_known
+    ? "Капитаны уже определены."
+    : "Капитанов ещё не назначили: их выбирают по размеру ставки, поэтому список отсортирован по ней.";
+  detailEl.innerHTML = `
+    <h2>Кто зарегистрировался — ${escapeHtml(data.tournament_label || "новый кубок")}</h2>
+    <p class="hint">${data.players.length} заявок. ${captainNote}</p>
+    <div class="table-scroll">
+      <table class="subs-table leaderboard-table">
+        <thead><tr><th></th><th>Игрок</th><th>MMR</th><th>Роли</th><th>Ставка</th><th>Игр · WR</th><th>Герои</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  for (const btn of detailEl.querySelectorAll(".player-link")) {
+    btn.addEventListener("click", () => navigate(`/player/${btn.dataset.accountId}`));
+  }
+  highlightSidebar();
 }
 
 function heroItemsHtml(heroes) {

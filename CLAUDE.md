@@ -26,7 +26,7 @@ deliberately outside the repo — the repo is public.
 |---|---|
 | `app.py` | Flask: endpoints, key access, tournament/slug resolution, launches collector |
 | `collect.py` | Collection: Steam → mixer-cup → OpenDota; builds DB aside, swaps it in |
-| `models.py` | 12 SQLite tables; `ensure_schema` adds missing columns |
+| `models.py` | 13 SQLite tables; `ensure_schema` adds missing columns |
 | `sources.py` | Tournament sources: API url, id offset, leagues, address prefix |
 | `mixercup_client.py` | mixer-cup GraphQL; applies the id offset itself |
 | `steam_client.py` | League match history — the only cheap source of a match list |
@@ -39,7 +39,7 @@ deliberately outside the repo — the repo is public.
 
 Steam gives the league's match list with lineups (one cheap call). mixer-cup
 gives what Dota does not have: team names, rosters, MMR, results, substitutions,
-queue, weeks. OpenDota gives per-match draft and KDA — one call per match, the
+queue, weeks, and — for a cup still forming — who signed up. OpenDota gives per-match draft and KDA — one call per match, the
 bottleneck.
 
 The collector is a **separate process**: it copies the live DB, fills the copy,
@@ -76,6 +76,9 @@ file immediately.
 - **The mixer-cup deployments run different schemas.** `api.mixer-cup.gg` has
   no week fields and answers 400 to a query mentioning them, which kills that
   source's whole sync. Hence `MixerSource.has_weeks`.
+- **`participantList`'s `pageInfo.total` is the page size, not the total.**
+  `first: 1` answers 1, `first: 5` answers 5 (cup 31 actually had 49). Page by
+  `offset` until a short page, never by that number.
 - **mixer-cup exposes no Steam id for a player** — it is parsed out of the avatar
   URL. No avatar: match by nickname among known players
   (`_resolve_account_by_nickname`), else show a card with no stats

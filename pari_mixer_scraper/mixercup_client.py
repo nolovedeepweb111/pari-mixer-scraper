@@ -123,6 +123,19 @@ query ParticipantList($tournamentId: Int!, $first: Int, $offset: Int, $filters: 
 }
 """
 
+_REGISTRATIONS_QUERY = """
+query Registrations($tournamentId: Int!, $first: Int, $offset: Int) {
+    participantList(tournamentId: $tournamentId, first: $first, offset: $offset) {
+        items {
+            status
+            bidSize
+            isCaptain
+            player { id nickname rating steamAvatar preferredRoles }
+        }
+    }
+}
+"""
+
 _TOURNAMENT_EVENTS_QUERY = """
 query TournamentEvents($filters: TournamentEventFilterInput, $first: Int, $offset: Int) {
     tournamentEvents(filters: $filters, first: $first, offset: $offset, sort: [CREATED_AT]) {
@@ -227,6 +240,28 @@ class MixerCupClient:
         tournament_id = self._local_id(tournament_id)
         data = self._post(_WEEKS_QUERY, {"tournamentId": tournament_id})
         return data.get("tournamentWeeks") or []
+
+    def iter_registrations(self, tournament_id: int, page_size: int = 100):
+        """Заявки на кубок, который ещё не начался: {status, bidSize,
+        isCaptain, player}.
+
+        Листается по offset до короткой страницы, а НЕ по pageInfo.total:
+        у этого запроса total равен размеру выданной страницы, а не числу
+        заявок - с first=1 он отвечает 1, с first=5 отвечает 5. Проверено на
+        турнире 31, где заявок 49."""
+        offset = 0
+        while True:
+            data = self._post(_REGISTRATIONS_QUERY, {
+                "tournamentId": self._local_id(tournament_id),
+                "first": page_size,
+                "offset": offset,
+            })
+            items = ((data.get("participantList") or {}).get("items")) or []
+            for item in items:
+                yield item
+            if len(items) < page_size:
+                return
+            offset += len(items)
 
     def _week_number_by_id(self, local_tournament_id: int) -> dict[str, int]:
         """weekId -> weekNumber. У команды в ответе только идентификатор недели,

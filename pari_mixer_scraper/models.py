@@ -211,6 +211,34 @@ class UnlinkedRosterPlayer(Base):
     preferred_roles: Mapped[str | None]
 
 
+class TournamentRegistration(Base):
+    """Заявка игрока на ещё не начавшийся кубок (статус турнира REDUCTION).
+
+    До драфта команд нет, а список желающих уже есть: mixer-cup отдаёт его
+    через participantList - ник, рейтинг, роли, размер ставки и признак
+    капитана. Ставка тут не украшение: капитанами становятся те, кто поставил
+    больше всех, так что по ней видно будущих капитанов ещё до жеребьёвки.
+
+    Steam-аккаунт достаётся из ссылки на аватар, как и везде (см.
+    UnlinkedRosterPlayer): по нему заявка связывается с нашей статистикой
+    прошлых кубков. Если аватара нет, остаётся ник и рейтинг.
+
+    Перестраивается из mixer-cup на каждом сборе, бэкап не нужен."""
+    __tablename__ = "tournament_registrations"
+
+    tournament_id: Mapped[int] = mapped_column(primary_key=True)
+    mixer_player_id: Mapped[str] = mapped_column(primary_key=True)
+    account_id: Mapped[int | None] = mapped_column(nullable=True)
+    nickname: Mapped[str | None]
+    mmr: Mapped[float | None]
+    preferred_roles: Mapped[str | None]
+    # Строкой: mixer-cup отдаёт её как "57.06", и округлять до целых нельзя -
+    # у большинства ставка меньше единицы.
+    bid: Mapped[str | None]
+    is_captain: Mapped[bool | None]
+    status: Mapped[str | None]
+
+
 class UnavailableMatch(Base):
     """Матч, которого у OpenDota нет (404), и когда мы про него спрашивали.
 

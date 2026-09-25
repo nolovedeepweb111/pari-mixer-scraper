@@ -15,16 +15,18 @@ from dotenv import load_dotenv
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
-from .mixercup_client import MixerCupClient
+from .mixercup_client import MixerCupClient, steam_account_id_from_avatar_url
 from .models import (
     Base, Hero, Match, MatchDraftEntry, MatchPlayer, Player, PlayerNote, QueuedPlayer,
-    SubstitutionEvent, Team, TeamTournamentName, TeamWeekName, UnavailableMatch,
-    UnlinkedRosterPlayer,
+    SubstitutionEvent, Team, TeamTournamentName, TeamWeekName, TournamentRegistration,
+    UnavailableMatch, UnlinkedRosterPlayer,
     build_engine, configure_sqlite, ensure_schema,
 )
 from .opendota_client import OpenDotaClient, OpenDotaLimitReached
 from .roster_overrides import MANUAL_ROSTER_OVERRIDES
-from .sources import PRIMARY_SOURCE, SOURCES, all_league_ids, source_for_tournament
+from .sources import (
+    PRIMARY_SOURCE, SOURCE_ID_SPAN, SOURCES, all_league_ids, source_for_tournament,
+)
 from .steam_client import SteamClient
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -1326,6 +1328,54 @@ def restore_state_backup(session: Session, progress: ProgressFn) -> dict | None:
     return data
 
 
+def sync_registrations(
+    session: Session,
+    mixer_client: MixerCupClient,
+    tournament_id: int,
+    progress: ProgressFn,
+) -> int:
+    """Заявки на кубок, который ещё не начался (см. TournamentRegistration).
+
+    Список переписывается целиком: заявку можно снять, ставку - поднять, и
+    держать снятые заявки вечно значило бы показывать людей, которых в кубке
+    не будет."""
+    try:
+        items = list(mixer_client.iter_registrations(tournament_id))
+    except Exception as e:
+        progress(f"Registrations fetch failed for tournament {tournament_id}: {e}")
+        return 0
+
+    session.execute(
+        delete(TournamentRegistration)
+        .where(TournamentRegistration.tournament_id == tournament_id)
+    )
+    seen: set[str] = set()
+    captains = 0
+    for item in items:
+        player = item.get("player") or {}
+        player_id = player.get("id")
+        if not player_id or player_id in seen:
+            continue
+        seen.add(player_id)
+        roles = player.get("preferredRoles") or []
+        session.add(TournamentRegistration(
+            tournament_id=tournament_id,
+            mixer_player_id=player_id,
+            account_id=steam_account_id_from_avatar_url(player.get("steamAvatar")),
+            nickname=player.get("nickname"),
+            mmr=player.get("rating"),
+            preferred_roles=",".join(roles) if roles else None,
+            bid=item.get("bidSize"),
+            is_captain=bool(item.get("isCaptain")),
+            status=item.get("status"),
+        ))
+        captains += bool(item.get("isCaptain"))
+    session.commit()
+    tail = f", {captains} captain(s)" if captains else ", no captains yet"
+    progress(f"Registrations for tournament {tournament_id}: {len(seen)} player(s){tail}")
+    return len(seen)
+
+
 def sync_queue_snapshot(
     session: Session,
     mixer_client: MixerCupClient,
@@ -1827,6 +1877,29 @@ def _sync_mixer_source(session: Session, src, od_client: OpenDotaClient,
     except Exception as e:
         progress(f"[{src.key}] could not resolve tournament id, skipping team/roster linking: {e}")
         return None
+
+    # Кубок, который ещё набирает игроков (REDUCTION): команд у него нет, а
+    # список заявок уже есть, и это единственное, что про него можно показать.
+    try:
+        registering = [t["id"] for t in mixer_client.list_tournaments()
+                       if t.get("status") == "REDUCTION"]
+        for tid in registering:
+            sync_registrations(session, mixer_client, tid, progress)
+        # Кубок начался - заявки больше не нужны: есть команды. Чистим только
+        # свой диапазон номеров, чужой источник трогать нельзя.
+        dropped = session.execute(
+            delete(TournamentRegistration).where(
+                TournamentRegistration.tournament_id >= src.id_offset,
+                TournamentRegistration.tournament_id < src.id_offset + SOURCE_ID_SPAN,
+                TournamentRegistration.tournament_id.notin_(registering or [-1]),
+            )
+        ).rowcount
+        session.commit()
+        if dropped:
+            progress(f"[{src.key}] dropped {dropped} registration(s) of cups that have started")
+    except Exception as e:
+        progress(f"[{src.key}] could not list tournaments for registrations: "
+                 f"{' '.join(str(e).split())[:200]}")
 
     if active_id is None:
         return None

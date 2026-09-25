@@ -33,7 +33,7 @@ from pari_mixer_scraper.models import (
     TeamWeekName,
     UnlinkedRosterPlayer,
     TeamTournamentName,
-    SubstitutionEvent, Team,
+    SubstitutionEvent, Team, TournamentRegistration,
     build_engine, configure_sqlite, ensure_schema,
 )
 
@@ -715,6 +715,12 @@ def api_tournaments():
                 .where(Match.mixer_tournament_id.is_not(None)).distinct()
             )
         }
+        # Кубок, который ещё не начался: матчей нет, а заявки есть - и это
+        # единственное, что про него пока можно показать.
+        registered = dict(session.execute(
+            select(TournamentRegistration.tournament_id, func.count())
+            .group_by(TournamentRegistration.tournament_id)
+        ).all())
     return jsonify({
         "active_id": active,
         "active_ids": sorted(active_ids),
@@ -731,6 +737,8 @@ def api_tournaments():
                 "weeks": sorted(weeks_by_cup.get(tournament_id, [])),
                 # Lets the switcher mark what this visitor can't open yet.
                 "locked": not _may_see_tournament(tournament_id),
+                # Сколько человек подало заявку (кубок в наборе).
+                "registrations": registered.get(tournament_id, 0),
             }
             for tournament_id in ids
             # Only cups this site can actually show. mixer-cup's tournament
@@ -738,6 +746,7 @@ def api_tournaments():
             # collected anything - those have an id and a name here and
             # nothing else, and they are not this cup series.
             if tournament_id in played or tournament_id in active_ids
+            or tournament_id in registered
         ],
     })
 
@@ -1376,6 +1385,102 @@ def _past_cup_teams(session: Session, tournament_id: int,
     ]
     teams.sort(key=lambda t: t["name"].lower())
     return teams
+
+
+@app.get("/api/registrations")
+def api_registrations():
+    """Кто подал заявку на кубок, который ещё не начался.
+
+    До драфта команд нет, и страница кубка иначе была бы пустой. Показываем
+    заявки со ставкой (по ней выбирают капитанов) и, если человек уже играл у
+    нас, его статистику прошлых кубков - ради неё сюда и заходят."""
+    scope = request.args.get("tournament", type=int)
+    with Session(engine) as session:
+        if scope is None:
+            scope = session.execute(
+                select(TournamentRegistration.tournament_id)
+                .order_by(TournamentRegistration.tournament_id.desc()).limit(1)
+            ).scalar()
+        if scope is None:
+            return jsonify({"tournament_id": None, "players": [], "hero_pools_locked": True})
+        if not _may_see_tournament(scope):
+            return _deny_tournament()
+
+        rows = session.execute(
+            select(TournamentRegistration)
+            .where(TournamentRegistration.tournament_id == scope)
+        ).scalars().all()
+        account_ids = [r.account_id for r in rows if r.account_id]
+
+        decided = case((Match.radiant_win.is_not(None), 1), else_=0)
+        won = case((MatchPlayer.is_radiant == Match.radiant_win, 1), else_=0)
+        stats = {
+            aid: (games, dec or 0, wins or 0)
+            for aid, games, dec, wins in session.execute(
+                select(MatchPlayer.account_id, func.count(), func.sum(decided), func.sum(won))
+                .join(Match, Match.match_id == MatchPlayer.match_id)
+                .where(MatchPlayer.account_id.in_(account_ids))
+                .group_by(MatchPlayer.account_id)
+            )
+        } if account_ids else {}
+        heroes_by_player: dict[int, list] = {}
+        if account_ids:
+            for aid, hero_name, internal_name, games in session.execute(
+                select(MatchPlayer.account_id, Hero.localized_name, Hero.name, func.count())
+                .join(Hero, Hero.hero_id == MatchPlayer.hero_id)
+                .join(Match, Match.match_id == MatchPlayer.match_id)
+                .where(MatchPlayer.account_id.in_(account_ids))
+                .group_by(MatchPlayer.account_id, MatchPlayer.hero_id)
+            ):
+                heroes_by_player.setdefault(aid, []).append(
+                    (games, hero_name, _hero_icon_slug(internal_name))
+                )
+        # Ник из наших данных нужен только чтобы найти страницу игрока; на
+        # карточке показывается тот, под которым человек зарегистрировался.
+        known = {
+            aid for (aid,) in session.execute(
+                select(Player.account_id).where(Player.account_id.in_(account_ids))
+            )
+        } if account_ids else set()
+
+    pools_locked = not _may_see_hero_pools()
+    players = []
+    for r in rows:
+        games, dec, wins = stats.get(r.account_id, (0, 0, 0))
+        top = sorted(heroes_by_player.get(r.account_id, []), reverse=True)[:5]
+        players.append({
+            "account_id": r.account_id if r.account_id in known else None,
+            "name": r.nickname or "без ника",
+            "mmr": r.mmr,
+            "roles": r.preferred_roles,
+            # Ставка: по ней выбирают капитанов, поэтому она тут главное число.
+            "bid": _as_float(r.bid),
+            "is_captain": bool(r.is_captain),
+            "status": r.status,
+            "games": games,
+            "wins": wins,
+            "losses": dec - wins,
+            "win_rate": round(100 * wins / dec) if dec else None,
+            "top_heroes": [] if pools_locked else [
+                {"name": name, "icon": slug, "games": count} for count, name, slug in top
+            ],
+        })
+    # Капитаны наверх, дальше по ставке: это и есть порядок отбора.
+    players.sort(key=lambda p: (not p["is_captain"], -(p["bid"] or 0), -(p["mmr"] or 0)))
+    return jsonify({
+        "tournament_id": scope,
+        "tournament_label": _tournament_label(scope, None),
+        "captains_known": any(p["is_captain"] for p in players),
+        "hero_pools_locked": pools_locked,
+        "players": players,
+    })
+
+
+def _as_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @app.get("/api/teams")

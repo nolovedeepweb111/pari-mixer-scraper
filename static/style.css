@@ -1125,3 +1125,15 @@ aside h2 {
 
 /* Игра без драфта у OpenDota: пики восстановлены по составам. */
 .draft-partial { margin-left: 8px; font-size: 12px; }
+
+/* Страница «Кто зарегистрировался»: заявки на ещё не начавшийся кубок. */
+.tag-captain {
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  padding: 2px 8px;
+}
+.reg-bid { font-weight: 600; }
+.reg-roles { color: var(--muted); font-size: 13px; }
+/* Таблица шире телефона - прокручивается сама, не растягивая страницу. */
+.table-scroll { overflow-x: auto; }

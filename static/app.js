@@ -468,8 +468,14 @@ async function loadRegistrations(tournamentId) {
     const nameCell = p.account_id
       ? `<button class="player-link" data-account-id="${p.account_id}">${escapeHtml(p.name)}</button>`
       : escapeHtml(p.name);
-    // Капитан известен только после редукциона; до него подсказка - ставка.
-    const captain = p.is_captain ? '<span class="tag tag-captain">Капитан</span>' : "";
+    // До редукциона капитаны только предсказаны по ставке - так и подписано.
+    const captain = p.reserve
+      ? '<span class="tag tag-reserve">Резерв</span>'
+      : p.captain_by_bid
+        ? '<span class="tag tag-captain-bid">Капитан по ставке</span>'
+        : p.is_captain
+          ? '<span class="tag tag-captain">Капитан</span>'
+          : "";
     const record = p.games
       ? `${p.games} · ${p.win_rate}%`
       : '<span class="hint">не играл(а) у нас</span>';
@@ -479,7 +485,7 @@ async function loadRegistrations(tournamentId) {
           .map((h) => `<img class="hero-icon" src="${escapeHtml(heroIconUrl(h.icon))}" alt="${escapeHtml(h.name)}" title="${escapeHtml(h.name)} ×${h.games}" loading="lazy" onerror="this.remove()">`)
           .join("") || '<span class="hint">—</span>';
     return `
-      <tr>
+      <tr class="${p.reserve ? "reg-reserve" : ""}">
         <td class="lb-rank">${i + 1}</td>
         <td>${nameCell} ${captain}</td>
         <td>${formatMmr(p.mmr)}</td>
@@ -490,11 +496,14 @@ async function loadRegistrations(tournamentId) {
       </tr>`;
   }).join("");
   const captainNote = data.captains_known
-    ? "Капитаны уже определены."
-    : "Капитанов ещё не назначили: их выбирают по размеру ставки, поэтому список отсортирован по ней.";
+    ? `Капитаны определены, их ${data.captain_slots}.`
+    : `Капитанами станут те, кто сделал ${data.captain_slots} самых крупных ставок. Пока это прогноз: mixer-cup их ещё не назначил.`;
+  const reserveNote = data.reserve_count
+    ? ` В резерве ${data.reserve_count}: минимальная ставка, за капитанство не борются.`
+    : "";
   detailEl.innerHTML = `
     <h2>Кто зарегистрировался — ${escapeHtml(data.tournament_label || "новый кубок")}</h2>
-    <p class="hint">${data.players.length} заявок. ${captainNote}</p>
+    <p class="hint">${data.players.length} заявок. ${captainNote}${reserveNote}</p>
     <div class="table-scroll">
       <table class="subs-table leaderboard-table">
         <thead><tr><th></th><th>Игрок</th><th>MMR</th><th>Роли</th><th>Ставка</th><th>Игр · WR</th><th>Герои</th></tr></thead>

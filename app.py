@@ -995,6 +995,9 @@ for _pair in os.environ.get("MIXER_TOURNAMENT_SLUGS", "").replace(",", ";").spli
         except ValueError:
             pass
 
+# Сколько капитанов набирает кубок: столько самых больших ставок и проходит.
+CAPTAIN_SLOTS = int(os.environ.get("CAPTAIN_SLOTS", "24"))
+
 _LABEL_NUMBER_RE = re.compile(r"#\s*(\d+)")
 
 
@@ -1444,9 +1447,26 @@ def api_registrations():
         } if account_ids else set()
 
     pools_locked = not _may_see_hero_pools()
+    # Ставка на минимуме - это не ставка, а вход в резерв: человек записался,
+    # но за капитанство не борется. На кубке 31 таких 44 из 49, все ровно по
+    # 0.68. Минимум берём из самих заявок: у каждого кубка он свой.
+    bids = [b for b in (_as_float(r.bid) for r in rows) if b is not None]
+    floor = min(bids) if bids else None
+    real_bids = sorted(
+        (b for b in bids if floor is None or b > floor), reverse=True
+    )[:CAPTAIN_SLOTS]
+    # Порог, начиная с которого ставка ещё попадает в число капитанских.
+    captain_cut = real_bids[-1] if len(real_bids) >= CAPTAIN_SLOTS else (
+        real_bids[-1] if real_bids else None)
     players = []
     for r in rows:
         games, dec, wins = stats.get(r.account_id, (0, 0, 0))
+        bid = _as_float(r.bid)
+        reserve = bid is None or (floor is not None and bid <= floor)
+        # Капитанами становятся CAPTAIN_SLOTS самых больших ставок. Пока
+        # mixer-cup не проставил isCaptain, это прогноз по ставке; как
+        # проставит - его ответ главнее нашего счёта.
+        by_bid = (not reserve and captain_cut is not None and bid >= captain_cut)
         top = sorted(heroes_by_player.get(r.account_id, []), reverse=True)[:5]
         players.append({
             "account_id": r.account_id if r.account_id in known else None,
@@ -1454,8 +1474,12 @@ def api_registrations():
             "mmr": r.mmr,
             "roles": r.preferred_roles,
             # Ставка: по ней выбирают капитанов, поэтому она тут главное число.
-            "bid": _as_float(r.bid),
-            "is_captain": bool(r.is_captain),
+            "bid": bid,
+            "is_captain": bool(r.is_captain) or by_bid,
+            # Метка «по ставке»: капитан ещё не назначен, просто ставка в
+            # числе крупнейших.
+            "captain_by_bid": by_bid and not r.is_captain,
+            "reserve": reserve,
             "status": r.status,
             "games": games,
             "wins": wins,
@@ -1465,12 +1489,17 @@ def api_registrations():
                 {"name": name, "icon": slug, "games": count} for count, name, slug in top
             ],
         })
-    # Капитаны наверх, дальше по ставке: это и есть порядок отбора.
-    players.sort(key=lambda p: (not p["is_captain"], -(p["bid"] or 0), -(p["mmr"] or 0)))
+    # Порядок отбора: капитаны, потом остальные по ставке, резерв в конце.
+    players.sort(key=lambda p: (
+        p["reserve"], not p["is_captain"], -(p["bid"] or 0), -(p["mmr"] or 0)))
     return jsonify({
         "tournament_id": scope,
         "tournament_label": _tournament_label(scope, None),
-        "captains_known": any(p["is_captain"] for p in players),
+        "captain_slots": CAPTAIN_SLOTS,
+        # Назначил ли капитанов сам mixer-cup - или мы их пока только
+        # предсказываем по ставке.
+        "captains_known": any(p["is_captain"] and not p["captain_by_bid"] for p in players),
+        "reserve_count": sum(1 for p in players if p["reserve"]),
         "hero_pools_locked": pools_locked,
         "players": players,
     })

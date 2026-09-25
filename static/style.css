@@ -1133,6 +1133,21 @@ aside h2 {
   font-size: 11px;
   padding: 2px 8px;
 }
+.tag-captain-bid {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-size: 11px;
+  padding: 1px 7px;
+}
+.tag-reserve {
+  background: var(--panel-deep);
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 8px;
+}
+/* Резерв - ниже всех и тише: эти люди ждут, а не борются за капитанство. */
+.reg-reserve td { color: var(--muted); }
 .reg-bid { font-weight: 600; }
 .reg-roles { color: var(--muted); font-size: 13px; }
 /* Таблица шире телефона - прокручивается сама, не растягивая страницу. */

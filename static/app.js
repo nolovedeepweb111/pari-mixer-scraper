@@ -99,7 +99,7 @@ function renderCupSwitcher() {
     .map((t) => {
       const mark = t.locked ? " 🔒"
         : t.is_active ? " · сейчас"
-        : !t.has_matches && t.registrations > 0 ? " · набор"
+        : t.registrations > 0 ? " · набор"
         : "";
       // The label is the tournament's name as mixer-cup reports it.
       return `<option value="${escapeHtml(t.slug)}">${escapeHtml(t.label)}${mark}</option>`;
@@ -149,6 +149,7 @@ function parsePath(pathname) {
   const slug = parts[0];
   const cup = cups.bySlug.get(slug);
   const tournamentId = cup ? cup.id : null;
+  if (parts[1] === "reg") return { view: "registrations", slug, tournamentId };
   if (parts[1] === "players") return { view: "players", slug, tournamentId };
   if (parts[1] === "subs") return { view: "subs", slug, tournamentId };
   if (parts[1] === "team" && parts[2]) {
@@ -221,6 +222,8 @@ async function renderRoute() {
       return loadPlayersLeaderboard(cupId);
     case "allPlayers":
       return loadPlayersLeaderboard("all");
+    case "registrations":
+      return loadRegistrations(cupId);
     case "subs":
       return loadAllSubstitutions(cupId);
     case "player":
@@ -228,7 +231,7 @@ async function renderRoute() {
     case "match":
       return loadMatchPage(route.matchId);
     default:
-      if (cupIsRegistering(cupId)) return loadRegistrations(cupId);
+      if (hasRegistrations(cupId) && !lastTeamList) return loadRegistrations(cupId);
       detailEl.innerHTML = '<p class="hint">Выберите команду слева</p>';
       highlightSidebar();
   }
@@ -391,16 +394,18 @@ async function loadTeams(tournamentId) {
     return;
   }
   if (teams.length === 0) {
-    teamsEl.innerHTML = cupIsRegistering(tournamentId)
-      ? '<p class="hint">Команд ещё нет: идёт набор. Список заявок — справа.</p>'
+    teamsEl.innerHTML = hasRegistrations(tournamentId)
+      ? '<p class="hint">Команд ещё нет: идёт набор.</p>'
       : '<p class="hint">Нет данных. Обновляется автоматически, зайдите чуть позже.</p>';
     clearSortSlot();
     lastTeamList = null;
+    renderRegistrationsLink(tournamentId);
     return;
   }
 
   lastTeamList = { tournamentId, teams, weeks };
   renderTeamList();
+  renderRegistrationsLink(tournamentId);
 }
 
 // Отрисовка уже полученного списка. Отдельно от загрузки, чтобы смена
@@ -450,10 +455,23 @@ function formatRoles(roles) {
   return roles.split(",").map((r) => ROLE_LABELS[r] || r).join(" / ");
 }
 
-// Кубок, который ещё набирает игроков: команд нет, есть заявки.
-function cupIsRegistering(tournamentId) {
+// Есть ли у кубка заявки - список тех, кто записался на ещё не начавшийся кубок.
+function hasRegistrations(tournamentId) {
   const cup = cups.byId.get(tournamentId);
-  return !!cup && !cup.has_matches && cup.registrations > 0;
+  return !!cup && cup.registrations > 0;
+}
+
+// Кнопка «Заявки» под списком команд: пока кубок набирает игроков, это
+// единственная его страница, и попасть на неё надо как-то очевидно.
+function renderRegistrationsLink(tournamentId) {
+  const cup = cups.byId.get(tournamentId);
+  if (!cup || !cup.registrations) return;
+  const btn = document.createElement("button");
+  btn.className = "team-btn reg-link";
+  btn.innerHTML = `<span class="team-name">Заявки на кубок</span>` +
+    `<span class="team-meta">${cup.registrations} ${plural(cup.registrations, "заявка", "заявки", "заявок")}</span>`;
+  btn.onclick = () => navigate(cupPath(tournamentId, "reg"));
+  teamsEl.appendChild(btn);
 }
 
 async function loadRegistrations(tournamentId) {

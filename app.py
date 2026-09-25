@@ -683,6 +683,7 @@ app.url_map.converters["tslug"] = _TournamentSlugConverter
 
 
 @app.get("/<tslug:slug>")
+@app.get("/<tslug:slug>/reg")
 @app.get("/<tslug:slug>/players")
 @app.get("/<tslug:slug>/subs")
 @app.get("/<tslug:slug>/team/<int:team_id>")

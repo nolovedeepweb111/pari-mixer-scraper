@@ -527,7 +527,7 @@ async function loadRegistrations(tournamentId) {
     <div class="slots">
       <div class="slots-line">
         <span class="slots-left">${data.slots_left}</span>
-        <span class="slots-total">${plural(data.slots_left, "место", "места", "мест")} из ${total} свободно</span>
+        <span class="slots-total">${plural(data.slots_left, "место", "места", "мест")} из ${total} свободно${data.reserve_count ? `, ещё ${data.reserve_count} в резерве` : ""}</span>
       </div>
       <div class="slots-bar"><span style="width: ${filled}%"></span></div>
     </div>` : "";

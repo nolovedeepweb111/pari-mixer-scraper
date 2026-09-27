@@ -998,6 +998,9 @@ for _pair in os.environ.get("MIXER_TOURNAMENT_SLUGS", "").replace(",", ";").spli
 
 # Сколько капитанов набирает кубок: столько самых больших ставок и проходит.
 CAPTAIN_SLOTS = int(os.environ.get("CAPTAIN_SLOTS", "24"))
+# Сколько платных мест в кубке всего. Заявка занимает место, поэтому на
+# странице набора видно, сколько ещё осталось.
+PAID_SLOTS = int(os.environ.get("PAID_SLOTS", "120"))
 
 _LABEL_NUMBER_RE = re.compile(r"#\s*(\d+)")
 
@@ -1513,6 +1516,11 @@ def api_registrations():
         "tournament_id": scope,
         "tournament_label": _tournament_label(scope, None),
         "captain_slots": CAPTAIN_SLOTS,
+        "paid_slots": PAID_SLOTS,
+        "slots_taken": len(players),
+        # Не меньше нуля: мест может оказаться больше объявленного, и
+        # «осталось -3» читалось бы как ошибка сайта.
+        "slots_left": max(PAID_SLOTS - len(players), 0),
         # Назначил ли капитанов сам mixer-cup - или мы их пока только
         # предсказываем по ставке.
         "captains_known": any(p["is_captain"] and not p["captain_by_bid"] for p in players),

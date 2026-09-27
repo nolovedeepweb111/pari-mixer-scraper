@@ -1154,3 +1154,29 @@ aside h2 {
 .reg-roles { color: var(--muted); font-size: 13px; }
 /* Таблица шире телефона - прокручивается сама, не растягивая страницу. */
 .table-scroll { overflow-x: auto; }
+
+/* Счётчик платных мест над списком заявок. */
+.slots { margin: 14px 0 6px; max-width: 420px; }
+.slots-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.slots-left {
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--accent);
+}
+.slots-total { color: var(--muted); font-size: 13px; }
+.slots-bar {
+  margin-top: 6px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-deep);
+  overflow: hidden;
+}
+.slots-bar span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}

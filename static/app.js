@@ -519,8 +519,21 @@ async function loadRegistrations(tournamentId) {
   const reserveNote = data.reserve_count
     ? ` В резерве ${data.reserve_count}: минимальная ставка, за капитанство не борются.`
     : "";
+  // Счётчик мест: сколько заявок принято из объявленных платных мест.
+  const taken = data.slots_taken || 0;
+  const total = data.paid_slots || 0;
+  const filled = total ? Math.min(100, Math.round((100 * taken) / total)) : 0;
+  const slotsHtml = total ? `
+    <div class="slots">
+      <div class="slots-line">
+        <span class="slots-left">${data.slots_left}</span>
+        <span class="slots-total">${plural(data.slots_left, "место", "места", "мест")} из ${total} свободно</span>
+      </div>
+      <div class="slots-bar"><span style="width: ${filled}%"></span></div>
+    </div>` : "";
   detailEl.innerHTML = `
     <h2>Кто зарегистрировался — ${escapeHtml(data.tournament_label || "новый кубок")}</h2>
+    ${slotsHtml}
     <p class="hint">${data.players.length} заявок. ${captainNote}${reserveNote}</p>
     <div class="table-scroll">
       <table class="subs-table leaderboard-table">

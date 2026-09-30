@@ -515,26 +515,33 @@ async function loadRegistrations(tournamentId) {
   }).join("");
   const captainNote = data.captains_known
     ? `Капитаны определены, их ${data.captain_slots}.`
-    : `Капитанами станут те, кто сделал ${data.captain_slots} самых крупных ставок. Пока это прогноз: mixer-cup их ещё не назначил.`;
+    : `Места разыгрываются ставками: ${data.paid_slots} крупнейших занимают места, из них ${data.captain_slots} крупнейших становятся капитанами. Пока идёт набор, это прогноз — список меняется с каждой новой ставкой.`;
   const reserveNote = data.reserve_count
-    ? ` В резерве ${data.reserve_count}: минимальная ставка, за капитанство не борются.`
+    ? ` В резерве ${data.reserve_count}: их ставки не попали в ${data.paid_slots} крупнейших.`
     : "";
   // Счётчик мест: сколько заявок принято из объявленных платных мест.
   const taken = data.slots_taken || 0;
   const total = data.paid_slots || 0;
   const filled = total ? Math.min(100, Math.round((100 * taken) / total)) : 0;
+  const reserveTail = data.reserve_count
+    ? `, ${data.reserve_count} в резерве`
+    : "";
   const slotsHtml = total ? `
     <div class="slots">
       <div class="slots-line">
-        <span class="slots-left">${data.slots_left}</span>
-        <span class="slots-total">${plural(data.slots_left, "место", "места", "мест")} из ${total} свободно${data.reserve_count ? `, ещё ${data.reserve_count} в резерве` : ""}</span>
+        <span class="slots-left">${data.slots_left || "нет"}</span>
+        <span class="slots-total">${
+          data.slots_left
+            ? `${plural(data.slots_left, "место", "места", "мест")} из ${total} свободно${reserveTail}`
+            : `свободных мест: все ${total} разыграны по ставкам${reserveTail}`
+        }</span>
       </div>
       <div class="slots-bar"><span style="width: ${filled}%"></span></div>
     </div>` : "";
   detailEl.innerHTML = `
     <h2>Кто зарегистрировался — ${escapeHtml(data.tournament_label || "новый кубок")}</h2>
     ${slotsHtml}
-    <p class="hint">${data.players.length} заявок. ${captainNote}${reserveNote}</p>
+    <p class="hint">${data.players.length} ${plural(data.players.length, "заявка", "заявки", "заявок")}. ${captainNote}${reserveNote}</p>
     <div class="table-scroll">
       <table class="subs-table leaderboard-table">
         <thead><tr><th></th><th>Игрок</th><th>MMR</th><th>Роли</th><th>Ставка</th><th>Игр · WR</th><th>Герои</th></tr></thead>

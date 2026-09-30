@@ -1467,26 +1467,27 @@ def api_registrations():
         } if account_ids else set()
 
     pools_locked = not _may_see_hero_pools()
-    # Ставка на минимуме - это не ставка, а вход в резерв: человек записался,
-    # но за капитанство не борется. На кубке 31 таких 44 из 49, все ровно по
-    # 0.68. Минимум берём из самих заявок: у каждого кубка он свой.
-    bids = [b for b in (_as_float(r.bid) for r in rows) if b is not None]
-    floor = min(bids) if bids else None
-    real_bids = sorted(
-        (b for b in bids if floor is None or b > floor), reverse=True
-    )[:CAPTAIN_SLOTS]
-    # Порог, начиная с которого ставка ещё попадает в число капитанских.
-    captain_cut = real_bids[-1] if len(real_bids) >= CAPTAIN_SLOTS else (
-        real_bids[-1] if real_bids else None)
+    # Платных мест PAID_SLOTS, и разыгрываются они ставкой: места занимают
+    # PAID_SLOTS крупнейших ставок, остальные - резерв. Капитанами становятся
+    # CAPTAIN_SLOTS крупнейших из тех, кто место занял. Всё это - прогноз по
+    # текущим ставкам: набор идёт, ставки растут, и порядок меняется до самого
+    # конца редукциона. Когда mixer-cup проставит isCaptain, его ответ главнее.
+    ranked = sorted(
+        rows,
+        key=lambda r: (-(_as_float(r.bid) or 0), -(r.mmr or 0), (r.nickname or "")),
+    )
+    rank_of = {id(r): i for i, r in enumerate(ranked)}
+    # Ставка на минимуме - это не ставка: человек записался, но за место и
+    # капитанство не торгуется. Пока крупных ставок меньше, чем мест, такие
+    # иначе попадали бы в «капитаны по ставке», ничего не поставив.
+    floor = min((_as_float(r.bid) or 0) for r in rows) if rows else None
     players = []
     for r in rows:
         games, dec, wins = stats.get(r.account_id, (0, 0, 0))
         bid = _as_float(r.bid)
-        reserve = bid is None or (floor is not None and bid <= floor)
-        # Капитанами становятся CAPTAIN_SLOTS самых больших ставок. Пока
-        # mixer-cup не проставил isCaptain, это прогноз по ставке; как
-        # проставит - его ответ главнее нашего счёта.
-        by_bid = (not reserve and captain_cut is not None and bid >= captain_cut)
+        rank = rank_of[id(r)]
+        reserve = rank >= PAID_SLOTS
+        by_bid = rank < CAPTAIN_SLOTS and bid is not None and (floor is None or bid > floor)
         top = sorted(heroes_by_player.get(r.account_id, []), reverse=True)[:5]
         players.append({
             "account_id": r.account_id if r.account_id in known else None,
@@ -1509,8 +1510,8 @@ def api_registrations():
                 {"name": name, "icon": slug, "games": count} for count, name, slug in top
             ],
         })
-    # Место занимают только оплаченные заявки: резерв записался, но платного
-    # места не занял.
+    # Занятые места - это заявки, попавшие в число платных; резерв за их
+    # пределами и места не занимает.
     paid_taken = sum(1 for p in players if not p["reserve"])
     # Порядок отбора: капитаны, потом остальные по ставке, резерв в конце.
     players.sort(key=lambda p: (

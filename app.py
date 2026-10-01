@@ -1653,7 +1653,7 @@ def api_teams():
         if week is not None and weeks and week != weeks[-1]:
             return jsonify(_past_cup_teams(session, live_scope, week))
 
-        team_query = select(Team.team_id, Team.name).order_by(Team.name)
+        team_query = select(Team.team_id, Team.name, Team.number).order_by(Team.name)
         if live_scope is not None:
             team_query = team_query.where(Team.tournament_id == live_scope)
         if week is not None:
@@ -1668,7 +1668,7 @@ def api_teams():
             # появился на сайте раньше, чем сборщик успел принести его данные.
             # Команды при этом открывались с 404: в этом кубке они не играли.
             teams = session.execute(
-                select(Team.team_id, Team.name).order_by(Team.name)
+                select(Team.team_id, Team.name, Team.number).order_by(Team.name)
             ).all()
 
         # Игроки состава без привязки к Steam (см. UnlinkedRosterPlayer): в
@@ -1683,7 +1683,7 @@ def api_teams():
 
         records = _team_records(session, live_scope, week)
         result = []
-        for team_id, name in teams:
+        for team_id, name, number in teams:
             # The mixer-confirmed roster is authoritative and includes
             # players who haven't played a match yet (fresh substitutes) -
             # so count straight from Player rows when it exists.
@@ -1716,6 +1716,9 @@ def api_teams():
                     "total_mmr": total_mmr,
                     "wins": wins,
                     "losses": losses,
+                    # Номер команды в кубке: по нему на сетке стоит буква, как
+                    # на сайте организаторов (команда 1 - «Команда A»).
+                    "number": number,
                 })
 
     result.sort(key=lambda t: t["total_mmr"] if t["total_mmr"] is not None else -1, reverse=True)

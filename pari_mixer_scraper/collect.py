@@ -855,6 +855,8 @@ def link_mixercup_data(
                         team_row.name = mixer_team["name"]
                     if mixer_team.get("id"):
                         team_row.mixer_uuid = mixer_team["id"]
+                    if mixer_team.get("number") is not None:
+                        team_row.number = mixer_team["number"]
                 # Active reclaims the team; past claims only if unclaimed, so
                 # a team known only from an old cup still gets a tournament.
                 if apply_rosters and right_week:
@@ -954,6 +956,8 @@ def sync_mixer_teams(
         # Неделя состава (см. Team.week_number); у источников без недель None.
         if mt.get("weekNumber") is not None:
             team_row.week_number = mt["weekNumber"]
+        if mt.get("number") is not None:
+            team_row.number = mt["number"]
         if mt.get("name"):
             _record_tournament_name(session, team_row.team_id, tournament_id, mt["name"])
         _apply_confirmed_roster(session, team_row.team_id, mt, tournament_id,

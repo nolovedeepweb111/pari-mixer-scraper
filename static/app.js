@@ -241,7 +241,7 @@ async function renderRoute() {
       return loadMatchPage(route.matchId);
     default:
       if (hasRegistrations(cupId) && !lastTeamList) return loadRegistrations(cupId);
-      detailEl.innerHTML = '<p class="hint">Выберите команду слева</p>';
+      renderCupHome(cupId);
       highlightSidebar();
   }
 }
@@ -416,6 +416,7 @@ async function loadTeams(tournamentId) {
   renderTeamList();
   renderRegistrationsLink(tournamentId);
   renderForecastLink(tournamentId);
+  if (route.view === "cup") renderCupHome(tournamentId);
 }
 
 // Отрисовка уже полученного списка. Отдельно от загрузки, чтобы смена
@@ -492,6 +493,50 @@ function renderForecastLink(tournamentId) {
     `<span class="team-meta">кто выглядит сильнее по составу</span>`;
   btn.onclick = () => navigate(cupPath(tournamentId, "forecast"));
   teamsEl.appendChild(btn);
+}
+
+// Главная страница кубка - сетка команд, как у организаторов на mixer-cup:
+// буква команды (она же её номер в кубке), сыграно, выиграно, проиграно.
+const TEAM_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+function teamLetter(team, index) {
+  const number = team.number || index + 1;
+  return TEAM_LETTERS[(number - 1) % TEAM_LETTERS.length];
+}
+
+function renderCupHome(tournamentId) {
+  if (!lastTeamList || lastTeamList.tournamentId !== tournamentId) {
+    detailEl.innerHTML = '<p class="hint">Выберите команду слева</p>';
+    return;
+  }
+  const cup = cups.byId.get(tournamentId);
+  // Порядок - по номеру команды, чтобы буквы шли подряд, как на их сайте.
+  const teams = [...lastTeamList.teams].sort(
+    (a, b) => (a.number || 99) - (b.number || 99) || a.name.localeCompare(b.name));
+  const cards = teams.map((team, i) => {
+    const letter = teamLetter(team, i);
+    const games = (team.wins || 0) + (team.losses || 0);
+    return `
+      <button class="cup-card" data-team-id="${team.team_id}">
+        <div class="cup-card-top">
+          <span class="cup-letter cup-letter-${(team.number || i + 1) % 8}">${letter}</span>
+          <span class="cup-counts">
+            <span><b>И</b>${games}</span><span><b>П</b>${team.wins || 0}</span><span><b>Пр</b>${team.losses || 0}</span>
+          </span>
+        </div>
+        <span class="cup-card-label">Команда ${letter}</span>
+        <span class="cup-card-name">${escapeHtml(team.name)}</span>
+        <span class="cup-card-meta">${team.total_mmr == null ? "" : `${formatMmr(team.total_mmr)} MMR`}</span>
+      </button>`;
+  }).join("");
+  detailEl.innerHTML = `
+    <h2>${escapeHtml((cup && cup.label) || "Команды кубка")}</h2>
+    <p class="hint">${teams.length} команд. Нажмите на команду, чтобы посмотреть состав, драфты и аналитику.</p>
+    <div class="cup-grid">${cards}</div>`;
+  for (const card of detailEl.querySelectorAll(".cup-card")) {
+    card.addEventListener("click", () =>
+      navigate(cupPath(tournamentId, `team/${card.dataset.teamId}`)));
+  }
 }
 
 let forecastTimer = null;

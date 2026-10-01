@@ -133,6 +133,10 @@ class Team(Base):
     # свалились бы в один список, а их статистика - в одну кучу, хотя играли её
     # разные люди. У кубков PARI недель нет, там всегда None.
     week_number: Mapped[int | None] = mapped_column(nullable=True)
+    # Номер команды в кубке. Им mixer-cup подписывает команды на своём сайте:
+    # команда 1 - это «Команда A», 2 - «Команда B» и так далее. Нужен, чтобы
+    # наша сетка команд читалась так же, как у организаторов.
+    number: Mapped[int | None] = mapped_column(nullable=True)
     # NOTE: `name` above is this team's name in the tournament that owns it -
     # i.e. the ACTIVE one. It is the wrong name to print next to an older
     # tournament's match: mixer-cup recycles the same Steam team registrations

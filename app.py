@@ -1459,6 +1459,10 @@ def api_forecast():
                 "team_id": t.team_id,
                 "name": t.name,
                 "strength": round(100 * t.strength, 1),
+                # Оценка только по составу и доля, которую в итоговой оценке
+                # занимают уже сыгранные игры кубка.
+                "strength_prior": round(100 * t.strength_prior, 1),
+                "results_weight": round(100 * t.results_weight),
                 "total_mmr": t.total_mmr,
                 "wins": t.actual_wins,
                 "losses": t.actual_losses,

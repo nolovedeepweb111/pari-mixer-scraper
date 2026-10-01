@@ -553,10 +553,15 @@ function forecastTeamRow(team) {
   const record = team.wins + team.losses
     ? `${team.wins}–${team.losses}`
     : '<span class="hint">ещё не играли</span>';
+  const mix = team.results_weight
+    ? `<span class="fc-part">состав ${100 - team.results_weight}% · результаты ${team.results_weight}%</span>`
+    : "";
   const roleWarn = team.missing_roles.length
     ? `<span class="tag tag-warn" title="Никто не называет эти роли предпочтительными">нет: ${team.missing_roles.map((r) => escapeHtml(ROLE_LABELS[r] || r)).join(", ")}</span>`
     : "";
-  const context = `<span class="fc-part">винрейт пятёрки ${team.squad_win_rate}%</span>` +
+  const context = mix +
+    `<span class="fc-part">по составу ${team.strength_prior}%</span>` +
+    `<span class="fc-part">винрейт пятёрки ${team.squad_win_rate}%</span>` +
     `<span class="fc-part">роли ${Math.round(team.role_slots * 5)}/5</span>`;
   const breakdown = Object.entries(FORECAST_COMPONENTS)
     .map(([key, label]) => {
@@ -599,7 +604,7 @@ function forecastTeamRow(team) {
         ${roleWarn}
       </summary>
       <div class="fc-parts">${breakdown}</div>
-      <div class="fc-parts fc-context">в формулу не входит: ${context}</div>
+      <div class="fc-parts fc-context">${context}</div>
       <table class="subs-table">
         <thead><tr><th>Игрок</th><th>MMR</th><th>Роли</th><th>Винрейт</th>
           <th title="Доля золота матча: 1.00 — ровно десятая часть">Золото</th>
@@ -629,12 +634,13 @@ async function loadForecast(tournamentId, silent) {
   detailEl.innerHTML = `
     <h2>Прогноз силы команд — ${escapeHtml(data.tournament_label || "кубок")}</h2>
     <p class="hint">
-      Ожидаемая доля побед по составу: доля золота в прошлых играх, сила
-      лучшего игрока по рейтингу Эло, суммарный MMR и то, доигрывают ли эти
-      люди кубки до конца. Веса подобраны на 171 команде семи прошлых кубков:
-      порядок пар команд модель угадывает в 68% случаев против 50% у монетки,
-      победителя отдельной игры — в 59%. Это оценка состава, а не предсказание
-      конкретного матча. Обновляется каждую минуту.
+      Ожидаемая доля побед. Пока игр мало, считается по составу: доля золота в
+      прошлых играх, сила лучшего игрока по рейтингу Эло, суммарный MMR и то,
+      доигрывают ли эти люди кубки до конца. Дальше оценку перевешивают
+      результаты самого кубка. Веса подобраны на 171 команде семи прошлых
+      кубков: порядок пар команд модель угадывает в 68% случаев против 50% у
+      монетки, победителя отдельной игры — в 64%, а у команд с пятью и более
+      играми — в 66%. Обновляется каждую минуту.
     </p>
     <div class="fc-list">${data.teams.map(forecastTeamRow).join("")}</div>`;
   for (const [i, node] of [...detailEl.querySelectorAll(".fc-team")].entries()) {

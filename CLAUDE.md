@@ -62,7 +62,9 @@ file immediately.
 - **The forecast's weights were fitted, not chosen** (`forecast.py`): 171 teams,
   seven past cups, features taken strictly from before each cup. Nested
   validation (features picked inside the training fold) orders 66-68% of team
-  pairs right and calls 59% of match winners. Re-fit with `tools/forecast_*.py`
+  pairs right. While a cup runs, its own results outweigh the roster estimate
+  (`PRIOR_GAMES` virtual games), which lifts match-winner accuracy from 59% to
+  64%, and to 66% for teams past five games — the single biggest gain so far. Re-fit with `tools/forecast_*.py`
   on a DB built by `tools/build_dev_db.py`, never by hand. Two measured results
   that look like bugs but are not: durability's weight is negative, and win rate
   plus roles drop out of the model once gold share is in.

@@ -36,8 +36,22 @@
 командах, которые борются за место. Мы оставили признак как посчитался, а не
 подкрутили под интуицию.
 
+Пока кубок идёт, к оценке состава подмешиваются его собственные результаты:
+прогноз весит PRIOR_GAMES виртуальных игр, дальше настоящие победы перевешивают
+его сами. Это самая большая прибавка за всё время работы над моделью - угадывание
+победителя матча растёт с 59.4% до 64.4%, а у команд, сыгравших хотя бы пять игр,
+до 65.9% (logloss 0.665 -> 0.639).
+
+Что ещё пробовали и что НЕ помогло (проверено на тех же данных):
+рейтинг Брэдли-Терри вместо Эло, затухание старых игр с полураспадом 30-120
+дней, доля золота с поправкой на место игрока по фарму внутри команды, KDA,
+доля саппортов в составе, средний Эло вместо максимума. Ни один вариант не
+обошёл нынешний набор. Максимум по команде вместо суммы - не наша выдумка: то
+же самое получено в работе про агрегацию рейтингов в командных играх
+(arxiv 2106.11397), где MAX побеждает SUM и MIN.
+
 Предсказание - ожидаемая доля побед команды в её сериях, а не вероятность
-выиграть кубок. Пересчитать веса: tools/backtest_forecast.py.
+выиграть кубок. Пересчитать веса: tools/forecast_*.py.
 """
 from __future__ import annotations
 
@@ -67,6 +81,11 @@ WEIGHTS = {
     "mmr": 0.0185,
 }
 
+# Сколько виртуальных игр весит прогноз по составу, пока кубок идёт. 10 -
+# из проверки: при 3 текущий счёт слишком дёргает оценку, при 40 он почти не
+# влияет, а в середине кубка качество одинаковое.
+PRIOR_GAMES = 10
+
 CORE_ROLES = {"CARRY", "MIDLANER", "OFFLANER"}
 ALL_ROLES = ("CARRY", "MIDLANER", "OFFLANER", "SOFT_SUPPORT", "HARD_SUPPORT")
 
@@ -92,7 +111,9 @@ class TeamForecast:
     team_id: int
     name: str
     total_mmr: float | None
-    strength: float                 # ожидаемая доля побед, 0..1
+    strength: float                 # ожидаемая доля побед, 0..1 (с учётом игр кубка)
+    strength_prior: float = 0.5     # только по составу, без результатов кубка
+    results_weight: float = 0.0     # какая доля оценки сейчас идёт от результатов
     rank: int = 0
     components: dict = field(default_factory=dict)
     players: list[PlayerForecast] = field(default_factory=list)
@@ -335,7 +356,13 @@ def forecast_tournament(session: Session, tournament_id: int,
             t.components[name] = {"value": t.components[name], "z": z, "effect": weight * z}
 
     for t in teams:
-        t.strength = 0.5 + sum(c["effect"] for c in t.components.values())
+        t.strength_prior = 0.5 + sum(c["effect"] for c in t.components.values())
+        # Результаты идущего кубка перевешивают оценку состава по мере того,
+        # как их становится больше.
+        played = t.actual_wins + t.actual_losses
+        t.strength = ((t.strength_prior * PRIOR_GAMES + t.actual_wins)
+                      / (PRIOR_GAMES + played))
+        t.results_weight = played / (PRIOR_GAMES + played)
     teams.sort(key=lambda t: -t.strength)
     for i, t in enumerate(teams, start=1):
         t.rank = i

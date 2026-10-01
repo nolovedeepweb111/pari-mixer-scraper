@@ -1463,6 +1463,10 @@ def api_forecast():
                 "wins": t.actual_wins,
                 "losses": t.actual_losses,
                 "missing_roles": t.missing_roles,
+                # Контекст: в формулу не входит (см. forecast.py), но на
+                # странице показывается.
+                "squad_win_rate": round(100 * t.squad_win_rate, 1),
+                "role_slots": t.role_slots,
                 "components": {
                     name: {"value": c["value"], "z": round(c["z"], 2),
                            "effect": round(100 * c["effect"], 1)}
@@ -1476,6 +1480,8 @@ def api_forecast():
                         "roles": p.roles,
                         "games": p.games,
                         "win_rate": p.win_rate,
+                        "gold_share": round(p.gold_share, 2) if p.gold_share is not None else None,
+                        "elo": round(p.elo),
                         "durability": round(100 * p.durability) if p.durability is not None else None,
                         "left_early": p.left_early,
                     }

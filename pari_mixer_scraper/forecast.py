@@ -1,28 +1,43 @@
 """Прогноз силы команд кубка.
 
-Веса не выдуманы: они получены линейной регрессией по 171 команде из семи
-прошлых кубков (26-30, супермиксеры WINLINE и PARI), причём признаки считались
-ТОЛЬКО по играм до начала каждого кубка - иначе вышла бы подгонка под ответ.
-Проверка «обучаемся без одного кубка, предсказываем его» даёт корреляцию
-предсказанного винрейта с настоящим +0.35 и верный порядок в 64% пар команд
-(у монетки 50%). Для сравнения: один только суммарный MMR даёт +0.16.
+Веса не выдуманы: подобраны гребневой регрессией по 171 команде из семи прошлых
+кубков (26-30, супермиксеры WINLINE и PARI). Признаки каждой команды считаются
+ТОЛЬКО по играм до начала её кубка, иначе вышла бы подгонка под ответ.
+
+Проверка - «обучаемся без одного кубка, предсказываем его», причём набор
+факторов тоже отбирался внутри обучающей части (вложенная проверка), чтобы не
+хвалить модель по тем же данным, на которых её подбирали:
+
+                            порядок пар команд   исход матча   logloss
+    только суммарный MMR          60.0%             56.1%       0.688
+    первая версия (винрейт,
+    MMR, роли, доигрываемость)    64.3%             57.8%       0.684
+    нынешняя                      68.0%             59.4%       0.665
+    честная вложенная оценка      66.4%             59.3%       0.675
+
+«Порядок пар» - доля пар команд одного кубка, которые модель расставила
+правильно (у монетки 50%). «Исход матча» - доля угаданных победителей в 2098
+играх, причём сила команды берётся на НАЧАЛО кубка и по ходу не уточняется.
 
 Что в модели и с каким знаком (на одно стандартное отклонение признака):
 
-    винрейт пятёрки в прошлом   +0.050   главный фактор
-    суммарный MMR               +0.034
-    доигрываемость              -0.030   да, МИНУС, см. ниже
-    разведение по ролям         +0.017
-    закрытые ядерные роли       +0.028
+    доля золота в матче      +0.042   главный фактор
+    сила лучшего игрока      +0.024   рейтинг Эло сильнейшего в составе
+    доигрываемость           -0.024   да, МИНУС, см. ниже
+    суммарный MMR            +0.019
 
-Минус у доигрываемости выглядит странно, но он устойчив по кубкам. Объяснение,
-скорее всего, такое: долю игр своей команды полностью отыгрывают прежде всего
-те, кого не меняют, - а меняют обычно в командах, которые борются за место, то
-есть сильных. Мы этот признак оставили как есть, а не подкрутили под интуицию,
-и честно показываем его на сайте отдельной колонкой.
+Чего в модели НЕТ и почему. Винрейт игроков и роли предсказывают успех по
+отдельности (+0.29 и +0.20), но рядом с долей золота перестают добавлять:
+экономика и так отражает, кто играет ядро и насколько успешно. Их мы всё равно
+показываем на странице - это полезный контекст, просто не вес в формуле.
 
-Предсказание - это ожидаемый винрейт команды, то есть доля побед в её сериях,
-а не вероятность выиграть кубок.
+Минус у доигрываемости устойчив по всем кубкам. Объяснение, видимо, такое:
+полностью отыгрывают свои игры прежде всего те, кого не меняют, а меняют в
+командах, которые борются за место. Мы оставили признак как посчитался, а не
+подкрутили под интуицию.
+
+Предсказание - ожидаемая доля побед команды в её сериях, а не вероятность
+выиграть кубок. Пересчитать веса: tools/backtest_forecast.py.
 """
 from __future__ import annotations
 
@@ -34,19 +49,22 @@ from sqlalchemy.orm import Session
 
 from .models import Match, MatchPlayer, Player, SubstitutionEvent, Team
 
-# Насколько сильно винрейт новичка тянется к 50%. 25 виртуальных игр: человек с
-# тремя победами из трёх не должен выглядеть сильнее того, кто выиграл 60 из
-# 100. Значение из бэктеста - при 10 и при 50 предсказание чуть хуже.
+# Насколько сильно винрейт новичка тянется к 50%: 25 виртуальных игр. Человек с
+# тремя победами из трёх не должен выглядеть сильнее того, кто выиграл 60 из 100.
 WINRATE_PRIOR_GAMES = 25
 
-# Веса из регрессии (признаки нормированы внутри кубка - сравниваем команды
-# между собой, а не с абстрактной шкалой).
+# Шаг рейтинга Эло. 24 - из бэктеста: при 12 рейтинг не успевает разойтись за
+# семь кубков, при 48 скачет от одной серии.
+ELO_K = 24
+ELO_START = 1500.0
+
+# Веса из регрессии. Признаки нормируются ВНУТРИ кубка - модель сравнивает
+# команды друг с другом, а не с абсолютной шкалой.
 WEIGHTS = {
-    "winrate": 0.0497,
-    "mmr": 0.0343,
-    "durability": -0.0297,
-    "role_slots": 0.0173,
-    "role_cores": 0.0282,
+    "gold": 0.0416,
+    "elo_max": 0.0242,
+    "durability": -0.0236,
+    "mmr": 0.0185,
 }
 
 CORE_ROLES = {"CARRY", "MIDLANER", "OFFLANER"}
@@ -62,7 +80,9 @@ class PlayerForecast:
     games: int
     wins: int
     win_rate: float | None          # сырой винрейт, для показа
-    expected_win_rate: float        # он же, подтянутый к 50% (в модель идёт этот)
+    expected_win_rate: float        # он же, подтянутый к 50%
+    gold_share: float | None        # доля золота матча: 1.0 - ровно десятая часть
+    elo: float                      # рейтинг по прошлым играм
     durability: float | None        # какую долю игр своей команды обычно отыгрывает
     left_early: int                 # сколько раз выходил из состава по ходу кубка
 
@@ -72,10 +92,12 @@ class TeamForecast:
     team_id: int
     name: str
     total_mmr: float | None
-    strength: float                 # ожидаемый винрейт, 0..1
+    strength: float                 # ожидаемая доля побед, 0..1
     rank: int = 0
     components: dict = field(default_factory=dict)
     players: list[PlayerForecast] = field(default_factory=list)
+    # Контекст: в формулу не входит, но на странице показывается.
+    squad_win_rate: float = 0.5
     role_slots: float = 0.0
     role_cores: float = 0.0
     missing_roles: list = field(default_factory=list)
@@ -86,12 +108,9 @@ class TeamForecast:
 def _role_fit(preferences: list[set[str]]) -> tuple[float, float, list[str]]:
     """Можно ли расставить пятёрку по пяти РАЗНЫМ ролям.
 
-    Перебор по пяти игрокам - это максимум 5^5 вариантов, считается мгновенно.
-    Пустой список ролей значит «играет что угодно»: так mixer-cup отдаёт тех,
-    кто роли не указал, и наказывать их не за что.
-
-    Возвращает (доля закрытых слотов, доля закрытых ядерных ролей, чего не
-    хватает)."""
+    Перебор по пяти игрокам считается мгновенно. Пустой список ролей значит
+    «играет что угодно»: так mixer-cup отдаёт тех, кто роли не указал, и
+    наказывать их не за что."""
     prefs = [p or set(ALL_ROLES) for p in preferences]
     best = {"filled": 0, "used": frozenset()}
 
@@ -111,65 +130,106 @@ def _role_fit(preferences: list[set[str]]) -> tuple[float, float, list[str]]:
     return best["filled"] / 5, min(cores, 3) / 3, missing
 
 
-def _history(session: Session, exclude_tournament: int | None):
-    """Игры игроков во всех ОСТАЛЬНЫХ кубках: винрейт и доля отыгранных игр.
+def _player_history(session: Session, exclude_tournament: int | None) -> dict[int, dict]:
+    """Всё, что мы знаем про игроков по ОСТАЛЬНЫМ кубкам: винрейт, доля золота,
+    рейтинг Эло, доля отыгранных игр.
 
     Текущий кубок исключается специально: прогноз должен опираться на прошлое,
-    иначе лидер таблицы просто получит высокий прогноз за то, что он лидер."""
+    иначе лидер таблицы получит высокий прогноз просто за то, что он лидер.
+
+    Один проход по всем играм в хронологическом порядке - иначе Эло не
+    посчитать, он обновляется матч за матчем."""
     scope = [Match.radiant_win.is_not(None), Match.mixer_tournament_id.is_not(None)]
     if exclude_tournament is not None:
         scope.append(Match.mixer_tournament_id != exclude_tournament)
 
     rows = session.execute(
         select(
-            MatchPlayer.account_id, Match.mixer_tournament_id,
-            func.count(),
-            func.sum(func.iif(MatchPlayer.is_radiant == Match.radiant_win, 1, 0)),
+            Match.match_id, Match.mixer_tournament_id, Match.start_time, Match.radiant_win,
+            MatchPlayer.account_id, MatchPlayer.is_radiant, MatchPlayer.gold_per_min,
         )
-        .join(Match, Match.match_id == MatchPlayer.match_id)
+        .join(MatchPlayer, MatchPlayer.match_id == Match.match_id)
         .where(*scope)
-        .group_by(MatchPlayer.account_id, Match.mixer_tournament_id)
+        .order_by(Match.start_time, Match.match_id)
     ).all()
 
-    # Сколько игр проводит команда за кубок - медиана по командам этого кубка.
-    # С ней доля отыгранных игр не зависит от формата: в супермиксере с
-    # решафлами команда играет за неделю меньше, чем за весь кубок PARI.
-    team_games: dict[int, list[int]] = defaultdict(list)
-    for cup, games in session.execute(
-        select(Match.mixer_tournament_id, func.count())
+    lineups: dict[int, list] = defaultdict(list)
+    order: list[int] = []
+    cup_of: dict[int, int] = {}
+    for match_id, cup, _start, radiant_win, account_id, is_radiant, gpm in rows:
+        if match_id not in lineups:
+            order.append(match_id)
+            cup_of[match_id] = cup
+        lineups[match_id].append((account_id, bool(is_radiant), gpm, bool(radiant_win)))
+
+    stats: dict[int, dict] = defaultdict(
+        lambda: {"games": 0, "wins": 0, "gold": 0.0, "gold_games": 0,
+                 "elo": ELO_START, "by_cup": defaultdict(int)})
+    for match_id in order:
+        line = lineups[match_id]
+        radiant = [p for p in line if p[1]]
+        dire = [p for p in line if not p[1]]
+        radiant_win = line[0][3]
+        for account_id, is_radiant, gpm, _ in line:
+            s = stats[account_id]
+            s["games"] += 1
+            s["wins"] += int(is_radiant == radiant_win)
+            s["by_cup"][cup_of[match_id]] += 1
+        # Доля золота: сколько человек добыл от всей добычи матча, умноженная на
+        # 10. Ровно средний игрок получает 1.0. Так сравниваются игроки из
+        # коротких и длинных игр, а заодно из разных по силе кубков.
+        total_gold = sum(p[2] or 0 for p in line)
+        if total_gold:
+            for account_id, _, gpm, _ in line:
+                s = stats[account_id]
+                s["gold"] += (gpm or 0) * 10 / total_gold
+                s["gold_games"] += 1
+        if len(radiant) == 5 and len(dire) == 5:
+            r_elo = sum(stats[p[0]]["elo"] for p in radiant) / 5
+            d_elo = sum(stats[p[0]]["elo"] for p in dire) / 5
+            expected = 1 / (1 + 10 ** ((d_elo - r_elo) / 400))
+            result = 1.0 if radiant_win else 0.0
+            for p in radiant:
+                stats[p[0]]["elo"] += ELO_K * (result - expected)
+            for p in dire:
+                stats[p[0]]["elo"] += ELO_K * ((1 - result) - (1 - expected))
+
+    # Сколько игр проводит команда за кубок - медиана по его командам. С ней
+    # доля отыгранных игр не зависит от формата: в супермиксере с решафлами
+    # команда за неделю играет меньше, чем за весь кубок PARI.
+    per_team: dict[int, list[int]] = defaultdict(list)
+    for cup, _team, games in session.execute(
+        select(Match.mixer_tournament_id, MatchPlayer.team_id, func.count())
         .select_from(MatchPlayer)
         .join(Match, Match.match_id == MatchPlayer.match_id)
         .where(*scope)
         .group_by(Match.mixer_tournament_id, MatchPlayer.team_id)
     ):
-        team_games[cup].append(games // 5 or 1)
+        per_team[cup].append(games // 5 or 1)
     full_cup = {}
-    for cup, counts in team_games.items():
+    for cup, counts in per_team.items():
         counts.sort()
         full_cup[cup] = counts[len(counts) // 2] or 1
 
-    totals: dict[int, list[int]] = defaultdict(lambda: [0, 0])
-    shares: dict[int, list[float]] = defaultdict(list)
-    for account_id, cup, games, wins in rows:
-        totals[account_id][0] += games
-        totals[account_id][1] += wins or 0
-        shares[account_id].append(min(games / full_cup.get(cup, games or 1), 1.0))
-    return totals, shares
+    for s in stats.values():
+        shares = [min(played / full_cup.get(cup, played or 1), 1.0)
+                  for cup, played in s["by_cup"].items()]
+        s["durability"] = sum(shares) / len(shares) if shares else None
+        s["gold_share"] = s["gold"] / s["gold_games"] if s["gold_games"] else None
+    return stats
 
 
 def _left_early(session: Session, exclude_tournament: int | None) -> dict[str, int]:
     """Сколько раз игрок уходил из состава по ходу кубка - по его нику.
 
-    В журнале замен mixer-cup есть только ник, аккаунта там нет, поэтому
-    сопоставляем по нику в нижнем регистре. Ник у человека может смениться, и
-    тогда прошлые уходы потеряются - это недооценка риска, но не выдумка."""
+    В журнале замен mixer-cup есть только ник, аккаунта там нет. Ник может
+    смениться, и тогда прошлые уходы потеряются: это недооценка риска, но не
+    выдумка."""
     scope = [SubstitutionEvent.event_type == "PLAYER_OFF"]
     if exclude_tournament is not None:
         scope.append(SubstitutionEvent.tournament_id != exclude_tournament)
     out: dict[str, int] = defaultdict(int)
-    for (nickname,) in session.execute(
-        select(SubstitutionEvent.nickname).where(*scope)
-    ):
+    for (nickname,) in session.execute(select(SubstitutionEvent.nickname).where(*scope)):
         if nickname:
             out[nickname.strip().casefold()] += 1
     return out
@@ -195,11 +255,11 @@ def forecast_tournament(session: Session, tournament_id: int,
     ).scalars():
         roster[player.team_id].append(player)
 
-    totals, shares = _history(session, tournament_id)
+    history = _player_history(session, tournament_id)
     offs = _left_early(session, tournament_id)
 
-    # Текущий счёт в кубке - он не участвует в прогнозе, но показать его рядом
-    # полезно: видно, сходится ли прогноз с тем, что происходит.
+    # Текущий счёт в кубке: в прогноз не входит, но рядом полезен - видно,
+    # сходится ли предсказание с тем, что происходит.
     record = defaultdict(lambda: [0, 0])
     scope = [Match.mixer_tournament_id == tournament_id, Match.radiant_win.is_not(None)]
     if week is not None:
@@ -208,9 +268,8 @@ def forecast_tournament(session: Session, tournament_id: int,
         select(Match.radiant_team_id, Match.dire_team_id, Match.radiant_win).where(*scope)
     ):
         for team_id, won in ((radiant_team, radiant_win), (dire_team, not radiant_win)):
-            if team_id is None:
-                continue
-            record[team_id][0 if won else 1] += 1
+            if team_id is not None:
+                record[team_id][0 if won else 1] += 1
 
     teams: list[TeamForecast] = []
     for team in team_rows:
@@ -219,8 +278,9 @@ def forecast_tournament(session: Session, tournament_id: int,
             continue
         forecasts = []
         for p in players:
-            games, wins = totals.get(p.account_id, [0, 0])
-            personal = shares.get(p.account_id) or []
+            s = history.get(p.account_id)
+            games = s["games"] if s else 0
+            wins = s["wins"] if s else 0
             forecasts.append(PlayerForecast(
                 account_id=p.account_id,
                 name=p.name or f"account {p.account_id}",
@@ -229,17 +289,16 @@ def forecast_tournament(session: Session, tournament_id: int,
                 games=games,
                 wins=wins,
                 win_rate=round(100 * wins / games) if games else None,
-                expected_win_rate=(wins + WINRATE_PRIOR_GAMES * 0.5)
-                / (games + WINRATE_PRIOR_GAMES),
-                durability=sum(personal) / len(personal) if personal else None,
+                expected_win_rate=(wins + WINRATE_PRIOR_GAMES * 0.5) / (games + WINRATE_PRIOR_GAMES),
+                gold_share=s["gold_share"] if s else None,
+                elo=s["elo"] if s else ELO_START,
+                durability=s["durability"] if s else None,
                 left_early=offs.get((p.name or "").strip().casefold(), 0),
             ))
-        prefs = [
-            {r for r in (p.roles or "").split(",") if r}
-            for p in forecasts
-        ]
-        slots, cores, missing = _role_fit(prefs)
-        known = [p.durability for p in forecasts if p.durability is not None]
+        slots, cores, missing = _role_fit(
+            [{r for r in (p.roles or "").split(",") if r} for p in forecasts])
+        known_dur = [p.durability for p in forecasts if p.durability is not None]
+        known_gold = [p.gold_share for p in forecasts if p.gold_share is not None]
         wins_t, losses_t = record.get(team.team_id, [0, 0])
         teams.append(TeamForecast(
             team_id=team.team_id,
@@ -247,15 +306,16 @@ def forecast_tournament(session: Session, tournament_id: int,
             total_mmr=sum(p.mmr for p in forecasts if p.mmr is not None) or None,
             strength=0.0,
             components={
-                "winrate": sum(p.expected_win_rate for p in forecasts) / len(forecasts),
+                # 1.0 - доля золота среднего игрока: у состава без истории
+                # нет оснований считаться ни жадным, ни скромным.
+                "gold": sum(known_gold) / len(known_gold) if known_gold else 1.0,
+                "elo_max": max(p.elo for p in forecasts),
+                # 0.75 - примерно средняя доля игр по прошлым кубкам.
+                "durability": sum(known_dur) / len(known_dur) if known_dur else 0.75,
                 "mmr": sum(p.mmr or 0 for p in forecasts),
-                # 0.75 - значение по умолчанию для состава без истории: это
-                # примерно средняя доля игр по прошлым кубкам.
-                "durability": sum(known) / len(known) if known else 0.75,
-                "role_slots": slots,
-                "role_cores": cores,
             },
             players=sorted(forecasts, key=lambda p: -(p.mmr or 0)),
+            squad_win_rate=sum(p.expected_win_rate for p in forecasts) / len(forecasts),
             role_slots=slots,
             role_cores=cores,
             missing_roles=missing,
@@ -266,17 +326,13 @@ def forecast_tournament(session: Session, tournament_id: int,
     if not teams:
         return []
 
-    # Признаки нормируем ВНУТРИ кубка: модель сравнивает команды друг с другом,
-    # а не с какой-то абсолютной шкалой. Поэтому один и тот же состав в слабом
-    # кубке получит прогноз выше, чем в сильном, - так и должно быть.
     for name, weight in WEIGHTS.items():
         values = [t.components[name] for t in teams]
         mean = sum(values) / len(values)
         spread = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5 or 1.0
         for t in teams:
             z = (t.components[name] - mean) / spread
-            t.components[name] = {"value": t.components[name], "z": z,
-                                  "effect": weight * z}
+            t.components[name] = {"value": t.components[name], "z": z, "effect": weight * z}
 
     for t in teams:
         t.strength = 0.5 + sum(c["effect"] for c in t.components.values())

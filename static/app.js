@@ -497,11 +497,10 @@ function renderForecastLink(tournamentId) {
 let forecastTimer = null;
 
 const FORECAST_COMPONENTS = {
-  winrate: "Винрейт игроков",
-  mmr: "Суммарный MMR",
+  gold: "Доля золота",
+  elo_max: "Сильнейший игрок",
   durability: "Доигрывают кубок",
-  role_slots: "Роли разведены",
-  role_cores: "Ядерные роли",
+  mmr: "Суммарный MMR",
 };
 
 function forecastTeamRow(team) {
@@ -512,6 +511,8 @@ function forecastTeamRow(team) {
   const roleWarn = team.missing_roles.length
     ? `<span class="tag tag-warn" title="Никто не называет эти роли предпочтительными">нет: ${team.missing_roles.map((r) => escapeHtml(ROLE_LABELS[r] || r)).join(", ")}</span>`
     : "";
+  const context = `<span class="fc-part">винрейт пятёрки ${team.squad_win_rate}%</span>` +
+    `<span class="fc-part">роли ${Math.round(team.role_slots * 5)}/5</span>`;
   const breakdown = Object.entries(FORECAST_COMPONENTS)
     .map(([key, label]) => {
       const c = team.components[key];
@@ -536,6 +537,8 @@ function forecastTeamRow(team) {
         <td>${formatMmr(p.mmr)}</td>
         <td class="reg-roles">${escapeHtml(formatRoles(p.roles))}</td>
         <td>${wr}</td>
+        <td>${p.gold_share == null ? "—" : p.gold_share.toFixed(2)}</td>
+        <td>${p.elo}</td>
         <td>${stay}</td>
       </tr>`;
     })
@@ -551,8 +554,12 @@ function forecastTeamRow(team) {
         ${roleWarn}
       </summary>
       <div class="fc-parts">${breakdown}</div>
+      <div class="fc-parts fc-context">в формулу не входит: ${context}</div>
       <table class="subs-table">
-        <thead><tr><th>Игрок</th><th>MMR</th><th>Роли</th><th>Винрейт</th><th>Доигрывает</th></tr></thead>
+        <thead><tr><th>Игрок</th><th>MMR</th><th>Роли</th><th>Винрейт</th>
+          <th title="Доля золота матча: 1.00 — ровно десятая часть">Золото</th>
+          <th title="Рейтинг по прошлым играм, старт 1500">Эло</th>
+          <th title="Какую долю игр своей команды обычно отыгрывает">Доигрывает</th></tr></thead>
         <tbody>${players}</tbody>
       </table>
     </details>`;
@@ -577,10 +584,11 @@ async function loadForecast(tournamentId, silent) {
   detailEl.innerHTML = `
     <h2>Прогноз силы команд — ${escapeHtml(data.tournament_label || "кубок")}</h2>
     <p class="hint">
-      Ожидаемая доля побед по составу: прошлый винрейт игроков, суммарный MMR,
-      роли и то, доигрывают ли эти люди кубки до конца. Веса подобраны на 171
-      команде семи прошлых кубков: порядок пар команд модель угадывает в 64%
-      случаев против 50% у монетки. Это оценка состава, а не предсказание
+      Ожидаемая доля побед по составу: доля золота в прошлых играх, сила
+      лучшего игрока по рейтингу Эло, суммарный MMR и то, доигрывают ли эти
+      люди кубки до конца. Веса подобраны на 171 команде семи прошлых кубков:
+      порядок пар команд модель угадывает в 68% случаев против 50% у монетки,
+      победителя отдельной игры — в 59%. Это оценка состава, а не предсказание
       конкретного матча. Обновляется каждую минуту.
     </p>
     <div class="fc-list">${data.teams.map(forecastTeamRow).join("")}</div>`;

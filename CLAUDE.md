@@ -60,10 +60,12 @@ file immediately.
   Sources with reshuffles also carry `teams.week_number`.
 - **Hero pools are always gated**, even in the free archive. That is the product.
 - **The forecast's weights were fitted, not chosen** (`forecast.py`): 171 teams,
-  seven past cups, features taken strictly from before each cup. Leave-one-cup-out
-  gives +0.35 correlation and 64% of team pairs ordered right. Re-fit with
-  `scratchpad/backtest.py` rather than hand-tuning; durability's weight is
-  negative and that is measured, not a sign error.
+  seven past cups, features taken strictly from before each cup. Nested
+  validation (features picked inside the training fold) orders 66-68% of team
+  pairs right and calls 59% of match winners. Re-fit with `tools/forecast_*.py`
+  on a DB built by `tools/build_dev_db.py`, never by hand. Two measured results
+  that look like bugs but are not: durability's weight is negative, and win rate
+  plus roles drop out of the model once gold share is in.
 - **PARI Super (league 19965) plays on the same Steam team ids as PARI Mixer
   Cup (19924).** Harmless while one is paused; if both run at once they will
   fight over `teams.tournament_id` every collection run.

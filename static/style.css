@@ -1180,3 +1180,65 @@ aside h2 {
   height: 100%;
   background: var(--accent);
 }
+
+/* Прогноз силы команд. */
+.fc-list { margin-top: 16px; }
+.fc-team {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+  margin-bottom: 8px;
+}
+.fc-team > summary {
+  cursor: pointer;
+  padding: 10px 14px;
+  display: grid;
+  grid-template-columns: 28px minmax(120px, 1fr) 56px 120px 64px auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+}
+.fc-team[open] > summary { border-bottom: 1px solid var(--border); }
+.fc-rank { color: var(--muted); }
+.fc-name { font-weight: 600; }
+.fc-strength { font-weight: 700; color: var(--accent); text-align: right; }
+.fc-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-deep);
+  overflow: hidden;
+}
+.fc-bar span { display: block; height: 100%; background: var(--accent); }
+.fc-record { color: var(--muted); font-size: 13px; }
+.fc-parts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 14px 0;
+}
+.fc-part {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--panel-deep);
+  color: var(--muted);
+}
+.fc-part.plus { color: var(--good); }
+.fc-part.minus { color: var(--bad); }
+.fc-team table { margin: 6px 14px 14px; }
+.tag-warn {
+  background: transparent;
+  border: 1px solid var(--bad);
+  color: var(--bad);
+  font-size: 11px;
+  padding: 1px 7px;
+}
+
+/* Узкий экран: строка команды перестраивается в две. */
+@media (max-width: 640px) {
+  .fc-team > summary {
+    grid-template-columns: 24px 1fr 52px;
+    row-gap: 6px;
+  }
+  .fc-bar, .fc-record, .fc-team > summary .tag-warn { grid-column: 1 / -1; }
+}

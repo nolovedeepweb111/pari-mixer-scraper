@@ -32,6 +32,7 @@ deliberately outside the repo — the repo is public.
 | `steam_client.py` | League match history — the only cheap source of a match list |
 | `opendota_client.py` | Match details (draft, KDA); raises on the daily quota |
 | `analysis.py` | Team stats, signature heroes, targeted-ban inference |
+| `forecast.py` | Team strength model: fitted weights, backtest notes in the docstring |
 | `static/app.js` | Whole front end: History-API routing, rendering, filters |
 | `deploy/` | Installer, systemd, nginx, `update.sh` (= `pms-update` on the server) |
 
@@ -58,6 +59,11 @@ file immediately.
   cup, so a match shows the name from `team_tournament_names`, not `teams.name`.
   Sources with reshuffles also carry `teams.week_number`.
 - **Hero pools are always gated**, even in the free archive. That is the product.
+- **The forecast's weights were fitted, not chosen** (`forecast.py`): 171 teams,
+  seven past cups, features taken strictly from before each cup. Leave-one-cup-out
+  gives +0.35 correlation and 64% of team pairs ordered right. Re-fit with
+  `scratchpad/backtest.py` rather than hand-tuning; durability's weight is
+  negative and that is measured, not a sign error.
 - **PARI Super (league 19965) plays on the same Steam team ids as PARI Mixer
   Cup (19924).** Harmless while one is paused; if both run at once they will
   fight over `teams.tournament_id` every collection run.

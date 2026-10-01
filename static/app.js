@@ -150,6 +150,7 @@ function parsePath(pathname) {
   const cup = cups.bySlug.get(slug);
   const tournamentId = cup ? cup.id : null;
   if (parts[1] === "reg") return { view: "registrations", slug, tournamentId };
+  if (parts[1] === "forecast") return { view: "forecast", slug, tournamentId };
   if (parts[1] === "players") return { view: "players", slug, tournamentId };
   if (parts[1] === "subs") return { view: "subs", slug, tournamentId };
   if (parts[1] === "team" && parts[2]) {
@@ -183,6 +184,12 @@ function scopeQuery(tournamentId) {
 
 async function renderRoute() {
   route = parsePath(location.pathname);
+  // Прогноз сам себя обновляет; при уходе с него таймер надо снять, иначе он
+  // продолжит стучаться на сервер и перерисовывать чужую страницу.
+  if (forecastTimer && route.view !== "forecast") {
+    clearInterval(forecastTimer);
+    forecastTimer = null;
+  }
   // A slug we have no tournament for: say so instead of quietly showing the
   // current cup under an address that promises another one.
   if (route.slug && !cups.bySlug.has(route.slug)) {
@@ -224,6 +231,8 @@ async function renderRoute() {
       return loadPlayersLeaderboard("all");
     case "registrations":
       return loadRegistrations(cupId);
+    case "forecast":
+      return loadForecast(cupId);
     case "subs":
       return loadAllSubstitutions(cupId);
     case "player":
@@ -406,6 +415,7 @@ async function loadTeams(tournamentId) {
   lastTeamList = { tournamentId, teams, weeks };
   renderTeamList();
   renderRegistrationsLink(tournamentId);
+  renderForecastLink(tournamentId);
 }
 
 // Отрисовка уже полученного списка. Отдельно от загрузки, чтобы смена
@@ -472,6 +482,121 @@ function renderRegistrationsLink(tournamentId) {
     `<span class="team-meta">${cup.registrations} ${plural(cup.registrations, "заявка", "заявки", "заявок")}</span>`;
   btn.onclick = () => navigate(cupPath(tournamentId, "reg"));
   teamsEl.appendChild(btn);
+}
+
+// Ссылка на прогноз - рядом со списком команд того же кубка.
+function renderForecastLink(tournamentId) {
+  const btn = document.createElement("button");
+  btn.className = "team-btn reg-link";
+  btn.innerHTML = `<span class="team-name">Прогноз силы команд</span>` +
+    `<span class="team-meta">кто выглядит сильнее по составу</span>`;
+  btn.onclick = () => navigate(cupPath(tournamentId, "forecast"));
+  teamsEl.appendChild(btn);
+}
+
+let forecastTimer = null;
+
+const FORECAST_COMPONENTS = {
+  winrate: "Винрейт игроков",
+  mmr: "Суммарный MMR",
+  durability: "Доигрывают кубок",
+  role_slots: "Роли разведены",
+  role_cores: "Ядерные роли",
+};
+
+function forecastTeamRow(team) {
+  const bar = Math.max(0, Math.min(100, (team.strength - 30) * (100 / 45)));
+  const record = team.wins + team.losses
+    ? `${team.wins}–${team.losses}`
+    : '<span class="hint">ещё не играли</span>';
+  const roleWarn = team.missing_roles.length
+    ? `<span class="tag tag-warn" title="Никто не называет эти роли предпочтительными">нет: ${team.missing_roles.map((r) => escapeHtml(ROLE_LABELS[r] || r)).join(", ")}</span>`
+    : "";
+  const breakdown = Object.entries(FORECAST_COMPONENTS)
+    .map(([key, label]) => {
+      const c = team.components[key];
+      if (!c) return "";
+      const sign = c.effect > 0 ? "plus" : c.effect < 0 ? "minus" : "zero";
+      return `<span class="fc-part ${sign}">${escapeHtml(label)} ${c.effect > 0 ? "+" : ""}${c.effect}</span>`;
+    })
+    .join("");
+  const players = team.players
+    .map((p) => {
+      const name = p.account_id
+        ? `<button class="player-link" data-account-id="${p.account_id}">${escapeHtml(p.name)}</button>`
+        : escapeHtml(p.name);
+      const wr = p.games ? `${p.win_rate}% из ${p.games}` : "нет игр у нас";
+      // Доля игр своей команды в прошлых кубках и сколько раз человек уходил
+      // из состава: это и есть ответ на «доиграет ли он до конца».
+      const stay = p.durability == null
+        ? '<span class="hint">нет истории</span>'
+        : `${p.durability}%${p.left_early ? ` · уходил ${p.left_early}×` : ""}`;
+      return `<tr>
+        <td>${name}</td>
+        <td>${formatMmr(p.mmr)}</td>
+        <td class="reg-roles">${escapeHtml(formatRoles(p.roles))}</td>
+        <td>${wr}</td>
+        <td>${stay}</td>
+      </tr>`;
+    })
+    .join("");
+  return `
+    <details class="fc-team">
+      <summary>
+        <span class="fc-rank">${team.rank}</span>
+        <span class="fc-name">${escapeHtml(team.name)}</span>
+        <span class="fc-strength">${team.strength}%</span>
+        <span class="fc-bar"><span style="width:${bar}%"></span></span>
+        <span class="fc-record">${record}</span>
+        ${roleWarn}
+      </summary>
+      <div class="fc-parts">${breakdown}</div>
+      <table class="subs-table">
+        <thead><tr><th>Игрок</th><th>MMR</th><th>Роли</th><th>Винрейт</th><th>Доигрывает</th></tr></thead>
+        <tbody>${players}</tbody>
+      </table>
+    </details>`;
+}
+
+async function loadForecast(tournamentId, silent) {
+  if (!silent) detailEl.innerHTML = '<p class="hint">Считаю силу команд...</p>';
+  const res = await fetch(`/api/forecast${scopeQuery(tournamentId)}`);
+  if (!res.ok) {
+    detailEl.innerHTML = '<p class="hint">Прогноз недоступен.</p>';
+    return;
+  }
+  const data = await res.json();
+  if (!data.teams.length) {
+    detailEl.innerHTML = '<p class="hint">Составов ещё нет — прогноз появится, когда команды соберут.</p>';
+    return;
+  }
+  // Открытые карточки переживают автообновление: иначе раскрытый состав
+  // схлопывался бы раз в минуту сам собой.
+  const opened = new Set(
+    [...detailEl.querySelectorAll(".fc-team[open]")].map((d) => d.dataset.teamId));
+  detailEl.innerHTML = `
+    <h2>Прогноз силы команд — ${escapeHtml(data.tournament_label || "кубок")}</h2>
+    <p class="hint">
+      Ожидаемая доля побед по составу: прошлый винрейт игроков, суммарный MMR,
+      роли и то, доигрывают ли эти люди кубки до конца. Веса подобраны на 171
+      команде семи прошлых кубков: порядок пар команд модель угадывает в 64%
+      случаев против 50% у монетки. Это оценка состава, а не предсказание
+      конкретного матча. Обновляется каждую минуту.
+    </p>
+    <div class="fc-list">${data.teams.map(forecastTeamRow).join("")}</div>`;
+  for (const [i, node] of [...detailEl.querySelectorAll(".fc-team")].entries()) {
+    node.dataset.teamId = data.teams[i].team_id;
+    if (opened.has(String(data.teams[i].team_id))) node.open = true;
+  }
+  for (const btn of detailEl.querySelectorAll(".player-link")) {
+    btn.addEventListener("click", () => navigate(`/player/${btn.dataset.accountId}`));
+  }
+  highlightSidebar();
+  if (!forecastTimer) {
+    forecastTimer = setInterval(() => {
+      if (route.view === "forecast") loadForecast(tournamentId, true);
+    }, 60000);
+  }
 }
 
 async function loadRegistrations(tournamentId) {

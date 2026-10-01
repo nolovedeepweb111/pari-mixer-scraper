@@ -23,6 +23,7 @@ from pari_mixer_scraper.analysis import (
     compute_team_stats,
     generate_coach_text,
 )
+from pari_mixer_scraper.forecast import WEIGHTS as FORECAST_WEIGHTS, forecast_tournament
 from pari_mixer_scraper.collect import DEFAULT_LEAGUE_ID
 from pari_mixer_scraper.sources import (
     PRIMARY_SOURCE, SOURCES, all_league_ids, source_for_tournament,
@@ -683,6 +684,7 @@ app.url_map.converters["tslug"] = _TournamentSlugConverter
 
 
 @app.get("/<tslug:slug>")
+@app.get("/<tslug:slug>/forecast")
 @app.get("/<tslug:slug>/reg")
 @app.get("/<tslug:slug>/players")
 @app.get("/<tslug:slug>/subs")
@@ -1408,6 +1410,81 @@ def _past_cup_teams(session: Session, tournament_id: int,
     ]
     teams.sort(key=lambda t: t["name"].lower())
     return teams
+
+
+# Прогноз перебирает все игры всех кубков (двадцать с лишним тысяч строк), а
+# меняется он только после сбора. Считаем раз в несколько минут и держим в
+# памяти: воркер один, страница обновляется сама, и без кэша каждое обновление
+# платило бы за полный пересчёт.
+_FORECAST_TTL_SECONDS = int(os.environ.get("FORECAST_TTL_SECONDS", "120"))
+_forecast_lock = threading.Lock()
+_forecast_cache: dict[tuple, tuple[float, list]] = {}
+
+
+def _forecast_for(tournament_id: int, week: int | None) -> list:
+    key = (tournament_id, week)
+    with _forecast_lock:
+        hit = _forecast_cache.get(key)
+        if hit and time.monotonic() < hit[0]:
+            return hit[1]
+    with Session(engine) as session:
+        teams = forecast_tournament(session, tournament_id, week)
+    with _forecast_lock:
+        _forecast_cache[key] = (time.monotonic() + _FORECAST_TTL_SECONDS, teams)
+    return teams
+
+
+@app.get("/api/forecast")
+def api_forecast():
+    """Сила команд текущего кубка - чей состав выглядит сильнее по прошлым
+    играм, рейтингу, ролям и тому, доигрывают ли эти люди кубки до конца.
+
+    Как считается и почему именно так - в pari_mixer_scraper/forecast.py."""
+    scope = _requested_scope()
+    if scope is None:
+        return jsonify({"tournament_id": None, "teams": []})
+    if not _may_see_tournament(scope):
+        return _deny_tournament()
+    with Session(engine) as session:
+        week = _requested_week(session, scope)
+    teams = _forecast_for(scope, week)
+    return jsonify({
+        "tournament_id": scope,
+        "tournament_label": _tournament_label(scope, None),
+        "week": week,
+        "weights": FORECAST_WEIGHTS,
+        "teams": [
+            {
+                "rank": t.rank,
+                "team_id": t.team_id,
+                "name": t.name,
+                "strength": round(100 * t.strength, 1),
+                "total_mmr": t.total_mmr,
+                "wins": t.actual_wins,
+                "losses": t.actual_losses,
+                "missing_roles": t.missing_roles,
+                "components": {
+                    name: {"value": c["value"], "z": round(c["z"], 2),
+                           "effect": round(100 * c["effect"], 1)}
+                    for name, c in t.components.items()
+                },
+                "players": [
+                    {
+                        "account_id": p.account_id,
+                        "name": p.name,
+                        "mmr": p.mmr,
+                        "roles": p.roles,
+                        "games": p.games,
+                        "win_rate": p.win_rate,
+                        "durability": round(100 * p.durability) if p.durability is not None else None,
+                        "left_early": p.left_early,
+                    }
+                    for p in t.players
+                ],
+            }
+            for t in teams
+        ],
+    })
 
 
 @app.get("/api/registrations")

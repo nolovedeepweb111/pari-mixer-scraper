@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+import requests
 from flask import Flask, abort, jsonify, redirect, request, send_from_directory, session
 from werkzeug.routing import BaseConverter
 from sqlalchemy import and_, case, func, or_, select
@@ -2985,6 +2986,105 @@ def api_export_backup():
         resp.set_etag(tag)
     resp.headers["Cache-Control"] = "no-cache"
     return resp.make_conditional(request)
+
+
+# Живые игры спрашиваются у Steam не чаще, чем раз в эти секунды: ответ общий
+# для всех, кто опрашивает ручку, и держится в памяти. Иначе сервис прогнозов с
+# опросом раз в 15 секунд умножал бы запросы к Steam на число своих экземпляров.
+LIVE_CACHE_SECONDS = int(os.environ.get("LIVE_CACHE_SECONDS", "15"))
+_live_lock = threading.Lock()
+_live_cache: dict = {"at": 0.0, "payload": None}
+
+
+def _fetch_live_games() -> dict:
+    """Текущие игры наших лиг из Steam: составы, счёт и драфт по ходу.
+
+    Проверено 01.10.2026: GetLiveLeagueGames эти лобби ВИДИТ (в отличие от
+    GetMatchDetails, который для этих лиг отвечает 500) и отдаёт пики с банами
+    прямо во время драфта - по ним прогноз может подставить героев сам, не
+    дожидаясь конца игры.
+
+    Порядка пиков Steam не даёт, только списки по сторонам: внутри стороны
+    порядок прихода сохраняется, между сторонами - нет."""
+    from pari_mixer_scraper.sources import all_league_ids
+
+    key = os.environ.get("STEAM_API_KEY")
+    if not key:
+        return {"error": "STEAM_API_KEY not set", "fetched_at": int(time.time()), "games": []}
+    leagues = set(all_league_ids())
+    r = requests.get(
+        "https://api.steampowered.com/IDOTA2Match_570/GetLiveLeagueGames/v1/",
+        params={"key": key}, timeout=20,
+    )
+    r.raise_for_status()
+    games = []
+    for g in ((r.json().get("result") or {}).get("games") or []):
+        if g.get("league_id") not in leagues:
+            continue
+        board = g.get("scoreboard") or {}
+        players, picks_bans = [], []
+        for side, is_radiant in (("radiant", True), ("dire", False)):
+            team = board.get(side) or {}
+            for p in team.get("players") or []:
+                players.append({
+                    "account_id": p.get("account_id"),
+                    "hero_id": p.get("hero_id"),
+                    "is_radiant": is_radiant,
+                    "net_worth": p.get("net_worth"),
+                    "gold_per_min": p.get("gold_per_min"),
+                })
+            for kind, is_pick in (("picks", True), ("bans", False)):
+                for i, entry in enumerate(team.get(kind) or []):
+                    picks_bans.append({
+                        "hero_id": entry.get("hero_id"),
+                        "is_pick": is_pick,
+                        "is_radiant": is_radiant,
+                        # Внутри своей стороны порядок настоящий, общего Steam
+                        # не отдаёт - см. docstring.
+                        "side_order": i,
+                    })
+        games.append({
+            "league_id": g.get("league_id"),
+            "match_id": g.get("match_id"),
+            "lobby_id": g.get("lobby_id"),
+            "radiant_team_id": (g.get("radiant_team") or {}).get("team_id"),
+            "dire_team_id": (g.get("dire_team") or {}).get("team_id"),
+            "radiant_team_name": (g.get("radiant_team") or {}).get("team_name"),
+            "dire_team_name": (g.get("dire_team") or {}).get("team_name"),
+            "game_time": board.get("duration"),
+            "radiant_score": (board.get("radiant") or {}).get("score"),
+            "dire_score": (board.get("dire") or {}).get("score"),
+            "spectators": g.get("spectators"),
+            "players": players,
+            "picks_bans": picks_bans,
+        })
+    return {"fetched_at": int(time.time()), "games": games}
+
+
+@app.get("/api/export/live")
+def api_export_live():
+    """Живые игры наших лиг - для сервиса прогнозов (тот же токен)."""
+    if not EXPORT_TOKEN:
+        abort(404)
+    if not _export_token_ok():
+        abort(403)
+    with _live_lock:
+        fresh = _live_cache["payload"] is not None and             time.monotonic() - _live_cache["at"] < LIVE_CACHE_SECONDS
+        if fresh:
+            return jsonify(_live_cache["payload"])
+    try:
+        payload = _fetch_live_games()
+    except Exception as e:
+        # Steam отвалился - отдаём последнее, что знали, пометив возрастом.
+        with _live_lock:
+            stale = _live_cache["payload"]
+        if stale is not None:
+            return jsonify({**stale, "stale": True, "error": " ".join(str(e).split())[:200]})
+        return jsonify({"error": " ".join(str(e).split())[:200], "games": []}), 502
+    with _live_lock:
+        _live_cache["payload"] = payload
+        _live_cache["at"] = time.monotonic()
+    return jsonify(payload)
 
 
 @app.get("/api/collect/status")

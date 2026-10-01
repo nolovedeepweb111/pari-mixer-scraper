@@ -711,6 +711,12 @@ def api_tournaments():
             .where(Team.tournament_id.is_not(None), Team.week_number.is_not(None))
             .distinct()
         ):
+            # Недели только у источников, которые про них знают: чужой номер
+            # недели на доставшейся по наследству Steam-команде иначе рисует
+            # переключатель там, где недель нет (см. _cup_weeks).
+            source = source_for_tournament(cup_id)
+            if source is not None and not source.has_weeks:
+                continue
             weeks_by_cup.setdefault(cup_id, []).append(week)
         played = {
             t for (t,) in session.execute(
@@ -1310,8 +1316,16 @@ def _roster_filter(session: Session, team_id: int):
 
 def _cup_weeks(session: Session, tournament_id: int | None) -> list[int]:
     """Недели, которые есть у этого кубка, по возрастанию. Пусто у источников
-    без недельных решафлов - там переключать нечего."""
+    без недельных решафлов - там переключать нечего.
+
+    Решает РЕЕСТР ИСТОЧНИКОВ, а не содержимое строк команд. Steam-команды
+    кочуют между сериями, и у кубка PARI #5 две из них достались от супермиксера
+    вместе с проставленной неделей 2. Сайт тогда счёл кубок недельным, выбрал
+    последнюю неделю и показал ровно эти две команды из двадцати четырёх."""
     if tournament_id is None:
+        return []
+    source = source_for_tournament(tournament_id)
+    if source is not None and not source.has_weeks:
         return []
     return sorted(
         w for (w,) in session.execute(

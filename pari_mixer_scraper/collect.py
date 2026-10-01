@@ -864,7 +864,10 @@ def link_mixercup_data(
                 elif team_row.tournament_id is None:
                     team_row.tournament_id = tournament_id
                 # Неделя, к которой относится этот состав (см. Team.week_number).
-                if right_week and team_week is not None:
+                # У источника без недель - сброс, см. sync_mixer_teams.
+                if not mixer_client.weeks:
+                    team_row.week_number = None
+                elif right_week and team_week is not None:
                     team_row.week_number = team_week
             # Rosters (which player is on the team now) are driven ONLY by the
             # active tournament - a player competing in both cups must not have
@@ -911,6 +914,9 @@ def sync_mixer_teams(
     except Exception as e:
         progress(f"MixerCup team sync failed: {e}")
         return
+    # Знает ли ЭТОТ источник про недели. Не «есть ли номер недели в ответе»:
+    # номер мог остаться на строке команды от прошлой серии.
+    src_has_weeks = mixer_client.weeks
 
     max_synth = session.execute(
         select(func.max(Team.team_id)).where(Team.team_id >= _SYNTHETIC_TEAM_ID_BASE)
@@ -953,9 +959,10 @@ def sync_mixer_teams(
                 team_row.name = mt["name"]
             team_row.tournament_id = tournament_id
             updated += 1
-        # Неделя состава (см. Team.week_number); у источников без недель None.
-        if mt.get("weekNumber") is not None:
-            team_row.week_number = mt["weekNumber"]
+        # Неделя состава (см. Team.week_number). У источника без недель её надо
+        # не просто не ставить, а СБРАСЫВАТЬ: Steam-команда могла прийти из
+        # серии с решафлами и принести чужой номер недели с собой.
+        team_row.week_number = mt.get("weekNumber") if src_has_weeks else None
         if mt.get("number") is not None:
             team_row.number = mt["number"]
         if mt.get("name"):

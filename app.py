@@ -1422,13 +1422,16 @@ _forecast_cache: dict[tuple, tuple[float, list]] = {}
 
 
 def _forecast_for(tournament_id: int, week: int | None) -> list:
-    key = (tournament_id, week)
+    # Идущий кубок - единственный, чьи составы в базе актуальны: только у него
+    # имеет смысл скидывать вес играм, сыгранным прежней пятёркой.
+    live = tournament_id in _active_tournament_ids()
+    key = (tournament_id, week, live)
     with _forecast_lock:
         hit = _forecast_cache.get(key)
         if hit and time.monotonic() < hit[0]:
             return hit[1]
     with Session(engine) as session:
-        teams = forecast_tournament(session, tournament_id, week)
+        teams = forecast_tournament(session, tournament_id, week, roster_is_current=live)
     with _forecast_lock:
         _forecast_cache[key] = (time.monotonic() + _FORECAST_TTL_SECONDS, teams)
     return teams
@@ -1463,6 +1466,8 @@ def api_forecast():
                 # занимают уже сыгранные игры кубка.
                 "strength_prior": round(100 * t.strength_prior, 1),
                 "results_weight": round(100 * t.results_weight),
+                # Сколько игр команды зачлось после скидки на смену состава.
+                "counted_games": t.counted_games,
                 "total_mmr": t.total_mmr,
                 "wins": t.actual_wins,
                 "losses": t.actual_losses,

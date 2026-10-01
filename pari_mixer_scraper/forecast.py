@@ -86,6 +86,16 @@ WEIGHTS = {
 # влияет, а в середине кубка качество одинаковое.
 PRIOR_GAMES = 10
 
+# Замены - главная особенность миксера: состав меняется по ходу кубка, и в
+# 1547 матчах из 1929 хотя бы одна команда играла уже не тем составом, что
+# раньше. Поэтому прошлая игра засчитывается команде не целиком, а в меру того,
+# сколько человек из НЫНЕШНЕГО состава её играли: вес = (совпало/5) ** степень.
+# Степень 3 выбрана проверкой: угадывание матчей то же, а logloss падает с
+# 0.639 до 0.625 (на матчах после замен - с 0.646 до 0.628), то есть модель
+# перестаёт быть самоуверенной насчёт команды, которая половину побед набрала
+# другим составом.
+ROSTER_OVERLAP_POWER = 3
+
 CORE_ROLES = {"CARRY", "MIDLANER", "OFFLANER"}
 ALL_ROLES = ("CARRY", "MIDLANER", "OFFLANER", "SOFT_SUPPORT", "HARD_SUPPORT")
 
@@ -114,6 +124,7 @@ class TeamForecast:
     strength: float                 # ожидаемая доля побед, 0..1 (с учётом игр кубка)
     strength_prior: float = 0.5     # только по составу, без результатов кубка
     results_weight: float = 0.0     # какая доля оценки сейчас идёт от результатов
+    counted_games: float = 0.0      # сколько игр зачлось после скидки на замены
     rank: int = 0
     components: dict = field(default_factory=dict)
     players: list[PlayerForecast] = field(default_factory=list)
@@ -257,8 +268,14 @@ def _left_early(session: Session, exclude_tournament: int | None) -> dict[str, i
 
 
 def forecast_tournament(session: Session, tournament_id: int,
-                        week: int | None = None) -> list[TeamForecast]:
-    """Сила каждой команды кубка. Список отсортирован, сильнейшие сверху."""
+                        week: int | None = None,
+                        roster_is_current: bool = True) -> list[TeamForecast]:
+    """Сила каждой команды кубка. Список отсортирован, сильнейшие сверху.
+
+    roster_is_current - идёт ли этот кубок прямо сейчас. У прошедшего в базе
+    лежит СЕГОДНЯШНИЙ состав команды (так устроены roster_confirmed и
+    Team.name), и сравнивать его с пятёрками тех игр бессмысленно: скидка на
+    замены тогда обнулила бы весь счёт кубка."""
     team_rows = session.execute(
         select(Team).where(Team.tournament_id == tournament_id)
     ).scalars().all()
@@ -279,18 +296,30 @@ def forecast_tournament(session: Session, tournament_id: int,
     history = _player_history(session, tournament_id)
     offs = _left_early(session, tournament_id)
 
-    # Текущий счёт в кубке: в прогноз не входит, но рядом полезен - видно,
-    # сходится ли предсказание с тем, что происходит.
+    # Игры кубка с составами: нужны и для счёта, и для веса каждой игры (см.
+    # ROSTER_OVERLAP_POWER).
     record = defaultdict(lambda: [0, 0])
+    played: dict[int, list] = defaultdict(list)
     scope = [Match.mixer_tournament_id == tournament_id, Match.radiant_win.is_not(None)]
     if week is not None:
         scope.append(Match.week_number == week)
-    for radiant_team, dire_team, radiant_win in session.execute(
-        select(Match.radiant_team_id, Match.dire_team_id, Match.radiant_win).where(*scope)
+    lineups: dict[tuple, set] = defaultdict(set)
+    sides: dict[int, tuple] = {}
+    for match_id, radiant_team, dire_team, radiant_win, account_id, is_radiant in session.execute(
+        select(Match.match_id, Match.radiant_team_id, Match.dire_team_id, Match.radiant_win,
+               MatchPlayer.account_id, MatchPlayer.is_radiant)
+        .join(MatchPlayer, MatchPlayer.match_id == Match.match_id)
+        .where(*scope)
     ):
-        for team_id, won in ((radiant_team, radiant_win), (dire_team, not radiant_win)):
-            if team_id is not None:
-                record[team_id][0 if won else 1] += 1
+        sides[match_id] = (radiant_team, dire_team, radiant_win)
+        lineups[(match_id, bool(is_radiant))].add(account_id)
+    for match_id, (radiant_team, dire_team, radiant_win) in sides.items():
+        for team_id, won, side in ((radiant_team, radiant_win, True),
+                                   (dire_team, not radiant_win, False)):
+            if team_id is None:
+                continue
+            record[team_id][0 if won else 1] += 1
+            played[team_id].append((bool(won), lineups.get((match_id, side), set())))
 
     teams: list[TeamForecast] = []
     for team in team_rows:
@@ -357,12 +386,23 @@ def forecast_tournament(session: Session, tournament_id: int,
 
     for t in teams:
         t.strength_prior = 0.5 + sum(c["effect"] for c in t.components.values())
-        # Результаты идущего кубка перевешивают оценку состава по мере того,
-        # как их становится больше.
-        played = t.actual_wins + t.actual_losses
-        t.strength = ((t.strength_prior * PRIOR_GAMES + t.actual_wins)
-                      / (PRIOR_GAMES + played))
-        t.results_weight = played / (PRIOR_GAMES + played)
+        # Результаты идущего кубка перевешивают оценку состава по мере того, как
+        # их становится больше - но игра, сыгранная другой пятёркой, засчитывается
+        # этой команде лишь частично (см. ROSTER_OVERLAP_POWER).
+        roster_ids = {p.account_id for p in t.players if p.account_id}
+        games = played.get(t.team_id, [])
+        # Скидка на замены - только для идущего кубка, см. docstring.
+        use_overlap = roster_is_current and bool(roster_ids)
+        weighted_wins = weighted_games = 0.0
+        for won, lineup in games:
+            weight = ((len(lineup & roster_ids) / 5) ** ROSTER_OVERLAP_POWER
+                      if use_overlap else 1.0)
+            weighted_games += weight
+            weighted_wins += weight * won
+        t.counted_games = round(weighted_games, 1)
+        t.strength = ((t.strength_prior * PRIOR_GAMES + weighted_wins)
+                      / (PRIOR_GAMES + weighted_games))
+        t.results_weight = weighted_games / (PRIOR_GAMES + weighted_games)
     teams.sort(key=lambda t: -t.strength)
     for i, t in enumerate(teams, start=1):
         t.rank = i

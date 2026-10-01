@@ -553,13 +553,19 @@ function forecastTeamRow(team) {
   const record = team.wins + team.losses
     ? `${team.wins}–${team.losses}`
     : '<span class="hint">ещё не играли</span>';
+  const games = (team.wins || 0) + (team.losses || 0);
+  // Игры, сыгранные другим составом, зачтены частично - показываем, сколько
+  // в итоге учтено, иначе непонятно, почему счёт 8-2, а оценка скромная.
+  const counted = games && Math.abs(team.counted_games - games) >= 0.5
+    ? `<span class="fc-part" title="Игры прежнего состава учтены частично">учтено ${team.counted_games} игр из ${games}</span>`
+    : "";
   const mix = team.results_weight
     ? `<span class="fc-part">состав ${100 - team.results_weight}% · результаты ${team.results_weight}%</span>`
     : "";
   const roleWarn = team.missing_roles.length
     ? `<span class="tag tag-warn" title="Никто не называет эти роли предпочтительными">нет: ${team.missing_roles.map((r) => escapeHtml(ROLE_LABELS[r] || r)).join(", ")}</span>`
     : "";
-  const context = mix +
+  const context = mix + counted +
     `<span class="fc-part">по составу ${team.strength_prior}%</span>` +
     `<span class="fc-part">винрейт пятёрки ${team.squad_win_rate}%</span>` +
     `<span class="fc-part">роли ${Math.round(team.role_slots * 5)}/5</span>`;
@@ -637,7 +643,8 @@ async function loadForecast(tournamentId, silent) {
       Ожидаемая доля побед. Пока игр мало, считается по составу: доля золота в
       прошлых играх, сила лучшего игрока по рейтингу Эло, суммарный MMR и то,
       доигрывают ли эти люди кубки до конца. Дальше оценку перевешивают
-      результаты самого кубка. Веса подобраны на 171 команде семи прошлых
+      результаты самого кубка — причём игра, сыгранная другим составом,
+      засчитывается команде лишь частично. Веса подобраны на 171 команде семи прошлых
       кубков: порядок пар команд модель угадывает в 68% случаев против 50% у
       монетки, победителя отдельной игры — в 64%, а у команд с пятью и более
       играми — в 66%. Обновляется каждую минуту.

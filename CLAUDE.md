@@ -64,7 +64,12 @@ file immediately.
   validation (features picked inside the training fold) orders 66-68% of team
   pairs right. While a cup runs, its own results outweigh the roster estimate
   (`PRIOR_GAMES` virtual games), which lifts match-winner accuracy from 59% to
-  64%, and to 66% for teams past five games — the single biggest gain so far. Re-fit with `tools/forecast_*.py`
+  64%, and to 66% for teams past five games — the single biggest gain so far.
+  A past game counts for a team only in proportion to how much of its CURRENT
+  five played it (`ROSTER_OVERLAP_POWER`), since substitutions are constant
+  here: 1547 of 1929 matches were played after someone had changed. That
+  discount applies only to the live cup — a finished cup's stored roster is
+  today's squad, not the one that played it. Re-fit with `tools/forecast_*.py`
   on a DB built by `tools/build_dev_db.py`, never by hand. Two measured results
   that look like bugs but are not: durability's weight is negative, and win rate
   plus roles drop out of the model once gold share is in.

@@ -128,6 +128,13 @@ MAX_DEVICES_PER_KEY = int(os.environ.get("MAX_DEVICES_PER_KEY", "2"))
 # before the owner sets it up) - EXCEPT in PUBLIC_ARCHIVE mode, see below.
 OPS_TOKEN = os.environ.get("OPS_TOKEN", "")
 
+# Отдельный токен ТОЛЬКО на чтение выгрузки (/api/export/...). Им ходит соседний
+# сервис прогнозов, который живёт на этом же сервере: ему нужна свежая история
+# матчей, но не нужны ни запуск сбора, ни привязки устройств, ни ключи доступа.
+# Пустой - ручек экспорта просто нет (404), чтобы не заводить открытую дыру
+# молчанием.
+EXPORT_TOKEN = os.environ.get("EXPORT_TOKEN", "")
+
 # Sell access to the RUNNING cup only: finished cups are readable by anyone,
 # the active one needs a key. Off by default - turning this on mid-tournament
 # would hand out the very thing people paid for, so it has to be an explicit
@@ -514,6 +521,18 @@ def _session_ok() -> bool:
     return False
 
 
+def _export_token_ok() -> bool:
+    """Проверка токена выгрузки. Сравнение постоянное по времени: токен длинный,
+    но подбирать его по скорости ответа всё равно не должно получаться.
+
+    Проверять «запрос пришёл с 127.0.0.1» бессмысленно: nginx проксирует туда
+    весь публичный трафик, и любой запрос из интернета выглядит локальным."""
+    if not EXPORT_TOKEN:
+        return False
+    token = request.headers.get("X-Export-Token") or request.args.get("export_token") or ""
+    return bool(token) and hmac.compare_digest(token, EXPORT_TOKEN)
+
+
 def _is_ops_path(p: str) -> bool:
     return p == "/api/collect" or p.startswith("/api/backup") or p.startswith("/api/archive")
 
@@ -573,6 +592,10 @@ def _gate():
         return
     p = request.path
     if p == "/login" or p.startswith("/api/auth/") or p == "/favicon.ico":
+        return
+    if p.startswith("/api/export/"):
+        # Токен проверяет сама ручка - и для неё это единственный способ входа,
+        # сессия пользователя тут не годится.
         return
     if _is_ops_path(p):
         # Deliberately NOT satisfied by a visitor's session: these are the
@@ -2782,6 +2805,10 @@ def api_all_substitutions():
 
 @app.get("/api/backup")
 def api_backup():
+    return jsonify(_build_backup(include_private=True))
+
+
+def _build_backup(include_private: bool) -> dict:
     """Dump of the data that is either impossible or expensive to re-fetch.
 
     Impossible: substitution events (mixer-cup deletes its own history
@@ -2848,7 +2875,7 @@ def api_backup():
             [account_id, hero_id, team_id, 1 if is_radiant else 0, k, d, a, gpm, xpm, nw]
         )
 
-    return jsonify({
+    payload = {
         "teams": [
             {
                 "team_id": t.team_id, "name": t.name,
@@ -2908,10 +2935,56 @@ def api_backup():
         # Access-key -> device bindings, keyed by HMAC(key) so the public
         # backup branch never exposes the keys themselves. Lets device
         # bindings (the anti-sharing state) survive restarts and deploys.
-        "access_bindings": {
+    }
+    if include_private:
+        # Привязки устройств и заметки - только для собственного бэкапа.
+        # Соседнему сервису (прогнозы) они не нужны, а раздавать их лишний раз
+        # незачем: заметки авторские, привязки - состояние защиты от шеринга.
+        payload["access_bindings"] = {
             kh: sorted(devs) for kh, devs in _snapshot_bindings().items()
-        },
-    })
+        }
+    else:
+        payload.pop("player_notes", None)
+    return payload
+
+
+@app.get("/api/export/backup")
+def api_export_backup():
+    """Та же выгрузка, что /api/backup, но по токену только на чтение.
+
+    Нужна соседнему сервису прогнозов: он живёт на этом же сервере и строил
+    модель по бэкапу из ветки data-backup, а тот обновляется раз в 3-6 часов,
+    потому что расписания GitHub Actions запускаются когда захотят. Игра
+    попадала в прогноз на следующий день. Здесь данные те же, но из живой базы:
+    сыгранный матч появляется в пределах цикла сбора, то есть за 10 минут.
+
+    ETag считается по файлу базы, а не по телу ответа: сборщик подменяет файл
+    целиком через os.replace, поэтому время изменения меняется ровно тогда,
+    когда меняются данные. Проверка идёт ДО сборки ответа, так что частый опрос
+    с If-None-Match почти ничего не стоит."""
+    if not EXPORT_TOKEN:
+        abort(404)
+    if not _export_token_ok():
+        abort(403)
+    try:
+        stat = os.stat(DB_PATH)
+        tag = hashlib.sha256(
+            f"{stat.st_mtime_ns}:{stat.st_size}".encode()
+        ).hexdigest()[:32]
+    except OSError:
+        tag = None
+
+    if tag and request.if_none_match and tag in request.if_none_match:
+        resp = app.response_class(status=304)
+        resp.set_etag(tag)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+    resp = jsonify(_build_backup(include_private=False))
+    if tag:
+        resp.set_etag(tag)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp.make_conditional(request)
 
 
 @app.get("/api/collect/status")
